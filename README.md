@@ -139,20 +139,31 @@ A few natural next steps if you want to go further:
 
 ## Releasing
 
-For maintainers cutting a new PyPI release:
+Releases are automated via two GitHub Actions workflows:
 
-```sh
-# bump version in pyproject.toml, then:
-uv build                              # produces dist/*.whl and dist/*.tar.gz
-uvx twine check dist/*                # sanity-check README rendering & metadata
-uv publish                            # uploads to PyPI (needs UV_PUBLISH_TOKEN)
-```
+1. **Release** (`.github/workflows/release.yml`) — `workflow_dispatch` with a
+   `bump` input (`patch` / `minor` / `major`). It runs `uv version --bump`,
+   commits `pyproject.toml` + `uv.lock` as `chore(release): X.Y.Z`, tags
+   `vX.Y.Z`, pushes both to `main`, and creates a GitHub release with
+   auto-generated notes. Requires a `RELEASE_TOKEN` secret (PAT with
+   Contents: read/write, allowlisted on branch protection so the bot can
+   push to `main`).
+2. **Publish to PyPI** (`.github/workflows/publish.yml`) — triggered by
+   `release: published`. Builds sdist + wheel with `uv build`, validates
+   with `twine check`, and publishes via `uv publish --trusted-publishing
+   always`. No token is stored; PyPI's Trusted Publisher config (pypi.org
+   → Manage → Publishing) authorises this repo/workflow/environment
+   (`pypi`) via OIDC.
 
-Get a PyPI API token from <https://pypi.org/manage/account/token/> and set
-`UV_PUBLISH_TOKEN` (or pass `--token`). After publishing, verify from a clean
-environment:
+To cut a release: go to Actions → **Release** → Run workflow, pick the
+bump type. When it finishes, the publish workflow runs automatically on
+the resulting GitHub release. Verify from a clean environment:
 
 ```sh
 uv tool install cc-pr-reviewer
 cc-pr-reviewer
 ```
+
+Manual fallback (if you ever need to publish locally): `uv build && uvx
+twine check dist/* && uv publish` with `UV_PUBLISH_TOKEN` set to a PyPI
+API token.
