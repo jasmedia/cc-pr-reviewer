@@ -1,0 +1,66 @@
+[project]
+name = "cc-pr-reviewer"
+version = "0.1.0"
+description = "Textual TUI that lists GitHub PRs awaiting your review and hands them off to Claude Code."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Jaseem", email = "jaseem@inferxgate.com" },
+]
+keywords = ["github", "pull-request", "code-review", "claude-code", "tui", "textual"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Version Control :: Git",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "textual>=0.60",
+]
+
+[project.urls]
+Homepage = "https://github.com/jasmedia/cc-pr-reviewer"
+Repository = "https://github.com/jasmedia/cc-pr-reviewer"
+Issues = "https://github.com/jasmedia/cc-pr-reviewer/issues"
+
+[project.scripts]
+cc-pr-reviewer = "cc_pr_reviewer:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = []
+only-include = ["cc_pr_reviewer.py"]
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.5.1",
+    "ruff>=0.15.11",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "UP",   # pyupgrade
+    "SIM",  # flake8-simplify
+]
