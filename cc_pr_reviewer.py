@@ -61,7 +61,10 @@ POST_INLINE_PROMPT = (
     "--method POST /repos/{owner}/{repo}/pulls/{number}/reviews` with an array "
     "of `comments` entries (each with `path`, `line`, and `body`), then submit "
     "the review with `event: COMMENT` so all findings appear grouped. Use the "
-    "PR's head commit SHA when the endpoint requires `commit_id`."
+    "PR's head commit SHA when the endpoint requires `commit_id`. Before "
+    "submitting, cross-check each finding against the list of existing review "
+    "comments above and drop any that duplicate a previously posted comment "
+    "(same file+line+substantive point)."
 )
 
 
@@ -147,6 +150,58 @@ def fetch_review_prs() -> list[dict[str, Any]]:
 def fetch_my_prs() -> list[dict[str, Any]]:
     """All open PRs across GitHub authored by @me."""
     return _search_prs(["--author=@me"])
+
+
+def fetch_existing_review_comments(repo: str, number: int) -> list[dict[str, Any]]:
+    """Inline review comments already posted on the PR.
+
+    Returns [] on any failure — this is non-fatal context for the review prompt.
+    """
+    r = run(
+        [
+            "gh",
+            "api",
+            "--paginate",
+            f"repos/{repo}/pulls/{number}/comments",
+        ]
+    )
+    if r.returncode != 0:
+        return []
+    try:
+        data = json.loads(r.stdout or "[]")
+    except json.JSONDecodeError:
+        return []
+    return data if isinstance(data, list) else []
+
+
+_COMMENT_BODY_CAP = 200
+_COMMENT_LIST_CAP = 50
+
+
+def format_existing_comments(comments: list[dict[str, Any]]) -> str:
+    """Compact prompt block listing prior inline review comments, or ''."""
+    if not comments:
+        return ""
+    # Sort most-recent first, then cap to keep the prompt bounded.
+    ordered = sorted(comments, key=lambda c: c.get("created_at", ""), reverse=True)
+    truncated = len(ordered) > _COMMENT_LIST_CAP
+    ordered = ordered[:_COMMENT_LIST_CAP]
+
+    lines = [
+        "Existing review comments already posted on this PR (do NOT repost "
+        "duplicates; you may extend or refine with clearly new info):"
+    ]
+    for c in ordered:
+        user = (c.get("user") or {}).get("login", "?")
+        path = c.get("path", "?")
+        line_no = c.get("line") or c.get("original_line") or "?"
+        body = (c.get("body") or "").strip().replace("\n", " ")
+        if len(body) > _COMMENT_BODY_CAP:
+            body = body[: _COMMENT_BODY_CAP - 1] + "…"
+        lines.append(f'- @{user} on {path}:{line_no} — "{body}"')
+    if truncated:
+        lines.append(f"(showing {_COMMENT_LIST_CAP} most recent of {len(comments)} total)")
+    return "\n".join(lines)
 
 
 def humanise(iso: str) -> str:
@@ -490,11 +545,24 @@ class PRReviewer(App):
             sha_r = run(["git", "rev-parse", "HEAD"], cwd=local_path)
             head_sha = sha_r.stdout.strip() if sha_r.returncode == 0 else ""
 
-            prompt = REVIEW_PROMPT + (POST_INLINE_PROMPT if self.post_inline else "")
+            existing = fetch_existing_review_comments(repo_full, number)
+            existing_block = format_existing_comments(existing)
+
+            prompt = REVIEW_PROMPT
+            if existing_block:
+                prompt += "\n\n" + existing_block
+            if self.post_inline:
+                prompt += POST_INLINE_PROMPT
+
             cmd = ["claude"]
             if self.auto_accept:
                 cmd += ["--permission-mode", "acceptEdits"]
             cmd.append(prompt)
+            if existing:
+                print(
+                    f"\nFound {len(existing)} existing review comment(s); "
+                    "Claude will skip duplicates."
+                )
             print(
                 f"\nLaunching Claude Code "
                 f"(auto-accept: {'on' if self.auto_accept else 'off'}, "
