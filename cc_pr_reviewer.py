@@ -27,8 +27,11 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import urllib.request
 import webbrowser
 from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
 from pathlib import Path
 from typing import Any
 
@@ -91,6 +94,41 @@ PROMPT_SECTION_SEP = "\n\n"
 # size on PRs with lots of prior review activity.
 EXISTING_COMMENT_BODY_CAP = 200
 EXISTING_COMMENT_LIST_CAP = 50
+
+# Update check: once per startup, silent on failure.
+PACKAGE_NAME = "cc-pr-reviewer"
+PYPI_JSON_URL = f"https://pypi.org/pypi/{PACKAGE_NAME}/json"
+RELEASES_URL = "https://github.com/jasmedia/cc-pr-reviewer/releases"
+
+
+def _installed_version() -> str | None:
+    try:
+        return _pkg_version(PACKAGE_NAME)
+    except PackageNotFoundError:
+        return None
+
+
+def _fetch_latest_version(timeout: float = 3.0) -> str | None:
+    try:
+        req = urllib.request.Request(PYPI_JSON_URL, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            data = json.load(resp)
+        v = data.get("info", {}).get("version")
+        return v if isinstance(v, str) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _parse_semver(v: str) -> tuple[int, ...]:
+    parts: list[int] = []
+    for seg in v.split("."):
+        digits = "".join(ch for ch in seg if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+
+def _is_newer(latest: str, current: str) -> bool:
+    return _parse_semver(latest) > _parse_semver(current)
 
 
 # --- Subprocess helpers ----------------------------------------------------
@@ -419,6 +457,17 @@ class PRReviewer(App):
         color: $text;
     }
     #status.-error { background: $error; }
+    #version-badge {
+        height: 1;
+        width: 100%;
+        content-align: right middle;
+        padding: 0 1;
+        background: $accent;
+        color: $text;
+        text-style: bold;
+        display: none;
+    }
+    #version-badge.-visible { display: block; }
     #diff-container {
         border: round $primary;
         padding: 1;
@@ -448,6 +497,7 @@ class PRReviewer(App):
         Binding("m", "toggle_mine", "Toggle my PRs"),
         Binding("a", "toggle_auto_accept", "Toggle auto-accept"),
         Binding("p", "toggle_post_inline", "Toggle post inline"),
+        Binding("u", "open_releases", "Releases"),
         Binding("q", "quit", "Quit"),
     ]
 
@@ -457,11 +507,13 @@ class PRReviewer(App):
         self.include_mine: bool = False
         self.auto_accept: bool = True
         self.post_inline: bool = True
+        self.latest_version: str | None = None
         self.review_db: sqlite3.Connection = _open_review_db()
         self.review_state: dict[str, dict[str, Any]] = _load_review_state(self.review_db)
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
+        yield Static("", id="version-badge")
         yield DataTable(id="pr-table", cursor_type="row", zebra_stripes=True)
         yield Static("Loading…", id="status")
         yield Footer()
@@ -472,6 +524,7 @@ class PRReviewer(App):
             "Repository", "#", "Title", "Author", "Updated", "Reviews", "Last Review", ""
         )
         self.action_refresh()
+        self._check_for_update()
 
     # --- actions ---
 
@@ -507,7 +560,7 @@ class PRReviewer(App):
             self._set_status(
                 f"No PRs awaiting your review 🎉{mode}   "
                 f"auto-accept: {auto}   post-inline: {post}   "
-                "(m: mine, a: auto-accept, p: post-inline, r: refresh, q: quit)"
+                "(m: mine, a: auto-accept, p: post-inline, r: refresh, u: releases, q: quit)"
             )
             return
         for i, pr in enumerate(data):
@@ -539,7 +592,7 @@ class PRReviewer(App):
         self._set_status(
             f"{len(data)} PR(s){mode}   auto-accept: {auto}   post-inline: {post}   "
             "•  enter: review  •  d: diff  •  o: browser  •  m: mine  "
-            "•  a: auto-accept  •  p: post-inline  •  r: refresh  •  q: quit"
+            "•  a: auto-accept  •  p: post-inline  •  r: refresh  •  u: releases  •  q: quit"
         )
 
     def _selected(self) -> dict[str, Any] | None:
@@ -552,6 +605,9 @@ class PRReviewer(App):
         pr = self._selected()
         if pr:
             webbrowser.open(pr["url"])
+
+    def action_open_releases(self) -> None:
+        webbrowser.open(RELEASES_URL)
 
     def action_show_diff(self) -> None:
         pr = self._selected()
@@ -677,6 +733,21 @@ class PRReviewer(App):
         w = self.query_one("#status", Static)
         w.update(msg)
         w.set_class(error, "-error")
+
+    @work(thread=True, exclusive=True)
+    def _check_for_update(self) -> None:
+        current = _installed_version()
+        if current is None:
+            return
+        latest = _fetch_latest_version()
+        if latest and _is_newer(latest, current):
+            self.call_from_thread(self._show_update_badge, latest)
+
+    def _show_update_badge(self, latest: str) -> None:
+        self.latest_version = latest
+        w = self.query_one("#version-badge", Static)
+        w.update(f" ▲ v{latest} available — press u ")
+        w.add_class("-visible")
 
 
 # --- Entry point -----------------------------------------------------------
