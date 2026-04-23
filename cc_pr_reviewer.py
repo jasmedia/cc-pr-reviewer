@@ -56,7 +56,7 @@ REVIEW_PROMPT = (
 )
 
 POST_INLINE_PROMPT = (
-    " Additionally, publish each finding as an inline PR review comment on "
+    "Additionally, publish each finding as an inline PR review comment on "
     "GitHub using the `gh` CLI. Create a single pending review via `gh api "
     "--method POST /repos/{owner}/{repo}/pulls/{number}/reviews` with an array "
     "of `comments` entries (each with `path`, `line`, and `body`), then submit "
@@ -72,6 +72,10 @@ POST_INLINE_DEDUP_SUFFIX = (
     "review comments above and drop any that duplicate a previously posted "
     "comment (same file+line+substantive point)."
 )
+
+# Prompt sections are joined with this separator so multi-line blocks (e.g.
+# the existing-comments list) don't get smashed into neighboring prose.
+PROMPT_SECTION_SEP = "\n\n"
 
 # Caps for the existing-comments block injected into the prompt. Bound prompt
 # size on PRs with lots of prior review activity.
@@ -170,12 +174,13 @@ def fetch_existing_review_comments(repo: str, number: int) -> list[dict[str, Any
     dedup context was unavailable (silent `[]` would let Claude re-post the
     same findings, which is exactly the bug this is meant to prevent).
     """
+    # No --paginate: we only keep EXISTING_COMMENT_LIST_CAP entries, so fetching
+    # 100 in one request bounds the worst-case wait regardless of PR size.
     r = run(
         [
             "gh",
             "api",
-            "--paginate",
-            f"repos/{repo}/pulls/{number}/comments",
+            f"repos/{repo}/pulls/{number}/comments?per_page=100",
         ]
     )
     target = f"{repo}#{number}"
@@ -195,12 +200,15 @@ def fetch_existing_review_comments(repo: str, number: int) -> list[dict[str, Any
 
 
 def format_existing_comments(comments: list[dict[str, Any]]) -> str:
-    """Compact prompt block listing up to the 50 most recent inline review
-    comments (bodies truncated to ~200 chars), or '' if none."""
-    if not comments:
+    """Compact prompt block listing up to `EXISTING_COMMENT_LIST_CAP` most
+    recent inline review comments (bodies truncated to
+    `EXISTING_COMMENT_BODY_CAP` chars), or '' if none."""
+    # Drop malformed entries first so a missing `created_at` can't get sorted
+    # to the front (empty string + reverse=True would treat it as "most recent").
+    dated = [c for c in comments if c.get("created_at")]
+    if not dated:
         return ""
-    # Sort most-recent first, then cap to keep the prompt bounded.
-    ordered = sorted(comments, key=lambda c: c.get("created_at", ""), reverse=True)
+    ordered = sorted(dated, key=lambda c: c["created_at"], reverse=True)
     truncated = len(ordered) > EXISTING_COMMENT_LIST_CAP
     ordered = ordered[:EXISTING_COMMENT_LIST_CAP]
 
@@ -220,7 +228,7 @@ def format_existing_comments(comments: list[dict[str, Any]]) -> str:
             body = body[: EXISTING_COMMENT_BODY_CAP - 1] + "…"
         lines.append(f'- @{user} on {locus} — "{body}"')
     if truncated:
-        lines.append(f"(showing {EXISTING_COMMENT_LIST_CAP} most recent of {len(comments)} total)")
+        lines.append(f"(showing {EXISTING_COMMENT_LIST_CAP} most recent of {len(dated)} total)")
     return "\n".join(lines)
 
 
@@ -565,16 +573,19 @@ class PRReviewer(App):
             sha_r = run(["git", "rev-parse", "HEAD"], cwd=local_path)
             head_sha = sha_r.stdout.strip() if sha_r.returncode == 0 else ""
 
+            print("Fetching existing review comments…")
             existing = fetch_existing_review_comments(repo_full, number)
             existing_block = format_existing_comments(existing)
 
-            prompt = REVIEW_PROMPT
+            sections = [REVIEW_PROMPT]
             if existing_block:
-                prompt += "\n\n" + existing_block
+                sections.append(existing_block)
             if self.post_inline:
-                prompt += POST_INLINE_PROMPT
+                post = POST_INLINE_PROMPT
                 if existing_block:
-                    prompt += POST_INLINE_DEDUP_SUFFIX
+                    post += POST_INLINE_DEDUP_SUFFIX
+                sections.append(post)
+            prompt = PROMPT_SECTION_SEP.join(sections)
 
             cmd = ["claude"]
             if self.auto_accept:
