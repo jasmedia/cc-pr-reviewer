@@ -127,6 +127,7 @@ def _search_prs(extra: list[str]) -> list[dict[str, Any]]:
             "search",
             "prs",
             "--state=open",
+            "--archived=false",
             "--limit=100",
             "--json",
             PR_FIELDS,
