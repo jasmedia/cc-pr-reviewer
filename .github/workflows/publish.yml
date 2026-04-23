@@ -17,7 +17,7 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v7
 
       - name: Build sdist and wheel
         run: uv build
@@ -26,7 +26,7 @@ jobs:
         run: uvx twine check dist/*
 
       - name: Upload distribution artifacts
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
@@ -48,7 +48,7 @@ jobs:
       id-token: write
     steps:
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v7
         with:
           # No repo checked out in this job, so there's no uv.lock to key
           # the cache on. Disable to silence "empty workdir" / "cache will
@@ -56,7 +56,7 @@ jobs:
           enable-cache: false
 
       - name: Download distribution artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/
