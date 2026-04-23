@@ -73,6 +73,16 @@ POST_INLINE_DEDUP_SUFFIX = (
     "comment (same file+line+substantive point)."
 )
 
+# Appended to POST_INLINE_PROMPT when the existing-comments fetch failed. The
+# alternative (empty `existing_block`) is indistinguishable from a PR that
+# genuinely has no prior comments, so without this hint Claude would happily
+# repost routine findings that were already flagged in the missing list.
+POST_INLINE_FETCH_FAILED_SUFFIX = (
+    " NOTE: existing-comment fetch failed, so no dedup list is available. "
+    "Err on the side of not reposting findings that look routine or commonly "
+    "raised; prefer fewer, clearly novel comments."
+)
+
 # Prompt sections are joined with this separator so multi-line blocks (e.g.
 # the existing-comments list) don't get smashed into neighboring prose.
 PROMPT_SECTION_SEP = "\n\n"
@@ -167,69 +177,97 @@ def fetch_my_prs() -> list[dict[str, Any]]:
     return _search_prs(["--author=@me"])
 
 
-def fetch_existing_review_comments(repo: str, number: int) -> list[dict[str, Any]]:
+def fetch_existing_review_comments(repo: str, number: int) -> tuple[list[dict[str, Any]], bool]:
     """Inline review comments already posted on the PR.
 
-    Returns [] on any failure, printing a one-line warning so the user knows
-    dedup context was unavailable (silent `[]` would let Claude re-post the
-    same findings, which is exactly the bug this is meant to prevent).
+    Returns `(comments, ok)`. `ok=False` with a printed warning on
+    transport/parse failure (non-zero exit, JSONDecodeError, non-list
+    payload) so the caller can tell Claude dedup context is missing.
+    `ok=True, comments=[]` means the PR genuinely has no inline comments.
     """
-    # No --paginate: we only keep EXISTING_COMMENT_LIST_CAP entries, so fetching
-    # 100 in one request bounds the worst-case wait regardless of PR size.
+    # Single page (per_page=100 is GitHub's max). PRs with >100 inline
+    # comments will miss the oldest ones; acceptable because we only
+    # surface EXISTING_COMMENT_LIST_CAP most-recent entries anyway.
     r = run(
         [
             "gh",
             "api",
-            f"repos/{repo}/pulls/{number}/comments?per_page=100",
+            "-F",
+            "per_page=100",
+            f"repos/{repo}/pulls/{number}/comments",
         ]
     )
     target = f"{repo}#{number}"
     if r.returncode != 0:
         err = (r.stderr or r.stdout).strip() or f"exit {r.returncode}"
         print(f"warning: could not fetch existing comments for {target}: {err}")
-        return []
+        return [], False
     try:
         data = json.loads(r.stdout or "[]")
     except json.JSONDecodeError as e:
         print(f"warning: could not parse existing comments for {target}: {e}")
-        return []
+        return [], False
     if not isinstance(data, list):
         print(f"warning: unexpected comments payload for {target}: {type(data).__name__}")
-        return []
-    return data
+        return [], False
+    return data, True
 
 
-def format_existing_comments(comments: list[dict[str, Any]]) -> str:
+def format_existing_comments(comments: list[dict[str, Any]]) -> tuple[str, int]:
     """Compact prompt block listing up to `EXISTING_COMMENT_LIST_CAP` most
     recent inline review comments (bodies truncated to
-    `EXISTING_COMMENT_BODY_CAP` chars), or '' if none."""
-    # Drop malformed entries first so a missing `created_at` can't get sorted
-    # to the front (empty string + reverse=True would treat it as "most recent").
-    dated = [c for c in comments if c.get("created_at")]
-    if not dated:
-        return ""
-    ordered = sorted(dated, key=lambda c: c["created_at"], reverse=True)
-    truncated = len(ordered) > EXISTING_COMMENT_LIST_CAP
-    ordered = ordered[:EXISTING_COMMENT_LIST_CAP]
+    `EXISTING_COMMENT_BODY_CAP` chars).
+
+    Returns `(block, shown_count)` where `shown_count` is the number of
+    entries actually rendered into `block`. Returns `("", 0)` when no
+    usable entries remain after filtering.
+    """
+    # Drop entries we can't render a useful dedup anchor for:
+    # - missing created_at: mixing None with strings TypeErrors sorted(),
+    #   and substituting "" would silently reorder malformed entries.
+    # - missing path: would render as a bare ":N" locus that Claude can't
+    #   match against — dedup silently no-ops for that entry.
+    # - empty/whitespace body: leaves Claude a locus with no substance, so
+    #   any new finding at that location trivially passes the "clearly new
+    #   info" test, defeating dedup.
+    usable: list[tuple[dict[str, Any], str]] = []
+    for c in comments:
+        if not c.get("created_at") or not c.get("path"):
+            continue
+        body = " ".join((c.get("body") or "").split())
+        if not body:
+            continue
+        usable.append((c, body))
+    if not usable:
+        return "", 0
+    usable.sort(key=lambda cb: cb[0]["created_at"], reverse=True)
+    truncated = len(usable) > EXISTING_COMMENT_LIST_CAP
+    shown = usable[:EXISTING_COMMENT_LIST_CAP]
 
     lines = [
         "Existing review comments already posted on this PR (do NOT repost "
         "duplicates; you may extend or refine with clearly new info):"
     ]
-    for c in ordered:
+    for c, body in shown:
         user = (c.get("user") or {}).get("login", "?")
-        path = c.get("path", "?")
+        path = c["path"]
+        # Outdated comments (line no longer in the PR's current diff) null
+        # out `line` but keep `original_line`; fall back so we still emit a
+        # locus, and label (outdated) so Claude doesn't suppress a legit
+        # new finding on a line that's since been rewritten.
         line_no = c.get("line")
-        if line_no is None:
-            line_no = c.get("original_line")
-        locus = f"{path}:{line_no}" if line_no is not None else f"{path} (file-level)"
-        body = " ".join((c.get("body") or "").split())
+        if line_no is not None:
+            locus = f"{path}:{line_no}"
+        elif c.get("original_line") is not None:
+            locus = f"{path}:{c['original_line']} (outdated)"
+        else:
+            locus = f"{path} (file-level)"
         if len(body) > EXISTING_COMMENT_BODY_CAP:
             body = body[: EXISTING_COMMENT_BODY_CAP - 1] + "…"
         lines.append(f'- @{user} on {locus} — "{body}"')
     if truncated:
-        lines.append(f"(showing {EXISTING_COMMENT_LIST_CAP} most recent of {len(dated)} total)")
-    return "\n".join(lines)
+        lines.append(f"(showing {EXISTING_COMMENT_LIST_CAP} most recent of {len(usable)} total)")
+    return "\n".join(lines), len(shown)
 
 
 def humanise(iso: str) -> str:
@@ -571,11 +609,16 @@ class PRReviewer(App):
                 return
 
             sha_r = run(["git", "rev-parse", "HEAD"], cwd=local_path)
-            head_sha = sha_r.stdout.strip() if sha_r.returncode == 0 else ""
+            if sha_r.returncode != 0:
+                err = (sha_r.stderr or sha_r.stdout).strip() or f"exit {sha_r.returncode}"
+                print(f"warning: could not resolve HEAD in {local_path}: {err}")
+                head_sha = ""
+            else:
+                head_sha = sha_r.stdout.strip()
 
             print("Fetching existing review comments…")
-            existing = fetch_existing_review_comments(repo_full, number)
-            existing_block = format_existing_comments(existing)
+            existing, fetch_ok = fetch_existing_review_comments(repo_full, number)
+            existing_block, shown = format_existing_comments(existing)
 
             sections = [REVIEW_PROMPT]
             if existing_block:
@@ -584,8 +627,15 @@ class PRReviewer(App):
                 post = POST_INLINE_PROMPT
                 if existing_block:
                     post += POST_INLINE_DEDUP_SUFFIX
+                elif not fetch_ok:
+                    post += POST_INLINE_FETCH_FAILED_SUFFIX
                 sections.append(post)
             prompt = PROMPT_SECTION_SEP.join(sections)
+
+            if not fetch_ok:
+                existing_desc = "existing comments: fetch failed"
+            else:
+                existing_desc = f"existing comments: {shown} in prompt of {len(existing)} fetched"
 
             cmd = ["claude"]
             if self.auto_accept:
@@ -595,18 +645,26 @@ class PRReviewer(App):
                 f"\nLaunching Claude Code "
                 f"(auto-accept: {'on' if self.auto_accept else 'off'}, "
                 f"post-inline: {'on' if self.post_inline else 'off'}, "
-                f"existing comments: {len(existing)}) "
+                f"{existing_desc}) "
                 "— type /exit when you're done.\n"
             )
-            subprocess.call(cmd, cwd=local_path)
+            rc = subprocess.call(cmd, cwd=local_path)
 
-            key = _pr_key(pr)
-            self.review_state[key] = _record_review(
-                self.review_db,
-                key,
-                pr.get("updatedAt", ""),
-                head_sha,
-            )
+            # Only count this as a review if Claude exited cleanly. Ctrl-C,
+            # crashes, or a failed launch leave rc != 0; recording those
+            # would inflate the "Reviews" count and reset staleness for a
+            # PR that wasn't actually reviewed, hiding genuine drift from
+            # the next real session.
+            if rc == 0:
+                key = _pr_key(pr)
+                self.review_state[key] = _record_review(
+                    self.review_db,
+                    key,
+                    pr.get("updatedAt", ""),
+                    head_sha,
+                )
+            else:
+                print(f"\nClaude exited with status {rc}; not recording this as a review.")
 
             input("\n── Claude session ended. Press Enter to return to the TUI ──")
 
