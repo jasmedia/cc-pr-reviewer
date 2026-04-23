@@ -61,11 +61,22 @@ POST_INLINE_PROMPT = (
     "--method POST /repos/{owner}/{repo}/pulls/{number}/reviews` with an array "
     "of `comments` entries (each with `path`, `line`, and `body`), then submit "
     "the review with `event: COMMENT` so all findings appear grouped. Use the "
-    "PR's head commit SHA when the endpoint requires `commit_id`. Before "
-    "submitting, cross-check each finding against the list of existing review "
-    "comments above and drop any that duplicate a previously posted comment "
-    "(same file+line+substantive point)."
+    "PR's head commit SHA when the endpoint requires `commit_id`."
 )
+
+# Appended to POST_INLINE_PROMPT only when we actually have existing comments
+# to cross-reference (see `_launch_claude`). Without that list the instruction
+# is meaningless and can cause hallucinated caution.
+POST_INLINE_DEDUP_SUFFIX = (
+    " Before submitting, cross-check each finding against the list of existing "
+    "review comments above and drop any that duplicate a previously posted "
+    "comment (same file+line+substantive point)."
+)
+
+# Caps for the existing-comments block injected into the prompt. Bound prompt
+# size on PRs with lots of prior review activity.
+EXISTING_COMMENT_BODY_CAP = 200
+EXISTING_COMMENT_LIST_CAP = 50
 
 
 # --- Subprocess helpers ----------------------------------------------------
@@ -155,7 +166,9 @@ def fetch_my_prs() -> list[dict[str, Any]]:
 def fetch_existing_review_comments(repo: str, number: int) -> list[dict[str, Any]]:
     """Inline review comments already posted on the PR.
 
-    Returns [] on any failure — this is non-fatal context for the review prompt.
+    Returns [] on any failure, printing a one-line warning so the user knows
+    dedup context was unavailable (silent `[]` would let Claude re-post the
+    same findings, which is exactly the bug this is meant to prevent).
     """
     r = run(
         [
@@ -165,27 +178,31 @@ def fetch_existing_review_comments(repo: str, number: int) -> list[dict[str, Any
             f"repos/{repo}/pulls/{number}/comments",
         ]
     )
+    target = f"{repo}#{number}"
     if r.returncode != 0:
+        err = (r.stderr or r.stdout).strip() or f"exit {r.returncode}"
+        print(f"warning: could not fetch existing comments for {target}: {err}")
         return []
     try:
         data = json.loads(r.stdout or "[]")
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
+        print(f"warning: could not parse existing comments for {target}: {e}")
         return []
-    return data if isinstance(data, list) else []
-
-
-_COMMENT_BODY_CAP = 200
-_COMMENT_LIST_CAP = 50
+    if not isinstance(data, list):
+        print(f"warning: unexpected comments payload for {target}: {type(data).__name__}")
+        return []
+    return data
 
 
 def format_existing_comments(comments: list[dict[str, Any]]) -> str:
-    """Compact prompt block listing prior inline review comments, or ''."""
+    """Compact prompt block listing up to the 50 most recent inline review
+    comments (bodies truncated to ~200 chars), or '' if none."""
     if not comments:
         return ""
     # Sort most-recent first, then cap to keep the prompt bounded.
     ordered = sorted(comments, key=lambda c: c.get("created_at", ""), reverse=True)
-    truncated = len(ordered) > _COMMENT_LIST_CAP
-    ordered = ordered[:_COMMENT_LIST_CAP]
+    truncated = len(ordered) > EXISTING_COMMENT_LIST_CAP
+    ordered = ordered[:EXISTING_COMMENT_LIST_CAP]
 
     lines = [
         "Existing review comments already posted on this PR (do NOT repost "
@@ -194,13 +211,16 @@ def format_existing_comments(comments: list[dict[str, Any]]) -> str:
     for c in ordered:
         user = (c.get("user") or {}).get("login", "?")
         path = c.get("path", "?")
-        line_no = c.get("line") or c.get("original_line") or "?"
-        body = (c.get("body") or "").strip().replace("\n", " ")
-        if len(body) > _COMMENT_BODY_CAP:
-            body = body[: _COMMENT_BODY_CAP - 1] + "…"
-        lines.append(f'- @{user} on {path}:{line_no} — "{body}"')
+        line_no = c.get("line")
+        if line_no is None:
+            line_no = c.get("original_line")
+        locus = f"{path}:{line_no}" if line_no is not None else f"{path} (file-level)"
+        body = " ".join((c.get("body") or "").split())
+        if len(body) > EXISTING_COMMENT_BODY_CAP:
+            body = body[: EXISTING_COMMENT_BODY_CAP - 1] + "…"
+        lines.append(f'- @{user} on {locus} — "{body}"')
     if truncated:
-        lines.append(f"(showing {_COMMENT_LIST_CAP} most recent of {len(comments)} total)")
+        lines.append(f"(showing {EXISTING_COMMENT_LIST_CAP} most recent of {len(comments)} total)")
     return "\n".join(lines)
 
 
@@ -553,20 +573,18 @@ class PRReviewer(App):
                 prompt += "\n\n" + existing_block
             if self.post_inline:
                 prompt += POST_INLINE_PROMPT
+                if existing_block:
+                    prompt += POST_INLINE_DEDUP_SUFFIX
 
             cmd = ["claude"]
             if self.auto_accept:
                 cmd += ["--permission-mode", "acceptEdits"]
             cmd.append(prompt)
-            if existing:
-                print(
-                    f"\nFound {len(existing)} existing review comment(s); "
-                    "Claude will skip duplicates."
-                )
             print(
                 f"\nLaunching Claude Code "
                 f"(auto-accept: {'on' if self.auto_accept else 'off'}, "
-                f"post-inline: {'on' if self.post_inline else 'off'}) "
+                f"post-inline: {'on' if self.post_inline else 'off'}, "
+                f"existing comments: {len(existing)}) "
                 "— type /exit when you're done.\n"
             )
             subprocess.call(cmd, cwd=local_path)
