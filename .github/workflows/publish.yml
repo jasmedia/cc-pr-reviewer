@@ -14,10 +14,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v6
 
       - name: Build sdist and wheel
         run: uv build
@@ -26,7 +26,7 @@ jobs:
         run: uvx twine check dist/*
 
       - name: Upload distribution artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: dist
           path: dist/
@@ -48,10 +48,15 @@ jobs:
       id-token: write
     steps:
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v6
+        with:
+          # No repo checked out in this job, so there's no uv.lock to key
+          # the cache on. Disable to silence "empty workdir" / "cache will
+          # never get invalidated" warnings.
+          enable-cache: false
 
       - name: Download distribution artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: dist
           path: dist/
