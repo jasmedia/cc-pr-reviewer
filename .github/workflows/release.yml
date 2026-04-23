@@ -24,7 +24,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
           # PAT with Contents: read/write, listed in the branch-protection
@@ -32,7 +32,7 @@ jobs:
           token: ${{ secrets.RELEASE_TOKEN }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v6
 
       - name: Configure git identity
         run: |
