@@ -25,3 +25,6 @@ dist/
 
 # Runtime state
 .review_state.db
+
+# Local notes
+feature-extend.md

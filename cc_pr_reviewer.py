@@ -29,6 +29,7 @@ import sqlite3
 import subprocess
 import urllib.request
 import webbrowser
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
@@ -443,31 +444,57 @@ class DiffScreen(ModalScreen):
 # --- Confirm modal ---------------------------------------------------------
 
 
-class ConfirmScreen(ModalScreen[bool]):
-    """Yes/No confirmation modal. Dismisses with True on Enter/y, False otherwise."""
+@dataclass(frozen=True)
+class ConfirmResult:
+    """Outcome of a confirmed ConfirmScreen — distinct from cancel (None)."""
+
+    post_inline: bool
+
+
+class ConfirmScreen(ModalScreen[ConfirmResult | None]):
+    """Confirm Claude Code launch for a PR review, with a post-inline toggle.
+
+    Dismisses with None on cancel, or a ConfirmResult on confirm. Keeping
+    cancel and confirm in separate shapes prevents a future truthy check
+    (`if result:`) from silently swallowing the post-inline-off case.
+    """
 
     BINDINGS = [
         Binding("enter,y", "confirm", "Yes"),
         Binding("escape,n,q", "cancel", "No"),
+        Binding("p", "toggle_post_inline", "Toggle post inline"),
     ]
 
     def __init__(self, prompt: str):
         super().__init__()
         self.prompt = prompt
+        self.post_inline = True
 
     def compose(self) -> ComposeResult:
-        hint = "[b]Enter[/] / [b]y[/] to proceed • [b]Esc[/] / [b]n[/] to cancel"
+        hint = (
+            "[b]Enter[/] / [b]y[/] to proceed • [b]Esc[/] / [b]n[/] to cancel "
+            "• [b]p[/] to toggle post-inline"
+        )
         yield Vertical(
             Label(self.prompt, id="confirm-title"),
+            Label(self._checkbox_text(), id="confirm-checkbox", markup=False),
             Label(hint, id="confirm-hint"),
             id="confirm-container",
         )
 
+    def _checkbox_text(self) -> str:
+        mark = "[x]" if self.post_inline else "[ ]"
+        return f"{mark} Post findings as inline PR comments"
+
     def action_confirm(self) -> None:
-        self.dismiss(True)
+        self.dismiss(ConfirmResult(post_inline=self.post_inline))
 
     def action_cancel(self) -> None:
-        self.dismiss(False)
+        self.dismiss(None)
+
+    def action_toggle_post_inline(self) -> None:
+        self.post_inline = not self.post_inline
+        self.query_one("#confirm-checkbox", Label).update(self._checkbox_text())
 
 
 # --- Main app --------------------------------------------------------------
@@ -545,7 +572,6 @@ class PRReviewer(App):
         Binding("o", "open_web", "Open in browser"),
         Binding("d", "show_diff", "View diff"),
         Binding("m", "toggle_mine", "Toggle my PRs"),
-        Binding("p", "toggle_post_inline", "Toggle post inline"),
         Binding("u", "open_releases", "Releases"),
         Binding("q", "quit", "Quit"),
     ]
@@ -554,7 +580,6 @@ class PRReviewer(App):
         super().__init__()
         self.prs: list[dict[str, Any]] = []
         self.include_mine: bool = False
-        self.post_inline: bool = True
         self.latest_version: str | None = None
         self.review_db: sqlite3.Connection = _open_review_db()
         self.review_state: dict[str, dict[str, Any]] = _load_review_state(self.review_db)
@@ -602,12 +627,10 @@ class PRReviewer(App):
         table = self.query_one("#pr-table", DataTable)
         table.clear()
         mode = " (+mine)" if self.include_mine else ""
-        post = "on" if self.post_inline else "off"
         if not data:
             self._set_status(
                 f"No PRs awaiting your review 🎉{mode}   "
-                f"post-inline: {post}   "
-                "(m: mine, p: post-inline, r: refresh, u: releases, q: quit)"
+                "(m: mine, r: refresh, u: releases, q: quit)"
             )
             return
         for i, pr in enumerate(data):
@@ -637,9 +660,9 @@ class PRReviewer(App):
                 key=str(i),
             )
         self._set_status(
-            f"{len(data)} PR(s){mode}   post-inline: {post}   "
+            f"{len(data)} PR(s){mode}   "
             "•  enter: review  •  d: diff  •  o: browser  •  m: mine  "
-            "•  p: post-inline  •  r: refresh  •  u: releases  •  q: quit"
+            "•  r: refresh  •  u: releases  •  q: quit"
         )
 
     def _selected(self) -> dict[str, Any] | None:
@@ -669,9 +692,9 @@ class PRReviewer(App):
         title = pr.get("title", "")
         prompt = f"Launch Claude Code review for {repo}#{pr['number']}?\n{title}"
 
-        def _proceed(confirmed: bool | None) -> None:
-            if confirmed:
-                self._launch_claude(pr)
+        def _proceed(result: ConfirmResult | None) -> None:
+            if result is not None:
+                self._launch_claude(pr, result.post_inline)
 
         self.push_screen(ConfirmScreen(prompt), _proceed)
 
@@ -679,13 +702,9 @@ class PRReviewer(App):
         self.include_mine = not self.include_mine
         self.action_refresh()
 
-    def action_toggle_post_inline(self) -> None:
-        self.post_inline = not self.post_inline
-        self._populate(self.prs)
-
     # --- launching claude ---
 
-    def _launch_claude(self, pr: dict[str, Any]) -> None:
+    def _launch_claude(self, pr: dict[str, Any], post_inline: bool) -> None:
         repo_full = pr["repository"]["nameWithOwner"]
         owner, name = repo_full.split("/", 1)
         number = pr["number"]
@@ -731,7 +750,7 @@ class PRReviewer(App):
             sections = [REVIEW_PROMPT]
             if existing_block:
                 sections.append(existing_block)
-            if self.post_inline:
+            if post_inline:
                 post = POST_INLINE_PROMPT
                 if existing_block:
                     post += POST_INLINE_DEDUP_SUFFIX
@@ -748,7 +767,7 @@ class PRReviewer(App):
             cmd = ["claude", "--permission-mode", "acceptEdits", prompt]
             print(
                 f"\nLaunching Claude Code "
-                f"(post-inline: {'on' if self.post_inline else 'off'}, "
+                f"(post-inline: {'on' if post_inline else 'off'}, "
                 f"{existing_desc}) "
                 "— type /exit when you're done.\n"
             )

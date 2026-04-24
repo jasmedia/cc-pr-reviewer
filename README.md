@@ -11,18 +11,11 @@ driving the review.
   queue across every repo you have access to.
 - Displays them in a scrollable table (repo, number, title, author, age,
   draft flag).
-- Keyboard-driven: pick a PR and either
-  - **Enter** — opens a confirmation modal; on **Enter/y** it clones the
-    repo (if needed), checks out the PR branch via `gh pr checkout`, and
-    launches `claude` inside that working tree with a prompt that invokes
-    the PR Review Toolkit agents. **Esc/n/q** cancels without side effects.
-  - **d** — full-screen `gh pr diff` viewer.
-  - **o** — open the PR in your browser.
-  - **m** — include PRs you authored in the list.
-  - **p** — toggle post-inline (instruct Claude to publish the findings
-    as inline PR review comments via `gh api`, grouped under one review).
-  - **r / F5** — refresh.
-  - **q** — quit.
+- Keyboard-driven: pick a PR and press **Enter** to open a confirmation
+  modal; on **Enter/y** it clones the repo (if needed), checks out the PR
+  branch via `gh pr checkout`, and launches `claude` inside that working
+  tree with a prompt that invokes the PR Review Toolkit agents. See
+  [Keybindings](#keybindings) for the full list.
 
 ## Prerequisites
 
@@ -89,14 +82,14 @@ before checking out the PR.
 | `d`           | View full diff                                               |
 | `o`           | Open PR in browser                                           |
 | `m`           | Toggle inclusion of PRs you authored                         |
-| `p`           | Toggle post-inline (publish findings as inline PR comments)  |
 | `r` / `F5`    | Refresh the list                                             |
 | `q`           | Quit                                                         |
 
-Inside the confirmation modal: `Enter` / `y` to proceed, `Esc` / `n` / `q` to cancel.
-
-The current state of the `p` toggle is shown in the status bar and is
-also printed before Claude launches.
+Inside the confirmation modal: `Enter` / `y` to proceed, `Esc` / `n` / `q`
+to cancel, `p` to toggle post-inline (instruct Claude to publish the
+findings as inline PR review comments via `gh api`, grouped under one
+review). The toggle defaults to on each time the modal opens; the chosen
+value is printed before Claude launches.
 
 ## How the Claude launch works
 
@@ -120,52 +113,9 @@ the PR's working tree, it has full file-level context.
 don't interrupt the review — the same mode you get with shift+tab
 inside a Claude session.
 
-If **post-inline** (`p`) is on, the prompt is extended to ask Claude to
-publish each finding as an inline review comment via a single
-`POST /repos/{owner}/{repo}/pulls/{n}/reviews` call through `gh api`, so
-they land grouped under one review.
+If the modal's **post-inline** checkbox (`p`) is on, the prompt is
+extended to ask Claude to publish each finding as an inline review
+comment via a single `POST /repos/{owner}/{repo}/pulls/{n}/reviews` call
+through `gh api`, so they land grouped under one review.
 
 When you `/exit` Claude, press Enter and the TUI returns.
-
-## Extending
-
-A few natural next steps if you want to go further:
-
-- Add filters (by org, by repo, by author) — `gh search prs` already
-  accepts `--owner`, `--repo`, `--author`.
-- Cache the PR list to disk with a TTL so startup is instant.
-- Add a "my authored PRs" tab (`--author=@me`) to re-use the same UI for
-  tracking your own open PRs.
-- Swap the hard-coded `REVIEW_PROMPT` for a couple of presets bound to
-  different keys (e.g. `t` for tests-only, `s` for simplify-only).
-
-## Releasing
-
-Releases are automated via two GitHub Actions workflows:
-
-1. **Release** (`.github/workflows/release.yml`) — `workflow_dispatch` with a
-   `bump` input (`patch` / `minor` / `major`). It runs `uv version --bump`,
-   commits `pyproject.toml` + `uv.lock` as `chore(release): X.Y.Z`, tags
-   `vX.Y.Z`, pushes both to `main`, and creates a GitHub release with
-   auto-generated notes. Requires a `RELEASE_TOKEN` secret (PAT with
-   Contents: read/write, allowlisted on branch protection so the bot can
-   push to `main`).
-2. **Publish to PyPI** (`.github/workflows/publish.yml`) — triggered by
-   `release: published`. Builds sdist + wheel with `uv build`, validates
-   with `twine check`, and publishes via `uv publish --trusted-publishing
-   always`. No token is stored; PyPI's Trusted Publisher config (pypi.org
-   → Manage → Publishing) authorises this repo/workflow/environment
-   (`pypi`) via OIDC.
-
-To cut a release: go to Actions → **Release** → Run workflow, pick the
-bump type. When it finishes, the publish workflow runs automatically on
-the resulting GitHub release. Verify from a clean environment:
-
-```sh
-uv tool install cc-pr-reviewer
-cc-pr-reviewer
-```
-
-Manual fallback (if you ever need to publish locally): `uv build && uvx
-twine check dist/* && uv publish` with `UV_PUBLISH_TOKEN` set to a PyPI
-API token.
