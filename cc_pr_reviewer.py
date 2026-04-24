@@ -665,7 +665,7 @@ class PRReviewer(App):
         yield Header(show_clock=True)
         yield Static("", id="version-badge")
         yield PRDataTable(id="pr-table", cursor_type="row", zebra_stripes=True)
-        yield Static("Loading…", id="status")
+        yield Static("Loading…", id="status", markup=False)
         yield Footer()
 
     def on_mount(self) -> None:
