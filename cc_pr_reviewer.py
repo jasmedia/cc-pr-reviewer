@@ -442,6 +442,36 @@ class DiffScreen(ModalScreen):
         )
 
 
+# --- Confirm modal ---------------------------------------------------------
+
+
+class ConfirmScreen(ModalScreen[bool]):
+    """Yes/No confirmation modal. Dismisses with True on Enter/y, False otherwise."""
+
+    BINDINGS = [
+        Binding("enter,y", "confirm", "Yes"),
+        Binding("escape,n,q", "cancel", "No"),
+    ]
+
+    def __init__(self, prompt: str):
+        super().__init__()
+        self.prompt = prompt
+
+    def compose(self) -> ComposeResult:
+        hint = "[b]Enter[/] / [b]y[/] to proceed • [b]Esc[/] / [b]n[/] to cancel"
+        yield Vertical(
+            Label(self.prompt, id="confirm-title"),
+            Label(hint, id="confirm-hint"),
+            id="confirm-container",
+        )
+
+    def action_confirm(self) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
 # --- Main app --------------------------------------------------------------
 
 
@@ -491,6 +521,20 @@ class PRReviewer(App):
         height: 1fr;
         overflow-y: auto;
         padding: 1;
+    }
+    #confirm-container {
+        border: round $primary;
+        padding: 1 2;
+        margin: 4 8;
+        background: $panel;
+        height: auto;
+    }
+    #confirm-title {
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    #confirm-hint {
+        color: $text-muted;
     }
     """
 
@@ -624,8 +668,17 @@ class PRReviewer(App):
 
     def action_review(self) -> None:
         pr = self._selected()
-        if pr:
-            self._launch_claude(pr)
+        if not pr:
+            return
+        repo = pr["repository"]["nameWithOwner"]
+        title = pr.get("title", "")
+        prompt = f"Launch Claude Code review for {repo}#{pr['number']}?\n{title}"
+
+        def _proceed(confirmed: bool | None) -> None:
+            if confirmed:
+                self._launch_claude(pr)
+
+        self.push_screen(ConfirmScreen(prompt), _proceed)
 
     def action_toggle_mine(self) -> None:
         self.include_mine = not self.include_mine
