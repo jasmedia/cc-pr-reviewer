@@ -41,7 +41,8 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
 from textual.screen import ModalScreen
-from textual.widgets import DataTable, Footer, Header, Label, Static
+from textual.widgets import DataTable, Footer, Header, Label, OptionList, Static
+from textual.widgets.option_list import Option
 
 # --- Configuration ---------------------------------------------------------
 
@@ -206,14 +207,19 @@ def _search_prs(extra: list[str]) -> list[dict[str, Any]]:
     return json.loads(r.stdout or "[]")
 
 
-def fetch_review_prs() -> list[dict[str, Any]]:
+def _repo_filter_arg(repo: str) -> list[str]:
+    repo = (repo or "").strip()
+    return [f"--repo={repo}"] if repo else []
+
+
+def fetch_review_prs(repo: str = "") -> list[dict[str, Any]]:
     """All open PRs across GitHub where @me is a requested reviewer."""
-    return _search_prs(["--review-requested=@me"])
+    return _search_prs(["--review-requested=@me", *_repo_filter_arg(repo)])
 
 
-def fetch_my_prs() -> list[dict[str, Any]]:
+def fetch_my_prs(repo: str = "") -> list[dict[str, Any]]:
     """All open PRs across GitHub authored by @me."""
-    return _search_prs(["--author=@me"])
+    return _search_prs(["--author=@me", *_repo_filter_arg(repo)])
 
 
 def fetch_existing_review_comments(repo: str, number: int) -> tuple[list[dict[str, Any]], bool]:
@@ -497,6 +503,53 @@ class ConfirmScreen(ModalScreen[ConfirmResult | None]):
         self.query_one("#confirm-checkbox", Label).update(self._checkbox_text())
 
 
+# --- Filter modal ----------------------------------------------------------
+
+
+CLEAR_FILTER_OPTION_ID = "__clear__"
+
+
+class FilterScreen(ModalScreen[str | None]):
+    """Pick a repo from the cached list to filter the PR view.
+
+    Dismisses with the chosen repo (`""` to clear) on Enter, or None on Esc.
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, repos: list[str], current: str):
+        super().__init__()
+        self.repos = repos
+        self.current = current
+
+    def compose(self) -> ComposeResult:
+        options: list[Option] = [Option("(any repo — clear filter)", id=CLEAR_FILTER_OPTION_ID)]
+        for repo in self.repos:
+            options.append(Option(repo, id=repo))
+        title = "Filter PRs by repo" if self.repos else "Filter PRs by repo (no repos cached yet)"
+        yield Vertical(
+            Label(title, id="filter-title"),
+            OptionList(*options, id="filter-list"),
+            Label("[b]Enter[/] select • [b]Esc[/] cancel", id="filter-hint"),
+            id="filter-container",
+        )
+
+    def on_mount(self) -> None:
+        ol = self.query_one("#filter-list", OptionList)
+        if self.current and self.current in self.repos:
+            ol.highlighted = self.repos.index(self.current) + 1  # +1 for the clear row
+        else:
+            ol.highlighted = 0
+        ol.focus()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        chosen = event.option.id or ""
+        self.dismiss("" if chosen == CLEAR_FILTER_OPTION_ID else chosen)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 # --- Main app --------------------------------------------------------------
 
 
@@ -561,6 +614,26 @@ class PRReviewer(App):
     #confirm-hint {
         color: $text-muted;
     }
+    #filter-container {
+        border: round $primary;
+        padding: 1 2;
+        margin: 4 8;
+        background: $panel;
+        height: auto;
+    }
+    #filter-title {
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    #filter-list {
+        height: auto;
+        max-height: 20;
+        margin: 1 0;
+    }
+    #filter-hint {
+        color: $text-muted;
+        margin-top: 1;
+    }
     """
 
     TITLE = "GitHub PR Reviewer"
@@ -572,6 +645,8 @@ class PRReviewer(App):
         Binding("o", "open_web", "Open in browser"),
         Binding("d", "show_diff", "View diff"),
         Binding("m", "toggle_mine", "Toggle my PRs"),
+        Binding("f", "filter", "Filter by repo"),
+        Binding("C", "clear_filter", "Clear filter"),
         Binding("u", "open_releases", "Releases"),
         Binding("q", "quit", "Quit"),
     ]
@@ -580,6 +655,8 @@ class PRReviewer(App):
         super().__init__()
         self.prs: list[dict[str, Any]] = []
         self.include_mine: bool = False
+        self.repo_filter: str = ""
+        self.repo_cache: list[str] = []
         self.latest_version: str | None = None
         self.review_db: sqlite3.Connection = _open_review_db()
         self.review_state: dict[str, dict[str, Any]] = _load_review_state(self.review_db)
@@ -607,11 +684,12 @@ class PRReviewer(App):
 
     @work(thread=True, exclusive=True)
     def _load_prs(self) -> None:
+        repo = self.repo_filter
         try:
-            data = fetch_review_prs()
+            data = fetch_review_prs(repo)
             if self.include_mine:
                 seen = {(p["repository"]["nameWithOwner"], p["number"]) for p in data}
-                for pr in fetch_my_prs():
+                for pr in fetch_my_prs(repo):
                     key = (pr["repository"]["nameWithOwner"], pr["number"])
                     if key in seen:
                         continue
@@ -622,15 +700,23 @@ class PRReviewer(App):
             return
         self.call_from_thread(self._populate, data)
 
+    def _filter_desc(self) -> str:
+        return f" [repo={self.repo_filter}]" if self.repo_filter else ""
+
     def _populate(self, data: list[dict[str, Any]]) -> None:
         self.prs = data
+        # Refresh repo cache only on unfiltered fetches; otherwise the cache
+        # would shrink to whatever the active filter happens to allow.
+        if not self.repo_filter and data:
+            self.repo_cache = sorted({pr["repository"]["nameWithOwner"] for pr in data})
         table = self.query_one("#pr-table", DataTable)
         table.clear()
         mode = " (+mine)" if self.include_mine else ""
+        filter_desc = self._filter_desc()
         if not data:
             self._set_status(
-                f"No PRs awaiting your review 🎉{mode}   "
-                "(m: mine, r: refresh, u: releases, q: quit)"
+                f"No PRs awaiting your review 🎉{mode}{filter_desc}   "
+                "(f: filter, m: mine, r: refresh, u: releases, q: quit)"
             )
             return
         for i, pr in enumerate(data):
@@ -660,8 +746,8 @@ class PRReviewer(App):
                 key=str(i),
             )
         self._set_status(
-            f"{len(data)} PR(s){mode}   "
-            "•  enter: review  •  d: diff  •  o: browser  •  m: mine  "
+            f"{len(data)} PR(s){mode}{filter_desc}   "
+            "•  enter: review  •  d: diff  •  o: browser  •  f: filter  •  m: mine  "
             "•  r: refresh  •  u: releases  •  q: quit"
         )
 
@@ -700,6 +786,21 @@ class PRReviewer(App):
 
     def action_toggle_mine(self) -> None:
         self.include_mine = not self.include_mine
+        self.action_refresh()
+
+    def action_filter(self) -> None:
+        def _apply(result: str | None) -> None:
+            if result is None or result == self.repo_filter:
+                return
+            self.repo_filter = result
+            self.action_refresh()
+
+        self.push_screen(FilterScreen(self.repo_cache, self.repo_filter), _apply)
+
+    def action_clear_filter(self) -> None:
+        if not self.repo_filter:
+            return
+        self.repo_filter = ""
         self.action_refresh()
 
     # --- launching claude ---
