@@ -445,6 +445,14 @@ class DiffScreen(ModalScreen):
 # --- Main app --------------------------------------------------------------
 
 
+class PRDataTable(DataTable):
+    # `action_select_cursor` is the Enter-key handler only; clicks go through
+    # `_on_click`, which posts `RowSelected` directly. Overriding here routes
+    # Enter to review while leaving mouse clicks as pure cursor moves.
+    def action_select_cursor(self) -> None:
+        self.app.action_review()  # type: ignore[attr-defined]
+
+
 class PRReviewer(App):
     CSS = """
     Screen { background: $surface; }
@@ -491,7 +499,7 @@ class PRReviewer(App):
 
     BINDINGS = [
         Binding("r,f5", "refresh", "Refresh"),
-        Binding("enter,c", "review", "Review w/ Claude"),
+        Binding("enter", "review", "Review w/ Claude"),
         Binding("o", "open_web", "Open in browser"),
         Binding("d", "show_diff", "View diff"),
         Binding("m", "toggle_mine", "Toggle my PRs"),
@@ -514,7 +522,7 @@ class PRReviewer(App):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield Static("", id="version-badge")
-        yield DataTable(id="pr-table", cursor_type="row", zebra_stripes=True)
+        yield PRDataTable(id="pr-table", cursor_type="row", zebra_stripes=True)
         yield Static("Loading…", id="status")
         yield Footer()
 
@@ -618,11 +626,6 @@ class PRReviewer(App):
         pr = self._selected()
         if pr:
             self._launch_claude(pr)
-
-    # DataTable swallows Enter for its own RowSelected event before the
-    # app-level `enter` binding can fire, so route that event to review.
-    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        self.action_review()
 
     def action_toggle_mine(self) -> None:
         self.include_mine = not self.include_mine
