@@ -230,9 +230,7 @@ def fetch_existing_review_comments(repo: str, number: int) -> tuple[list[dict[st
         [
             "gh",
             "api",
-            "-F",
-            "per_page=100",
-            f"repos/{repo}/pulls/{number}/comments",
+            f"repos/{repo}/pulls/{number}/comments?per_page=100",
         ]
     )
     target = f"{repo}#{number}"
