@@ -467,7 +467,7 @@ class ConfirmScreen(ModalScreen["bool | None"]):
         )
         yield Vertical(
             Label(self.prompt, id="confirm-title"),
-            Label(self._checkbox_text(), id="confirm-checkbox"),
+            Label(self._checkbox_text(), id="confirm-checkbox", markup=False),
             Label(hint, id="confirm-hint"),
             id="confirm-container",
         )
