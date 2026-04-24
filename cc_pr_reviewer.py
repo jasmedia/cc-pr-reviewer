@@ -29,6 +29,7 @@ import sqlite3
 import subprocess
 import urllib.request
 import webbrowser
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
@@ -443,10 +444,19 @@ class DiffScreen(ModalScreen):
 # --- Confirm modal ---------------------------------------------------------
 
 
-class ConfirmScreen(ModalScreen["bool | None"]):
+@dataclass(frozen=True)
+class ConfirmResult:
+    """Outcome of a confirmed ConfirmScreen — distinct from cancel (None)."""
+
+    post_inline: bool
+
+
+class ConfirmScreen(ModalScreen[ConfirmResult | None]):
     """Confirm Claude Code launch for a PR review, with a post-inline toggle.
 
-    Dismisses with None on cancel, or the chosen post_inline bool on confirm.
+    Dismisses with None on cancel, or a ConfirmResult on confirm. Keeping
+    cancel and confirm in separate shapes prevents a future truthy check
+    (`if result:`) from silently swallowing the post-inline-off case.
     """
 
     BINDINGS = [
@@ -455,10 +465,10 @@ class ConfirmScreen(ModalScreen["bool | None"]):
         Binding("p", "toggle_post_inline", "Toggle post inline"),
     ]
 
-    def __init__(self, prompt: str, post_inline: bool = True):
+    def __init__(self, prompt: str):
         super().__init__()
         self.prompt = prompt
-        self.post_inline = post_inline
+        self.post_inline = True
 
     def compose(self) -> ComposeResult:
         hint = (
@@ -477,7 +487,7 @@ class ConfirmScreen(ModalScreen["bool | None"]):
         return f"{mark} Post findings as inline PR comments"
 
     def action_confirm(self) -> None:
-        self.dismiss(self.post_inline)
+        self.dismiss(ConfirmResult(post_inline=self.post_inline))
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -682,9 +692,9 @@ class PRReviewer(App):
         title = pr.get("title", "")
         prompt = f"Launch Claude Code review for {repo}#{pr['number']}?\n{title}"
 
-        def _proceed(post_inline: bool | None) -> None:
-            if post_inline is not None:
-                self._launch_claude(pr, post_inline)
+        def _proceed(result: ConfirmResult | None) -> None:
+            if result is not None:
+                self._launch_claude(pr, result.post_inline)
 
         self.push_screen(ConfirmScreen(prompt), _proceed)
 
