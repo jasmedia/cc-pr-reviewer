@@ -619,6 +619,11 @@ class PRReviewer(App):
         if pr:
             self._launch_claude(pr)
 
+    # DataTable swallows Enter for its own RowSelected event before the
+    # app-level `enter` binding can fire, so route that event to review.
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        self.action_review()
+
     def action_toggle_mine(self) -> None:
         self.include_mine = not self.include_mine
         self.action_refresh()
