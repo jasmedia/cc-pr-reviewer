@@ -12,14 +12,13 @@ driving the review.
 - Displays them in a scrollable table (repo, number, title, author, age,
   draft flag).
 - Keyboard-driven: pick a PR and either
-  - **Enter / c** — clones the repo (if needed), checks out the PR branch
-    via `gh pr checkout`, and launches `claude` inside that working tree
-    with a prompt that invokes the PR Review Toolkit agents.
+  - **Enter** — opens a confirmation modal; on **Enter/y** it clones the
+    repo (if needed), checks out the PR branch via `gh pr checkout`, and
+    launches `claude` inside that working tree with a prompt that invokes
+    the PR Review Toolkit agents. **Esc/n/q** cancels without side effects.
   - **d** — full-screen `gh pr diff` viewer.
   - **o** — open the PR in your browser.
   - **m** — include PRs you authored in the list.
-  - **a** — toggle auto-accept (pass `--permission-mode acceptEdits` to
-    Claude so file-edit prompts don't interrupt the review).
   - **p** — toggle post-inline (instruct Claude to publish the findings
     as inline PR review comments via `gh api`, grouped under one review).
   - **r / F5** — refresh.
@@ -86,27 +85,30 @@ before checking out the PR.
 | Key           | Action                                                       |
 | ------------- | ------------------------------------------------------------ |
 | `↑` / `↓`     | Move through PRs                                             |
-| `Enter` / `c` | Clone + checkout + launch Claude Code review                 |
+| `Enter`       | Confirm, then clone + checkout + launch Claude Code review   |
 | `d`           | View full diff                                               |
 | `o`           | Open PR in browser                                           |
 | `m`           | Toggle inclusion of PRs you authored                         |
-| `a`           | Toggle auto-accept (`--permission-mode acceptEdits`)         |
 | `p`           | Toggle post-inline (publish findings as inline PR comments)  |
 | `r` / `F5`    | Refresh the list                                             |
 | `q`           | Quit                                                         |
 
-The current state of the `a` and `p` toggles is shown in the status bar
-and is also printed before Claude launches.
+Inside the confirmation modal: `Enter` / `y` to proceed, `Esc` / `n` / `q` to cancel.
+
+The current state of the `p` toggle is shown in the status bar and is
+also printed before Claude launches.
 
 ## How the Claude launch works
 
-When you press **Enter** on a row, the TUI suspends itself and runs, in order:
+When you press **Enter** on a row, a confirmation modal shows the target
+PR (`repo#N` + title). On **Enter/y** the TUI suspends itself and runs,
+in order:
 
 ```sh
 gh repo clone <owner>/<repo>                      # only if not already cloned
 git fetch --all --prune                           # otherwise
 gh pr checkout <N> --force
-claude [--permission-mode acceptEdits] "<review prompt>"
+claude --permission-mode acceptEdits "<review prompt>"
 ```
 
 The review prompt asks the PR Review Toolkit to run its six sub-agents
@@ -114,9 +116,9 @@ The review prompt asks the PR Review Toolkit to run its six sub-agents
 Analyzer, Code Reviewer, Code Simplifier). Because Claude Code starts in
 the PR's working tree, it has full file-level context.
 
-If **auto-accept** (`a`) is on, `--permission-mode acceptEdits` is passed
-so file-edit prompts don't interrupt the review — the same mode you get
-with shift+tab inside a Claude session.
+`--permission-mode acceptEdits` is always passed so file-edit prompts
+don't interrupt the review — the same mode you get with shift+tab
+inside a Claude session.
 
 If **post-inline** (`p`) is on, the prompt is extended to ask Claude to
 publish each finding as an inline review comment via a single
