@@ -440,7 +440,45 @@ class DiffScreen(ModalScreen):
         )
 
 
+# --- Confirm modal ---------------------------------------------------------
+
+
+class ConfirmScreen(ModalScreen[bool]):
+    """Yes/No confirmation modal. Dismisses with True on Enter/y, False otherwise."""
+
+    BINDINGS = [
+        Binding("enter,y", "confirm", "Yes"),
+        Binding("escape,n,q", "cancel", "No"),
+    ]
+
+    def __init__(self, prompt: str):
+        super().__init__()
+        self.prompt = prompt
+
+    def compose(self) -> ComposeResult:
+        hint = "[b]Enter[/] / [b]y[/] to proceed • [b]Esc[/] / [b]n[/] to cancel"
+        yield Vertical(
+            Label(self.prompt, id="confirm-title"),
+            Label(hint, id="confirm-hint"),
+            id="confirm-container",
+        )
+
+    def action_confirm(self) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
 # --- Main app --------------------------------------------------------------
+
+
+class PRDataTable(DataTable):
+    # `action_select_cursor` is the Enter-key handler only; clicks go through
+    # `_on_click`, which posts `RowSelected` directly. Overriding here routes
+    # Enter to review while leaving mouse clicks as pure cursor moves.
+    def action_select_cursor(self) -> None:
+        self.app.action_review()  # type: ignore[attr-defined]
 
 
 class PRReviewer(App):
@@ -482,6 +520,20 @@ class PRReviewer(App):
         overflow-y: auto;
         padding: 1;
     }
+    #confirm-container {
+        border: round $primary;
+        padding: 1 2;
+        margin: 4 8;
+        background: $panel;
+        height: auto;
+    }
+    #confirm-title {
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    #confirm-hint {
+        color: $text-muted;
+    }
     """
 
     TITLE = "GitHub PR Reviewer"
@@ -489,7 +541,7 @@ class PRReviewer(App):
 
     BINDINGS = [
         Binding("r,f5", "refresh", "Refresh"),
-        Binding("enter,c", "review", "Review w/ Claude"),
+        Binding("enter", "review", "Review w/ Claude"),
         Binding("o", "open_web", "Open in browser"),
         Binding("d", "show_diff", "View diff"),
         Binding("m", "toggle_mine", "Toggle my PRs"),
@@ -512,7 +564,7 @@ class PRReviewer(App):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield Static("", id="version-badge")
-        yield DataTable(id="pr-table", cursor_type="row", zebra_stripes=True)
+        yield PRDataTable(id="pr-table", cursor_type="row", zebra_stripes=True)
         yield Static("Loading…", id="status")
         yield Footer()
 
@@ -614,8 +666,17 @@ class PRReviewer(App):
 
     def action_review(self) -> None:
         pr = self._selected()
-        if pr:
-            self._launch_claude(pr)
+        if not pr:
+            return
+        repo = pr["repository"]["nameWithOwner"]
+        title = pr.get("title", "")
+        prompt = f"Launch Claude Code review for {repo}#{pr['number']}?\n{title}"
+
+        def _proceed(confirmed: bool | None) -> None:
+            if confirmed:
+                self._launch_claude(pr)
+
+        self.push_screen(ConfirmScreen(prompt), _proceed)
 
     def action_toggle_mine(self) -> None:
         self.include_mine = not self.include_mine
