@@ -545,7 +545,6 @@ class PRReviewer(App):
         Binding("o", "open_web", "Open in browser"),
         Binding("d", "show_diff", "View diff"),
         Binding("m", "toggle_mine", "Toggle my PRs"),
-        Binding("a", "toggle_auto_accept", "Toggle auto-accept"),
         Binding("p", "toggle_post_inline", "Toggle post inline"),
         Binding("u", "open_releases", "Releases"),
         Binding("q", "quit", "Quit"),
@@ -555,7 +554,6 @@ class PRReviewer(App):
         super().__init__()
         self.prs: list[dict[str, Any]] = []
         self.include_mine: bool = False
-        self.auto_accept: bool = True
         self.post_inline: bool = True
         self.latest_version: str | None = None
         self.review_db: sqlite3.Connection = _open_review_db()
@@ -604,13 +602,12 @@ class PRReviewer(App):
         table = self.query_one("#pr-table", DataTable)
         table.clear()
         mode = " (+mine)" if self.include_mine else ""
-        auto = "on" if self.auto_accept else "off"
         post = "on" if self.post_inline else "off"
         if not data:
             self._set_status(
                 f"No PRs awaiting your review 🎉{mode}   "
-                f"auto-accept: {auto}   post-inline: {post}   "
-                "(m: mine, a: auto-accept, p: post-inline, r: refresh, u: releases, q: quit)"
+                f"post-inline: {post}   "
+                "(m: mine, p: post-inline, r: refresh, u: releases, q: quit)"
             )
             return
         for i, pr in enumerate(data):
@@ -640,9 +637,9 @@ class PRReviewer(App):
                 key=str(i),
             )
         self._set_status(
-            f"{len(data)} PR(s){mode}   auto-accept: {auto}   post-inline: {post}   "
+            f"{len(data)} PR(s){mode}   post-inline: {post}   "
             "•  enter: review  •  d: diff  •  o: browser  •  m: mine  "
-            "•  a: auto-accept  •  p: post-inline  •  r: refresh  •  u: releases  •  q: quit"
+            "•  p: post-inline  •  r: refresh  •  u: releases  •  q: quit"
         )
 
     def _selected(self) -> dict[str, Any] | None:
@@ -681,10 +678,6 @@ class PRReviewer(App):
     def action_toggle_mine(self) -> None:
         self.include_mine = not self.include_mine
         self.action_refresh()
-
-    def action_toggle_auto_accept(self) -> None:
-        self.auto_accept = not self.auto_accept
-        self._populate(self.prs)
 
     def action_toggle_post_inline(self) -> None:
         self.post_inline = not self.post_inline
@@ -752,14 +745,10 @@ class PRReviewer(App):
             else:
                 existing_desc = f"existing comments: {shown} in prompt of {len(existing)} fetched"
 
-            cmd = ["claude"]
-            if self.auto_accept:
-                cmd += ["--permission-mode", "acceptEdits"]
-            cmd.append(prompt)
+            cmd = ["claude", "--permission-mode", "acceptEdits", prompt]
             print(
                 f"\nLaunching Claude Code "
-                f"(auto-accept: {'on' if self.auto_accept else 'off'}, "
-                f"post-inline: {'on' if self.post_inline else 'off'}, "
+                f"(post-inline: {'on' if self.post_inline else 'off'}, "
                 f"{existing_desc}) "
                 "— type /exit when you're done.\n"
             )
