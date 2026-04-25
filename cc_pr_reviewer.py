@@ -726,7 +726,6 @@ class PRReviewer(App):
         Binding("d", "show_diff", "View diff"),
         Binding("m", "toggle_mine", "Toggle my PRs"),
         Binding("f", "filter", "Filter by repo"),
-        Binding("C", "clear_filter", "Clear filter"),
         Binding("u", "open_releases", "Releases"),
         Binding("q", "quit", "Quit"),
     ]
@@ -891,12 +890,6 @@ class PRReviewer(App):
         new_repos = sorted(repos)
         self.repo_cache = new_repos
         return new_repos
-
-    def action_clear_filter(self) -> None:
-        if not self.repo_filter:
-            return
-        self._set_repo_filter("")
-        self.action_refresh()
 
     def _set_repo_filter(self, value: str) -> None:
         self.repo_filter = value
