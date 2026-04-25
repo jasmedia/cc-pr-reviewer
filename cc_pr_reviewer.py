@@ -22,6 +22,7 @@ Run:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -805,7 +806,7 @@ class PRReviewer(App):
         if not data:
             self._set_status(
                 f"No PRs awaiting your review 🎉{mode}{filter_desc}   "
-                "(f: filter, m: mine, r: refresh, u: releases, q: quit)"
+                "(f: filter, m: mine, r: refresh, u: upgrade, q: quit)"
             )
             return
         for i, pr in enumerate(data):
@@ -837,7 +838,7 @@ class PRReviewer(App):
         self._set_status(
             f"{len(data)} PR(s){mode}{filter_desc}   "
             "•  enter: review  •  d: diff  •  o: browser  •  f: filter  •  m: mine  "
-            "•  r: refresh  •  u: releases  •  q: quit"
+            "•  r: refresh  •  u: upgrade  •  q: quit"
         )
 
     def _selected(self) -> dict[str, Any] | None:
@@ -853,23 +854,33 @@ class PRReviewer(App):
 
     def action_upgrade(self) -> None:
         if self.latest_version is None:
-            self._set_status("Already on the latest version.")
+            self._set_status("No update available (or check is still in progress).")
             return
         if shutil.which("uv") is None:
             self._set_status(
-                f"`uv` not on PATH — run manually: pip install -U {PACKAGE_NAME}",
+                f"`uv` not on PATH — install uv (https://docs.astral.sh/uv/) "
+                f"then run: uv tool upgrade {PACKAGE_NAME}",
                 error=True,
             )
             return
         cmd = ["uv", "tool", "upgrade", PACKAGE_NAME]
+        rc = 1
         with self.suspend():
             print(f"\n$ {' '.join(cmd)}\n")
-            rc = subprocess.call(cmd)
+            try:
+                rc = subprocess.call(cmd)
+            except OSError as e:
+                print(f"\nFailed to launch `uv`: {e}")
             if rc == 0:
                 print(f"\nUpgraded to v{self.latest_version}. Restart cc-pr-reviewer.")
             else:
-                print(f"\nUpgrade failed (exit {rc}). See {RELEASES_URL}")
-            input("\nPress Enter to continue…")
+                print(
+                    f"\nUpgrade failed (exit {rc}). "
+                    f"If you installed via pip/pipx, run: pip install -U {PACKAGE_NAME}. "
+                    f"See {RELEASES_URL}"
+                )
+            with contextlib.suppress(EOFError):
+                input("\nPress Enter to continue…")
         if rc == 0:
             self.exit()
 
