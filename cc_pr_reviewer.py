@@ -208,17 +208,17 @@ def _search_prs(extra: list[str]) -> list[dict[str, Any]]:
     return json.loads(r.stdout or "[]")
 
 
-def _repo_filter_arg(repo: str) -> list[str]:
+def _repo_filter_arg(repo: str | None) -> list[str]:
     repo = (repo or "").strip()
     return [f"--repo={repo}"] if repo else []
 
 
-def fetch_review_prs(repo: str = "") -> list[dict[str, Any]]:
+def fetch_review_prs(repo: str | None = None) -> list[dict[str, Any]]:
     """All open PRs across GitHub where @me is a requested reviewer."""
     return _search_prs(["--review-requested=@me", *_repo_filter_arg(repo)])
 
 
-def fetch_my_prs(repo: str = "") -> list[dict[str, Any]]:
+def fetch_my_prs(repo: str | None = None) -> list[dict[str, Any]]:
     """All open PRs across GitHub authored by @me."""
     return _search_prs(["--author=@me", *_repo_filter_arg(repo)])
 
@@ -531,15 +531,29 @@ class ConfirmScreen(ModalScreen[ConfirmResult | None]):
 # --- Filter modal ----------------------------------------------------------
 
 
+# Real GitHub `nameWithOwner` values always contain '/', so this sentinel
+# can't collide with a real repo id used on the OptionList.
 CLEAR_FILTER_OPTION_ID = "__clear__"
 
 
-class FilterScreen(ModalScreen[str | None]):
+@dataclass(frozen=True)
+class FilterChoice:
+    """Outcome of a confirmed FilterScreen — distinct from cancel (None).
+
+    `repo=None` means "clear filter"; `repo="owner/name"` means "apply".
+    Mirrors `ConfirmResult` so a future truthy check at the call site can't
+    silently swallow the clear case.
+    """
+
+    repo: str | None
+
+
+class FilterScreen(ModalScreen[FilterChoice | None]):
     """Pick a repo from the cached list to filter the PR view.
 
-    Dismisses with the chosen repo (`""` to clear) on Enter, or None on Esc.
-    Press `r` inside the modal to re-fetch the unfiltered PR list and pick up
-    repos that weren't present at boot.
+    Dismisses with a FilterChoice on Enter, or None on Esc. Press `r` inside
+    the modal to re-fetch the unfiltered PR list and pick up repos that
+    weren't present at boot.
     """
 
     BINDINGS = [
@@ -552,7 +566,7 @@ class FilterScreen(ModalScreen[str | None]):
     def __init__(
         self,
         repos: list[str],
-        current: str,
+        current: str | None,
         refresh_repos: Callable[[], list[str]],
     ):
         super().__init__()
@@ -591,8 +605,9 @@ class FilterScreen(ModalScreen[str | None]):
             ol.highlighted = 0
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
-        chosen = event.option.id or ""
-        self.dismiss("" if chosen == CLEAR_FILTER_OPTION_ID else chosen)
+        chosen = event.option.id
+        repo = None if chosen == CLEAR_FILTER_OPTION_ID else chosen
+        self.dismiss(FilterChoice(repo=repo))
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -615,6 +630,7 @@ class FilterScreen(ModalScreen[str | None]):
 
     def _apply_refresh(self, repos: list[str]) -> None:
         self.repos = repos
+        self.app.repo_cache = tuple(repos)  # type: ignore[attr-defined]
         ol = self.query_one("#filter-list", OptionList)
         ol.clear_options()
         ol.add_options(self._build_options())
@@ -627,6 +643,8 @@ class FilterScreen(ModalScreen[str | None]):
         self.query_one("#filter-title", Label).update(
             f"{self._BASE_TITLE} (refresh failed: {truncated})"
         )
+        if err.strip():
+            self.app.notify(err, severity="error", timeout=10)
         self._refreshing = False
 
 
@@ -680,30 +698,19 @@ class PRReviewer(App):
         overflow-y: auto;
         padding: 1;
     }
-    #confirm-container {
+    #confirm-container, #filter-container {
         border: round $primary;
         padding: 1 2;
         margin: 4 8;
         background: $panel;
         height: auto;
     }
-    #confirm-title {
+    #confirm-title, #filter-title {
         text-style: bold;
         margin-bottom: 1;
     }
-    #confirm-hint {
+    #confirm-hint, #filter-hint {
         color: $text-muted;
-    }
-    #filter-container {
-        border: round $primary;
-        padding: 1 2;
-        margin: 4 8;
-        background: $panel;
-        height: auto;
-    }
-    #filter-title {
-        text-style: bold;
-        margin-bottom: 1;
     }
     #filter-list {
         height: auto;
@@ -711,7 +718,6 @@ class PRReviewer(App):
         margin: 1 0;
     }
     #filter-hint {
-        color: $text-muted;
         margin-top: 1;
     }
     """
@@ -734,11 +740,14 @@ class PRReviewer(App):
         super().__init__()
         self.prs: list[dict[str, Any]] = []
         self.include_mine: bool = False
-        self.repo_cache: list[str] = []
+        # Immutable: rebound wholesale, never mutated in place (writers must
+        # swap a fresh tuple to stay safe across the FilterScreen worker).
+        self.repo_cache: tuple[str, ...] = ()
         self.latest_version: str | None = None
         self.review_db: sqlite3.Connection = _open_review_db()
         self.review_state: dict[str, dict[str, Any]] = _load_review_state(self.review_db)
-        self.repo_filter: str = _get_setting(self.review_db, "repo_filter", "")
+        stored_filter = _get_setting(self.review_db, "repo_filter", "")
+        self.repo_filter: str | None = stored_filter or None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -784,10 +793,11 @@ class PRReviewer(App):
 
     def _populate(self, data: list[dict[str, Any]]) -> None:
         self.prs = data
-        # Refresh repo cache only on unfiltered fetches; otherwise the cache
-        # would shrink to whatever the active filter happens to allow.
-        if not self.repo_filter and data:
-            self.repo_cache = sorted({pr["repository"]["nameWithOwner"] for pr in data})
+        # Refresh repo cache only on unfiltered fetches; otherwise it would
+        # shrink to whatever the active filter happens to allow. An empty
+        # result is a legitimate "no repos" signal, so don't gate on `data`.
+        if self.repo_filter is None:
+            self.repo_cache = tuple(sorted({pr["repository"]["nameWithOwner"] for pr in data}))
         table = self.query_one("#pr-table", DataTable)
         table.clear()
         mode = " (+mine)" if self.include_mine else ""
@@ -868,32 +878,44 @@ class PRReviewer(App):
         self.action_refresh()
 
     def action_filter(self) -> None:
-        def _apply(result: str | None) -> None:
-            if result is None or result == self.repo_filter:
+        def _apply(result: FilterChoice | None) -> None:
+            if result is None or result.repo == self.repo_filter:
                 return
-            self._set_repo_filter(result)
-            self.action_refresh()
+            if self._set_repo_filter(result.repo):
+                self.action_refresh()
 
         self.push_screen(
-            FilterScreen(self.repo_cache, self.repo_filter, self._fetch_unfiltered_repos),
+            FilterScreen(list(self.repo_cache), self.repo_filter, self._fetch_unfiltered_repos),
             _apply,
         )
 
     def _fetch_unfiltered_repos(self) -> list[str]:
-        """Blocking re-fetch of the unfiltered PR list; updates `repo_cache`
-        and returns the new sorted repo list. Mirrors `_load_prs`'s scope so
-        toggling `m` widens the cache the next time the modal refreshes."""
-        repos = {pr["repository"]["nameWithOwner"] for pr in fetch_review_prs("")}
-        if self.include_mine:
-            for pr in fetch_my_prs(""):
-                repos.add(pr["repository"]["nameWithOwner"])
-        new_repos = sorted(repos)
-        self.repo_cache = new_repos
-        return new_repos
+        """Blocking re-fetch of the unfiltered PR list; returns the new
+        sorted repo list. The caller (FilterScreen._apply_refresh, on the
+        main thread) owns the assignment to `repo_cache` so we don't mutate
+        App state from a worker thread.
 
-    def _set_repo_filter(self, value: str) -> None:
+        Mirrors `_load_prs`'s scope: honors the current `include_mine`, so
+        toggling `m` (which requires closing the modal first, since modals
+        shadow App bindings) and re-opening will widen the cache on the next
+        refresh.
+        """
+        repos = {pr["repository"]["nameWithOwner"] for pr in fetch_review_prs(None)}
+        if self.include_mine:
+            for pr in fetch_my_prs(None):
+                repos.add(pr["repository"]["nameWithOwner"])
+        return sorted(repos)
+
+    def _set_repo_filter(self, value: str | None) -> bool:
+        # Persist first so a write failure can't leave session and disk
+        # diverged; warn and keep the prior value on failure.
+        try:
+            _set_setting(self.review_db, "repo_filter", value or "")
+        except sqlite3.Error as e:
+            self.notify(f"Couldn't persist filter: {e}", severity="warning")
+            return False
         self.repo_filter = value
-        _set_setting(self.review_db, "repo_filter", value)
+        return True
 
     # --- launching claude ---
 
