@@ -5,6 +5,8 @@ requested reviewer, and hands the selected PR off to Claude Code with the
 [PR Review Toolkit](https://claude.com/plugins/pr-review-toolkit) plugin
 driving the review.
 
+![cc-pr-reviewer screenshot](assets/cc-reviewer.png)
+
 ## What it does
 
 - `gh search prs --review-requested=@me --state=open` fetches your review
