@@ -732,7 +732,7 @@ class PRReviewer(App):
         Binding("d", "show_diff", "View diff"),
         Binding("m", "toggle_mine", "Toggle my PRs"),
         Binding("f", "filter", "Filter by repo"),
-        Binding("u", "open_releases", "Releases"),
+        Binding("u", "upgrade", "Upgrade"),
         Binding("q", "quit", "Quit"),
     ]
 
@@ -851,8 +851,27 @@ class PRReviewer(App):
         if pr:
             webbrowser.open(pr["url"])
 
-    def action_open_releases(self) -> None:
-        webbrowser.open(RELEASES_URL)
+    def action_upgrade(self) -> None:
+        if self.latest_version is None:
+            self._set_status("Already on the latest version.")
+            return
+        if shutil.which("uv") is None:
+            self._set_status(
+                f"`uv` not on PATH — run manually: pip install -U {PACKAGE_NAME}",
+                error=True,
+            )
+            return
+        cmd = ["uv", "tool", "upgrade", PACKAGE_NAME]
+        with self.suspend():
+            print(f"\n$ {' '.join(cmd)}\n")
+            rc = subprocess.call(cmd)
+            if rc == 0:
+                print(f"\nUpgraded to v{self.latest_version}. Restart cc-pr-reviewer.")
+            else:
+                print(f"\nUpgrade failed (exit {rc}). See {RELEASES_URL}")
+            input("\nPress Enter to continue…")
+        if rc == 0:
+            self.exit()
 
     def action_show_diff(self) -> None:
         pr = self._selected()
@@ -1028,7 +1047,7 @@ class PRReviewer(App):
     def _show_update_badge(self, latest: str) -> None:
         self.latest_version = latest
         w = self.query_one("#version-badge", Static)
-        w.update(f" ▲ v{latest} available — press u ")
+        w.update(f" ▲ v{latest} available — uv tool upgrade {PACKAGE_NAME} (press u) ")
         w.add_class("-visible")
 
 
