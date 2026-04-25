@@ -353,8 +353,32 @@ def _open_review_db() -> sqlite3.Connection:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
     conn.commit()
     return conn
+
+
+def _get_setting(conn: sqlite3.Connection, key: str, default: str = "") -> str:
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def _set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO settings (key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (key, value),
+    )
+    conn.commit()
 
 
 def _load_review_state(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
@@ -655,11 +679,11 @@ class PRReviewer(App):
         super().__init__()
         self.prs: list[dict[str, Any]] = []
         self.include_mine: bool = False
-        self.repo_filter: str = ""
         self.repo_cache: list[str] = []
         self.latest_version: str | None = None
         self.review_db: sqlite3.Connection = _open_review_db()
         self.review_state: dict[str, dict[str, Any]] = _load_review_state(self.review_db)
+        self.repo_filter: str = _get_setting(self.review_db, "repo_filter", "")
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -792,7 +816,7 @@ class PRReviewer(App):
         def _apply(result: str | None) -> None:
             if result is None or result == self.repo_filter:
                 return
-            self.repo_filter = result
+            self._set_repo_filter(result)
             self.action_refresh()
 
         self.push_screen(FilterScreen(self.repo_cache, self.repo_filter), _apply)
@@ -800,8 +824,12 @@ class PRReviewer(App):
     def action_clear_filter(self) -> None:
         if not self.repo_filter:
             return
-        self.repo_filter = ""
+        self._set_repo_filter("")
         self.action_refresh()
+
+    def _set_repo_filter(self, value: str) -> None:
+        self.repo_filter = value
+        _set_setting(self.review_db, "repo_filter", value)
 
     # --- launching claude ---
 
