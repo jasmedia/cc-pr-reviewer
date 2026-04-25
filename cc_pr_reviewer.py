@@ -29,6 +29,7 @@ import sqlite3
 import subprocess
 import urllib.request
 import webbrowser
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError
@@ -537,34 +538,57 @@ class FilterScreen(ModalScreen[str | None]):
     """Pick a repo from the cached list to filter the PR view.
 
     Dismisses with the chosen repo (`""` to clear) on Enter, or None on Esc.
+    Press `r` inside the modal to re-fetch the unfiltered PR list and pick up
+    repos that weren't present at boot.
     """
 
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("r", "refresh", "Refresh repos"),
+    ]
 
-    def __init__(self, repos: list[str], current: str):
+    _BASE_TITLE = "Filter PRs by repo"
+
+    def __init__(
+        self,
+        repos: list[str],
+        current: str,
+        refresh_repos: Callable[[], list[str]],
+    ):
         super().__init__()
         self.repos = repos
         self.current = current
+        self._refresh_repos = refresh_repos
+        self._refreshing = False
 
     def compose(self) -> ComposeResult:
-        options: list[Option] = [Option("(any repo — clear filter)", id=CLEAR_FILTER_OPTION_ID)]
-        for repo in self.repos:
-            options.append(Option(repo, id=repo))
-        title = "Filter PRs by repo" if self.repos else "Filter PRs by repo (no repos cached yet)"
+        title = self._BASE_TITLE if self.repos else f"{self._BASE_TITLE} (no repos cached yet)"
         yield Vertical(
             Label(title, id="filter-title"),
-            OptionList(*options, id="filter-list"),
-            Label("[b]Enter[/] select • [b]Esc[/] cancel", id="filter-hint"),
+            OptionList(*self._build_options(), id="filter-list"),
+            Label(
+                "[b]Enter[/] select • [b]r[/] refresh • [b]Esc[/] cancel",
+                id="filter-hint",
+            ),
             id="filter-container",
         )
 
+    def _build_options(self) -> list[Option]:
+        options: list[Option] = [Option("(any repo — clear filter)", id=CLEAR_FILTER_OPTION_ID)]
+        for repo in self.repos:
+            options.append(Option(repo, id=repo))
+        return options
+
     def on_mount(self) -> None:
         ol = self.query_one("#filter-list", OptionList)
+        self._highlight_current(ol)
+        ol.focus()
+
+    def _highlight_current(self, ol: OptionList) -> None:
         if self.current and self.current in self.repos:
             ol.highlighted = self.repos.index(self.current) + 1  # +1 for the clear row
         else:
             ol.highlighted = 0
-        ol.focus()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         chosen = event.option.id or ""
@@ -572,6 +596,38 @@ class FilterScreen(ModalScreen[str | None]):
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+    def action_refresh(self) -> None:
+        if self._refreshing:
+            return
+        self._refreshing = True
+        self.query_one("#filter-title", Label).update(f"{self._BASE_TITLE} (refreshing…)")
+        self._do_refresh()
+
+    @work(thread=True, exclusive=True)
+    def _do_refresh(self) -> None:
+        try:
+            repos = self._refresh_repos()
+        except Exception as e:  # noqa: BLE001
+            self.app.call_from_thread(self._refresh_failed, str(e))
+            return
+        self.app.call_from_thread(self._apply_refresh, repos)
+
+    def _apply_refresh(self, repos: list[str]) -> None:
+        self.repos = repos
+        ol = self.query_one("#filter-list", OptionList)
+        ol.clear_options()
+        ol.add_options(self._build_options())
+        self._highlight_current(ol)
+        self.query_one("#filter-title", Label).update(self._BASE_TITLE)
+        self._refreshing = False
+
+    def _refresh_failed(self, err: str) -> None:
+        truncated = err.strip().splitlines()[0][:80] if err.strip() else "unknown error"
+        self.query_one("#filter-title", Label).update(
+            f"{self._BASE_TITLE} (refresh failed: {truncated})"
+        )
+        self._refreshing = False
 
 
 # --- Main app --------------------------------------------------------------
@@ -819,7 +875,22 @@ class PRReviewer(App):
             self._set_repo_filter(result)
             self.action_refresh()
 
-        self.push_screen(FilterScreen(self.repo_cache, self.repo_filter), _apply)
+        self.push_screen(
+            FilterScreen(self.repo_cache, self.repo_filter, self._fetch_unfiltered_repos),
+            _apply,
+        )
+
+    def _fetch_unfiltered_repos(self) -> list[str]:
+        """Blocking re-fetch of the unfiltered PR list; updates `repo_cache`
+        and returns the new sorted repo list. Mirrors `_load_prs`'s scope so
+        toggling `m` widens the cache the next time the modal refreshes."""
+        repos = {pr["repository"]["nameWithOwner"] for pr in fetch_review_prs("")}
+        if self.include_mine:
+            for pr in fetch_my_prs(""):
+                repos.add(pr["repository"]["nameWithOwner"])
+        new_repos = sorted(repos)
+        self.repo_cache = new_repos
+        return new_repos
 
     def action_clear_filter(self) -> None:
         if not self.repo_filter:
