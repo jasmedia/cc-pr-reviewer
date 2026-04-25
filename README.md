@@ -1,5 +1,9 @@
 # cc-pr-reviewer
 
+[![PyPI Downloads](https://static.pepy.tech/badge/cc-pr-reviewer)](https://pepy.tech/projects/cc-pr-reviewer)
+[![uv](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/uv/main/assets/badge/v0.json)](https://github.com/astral-sh/uv)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+
 A small Textual TUI that lists every open GitHub PR where you are a
 requested reviewer, and hands the selected PR off to Claude Code with the
 [PR Review Toolkit](https://claude.com/plugins/pr-review-toolkit) plugin
