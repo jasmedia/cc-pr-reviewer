@@ -82,6 +82,7 @@ before checking out the PR.
 | `d`           | View full diff                                               |
 | `o`           | Open PR in browser                                           |
 | `m`           | Toggle inclusion of PRs you authored                         |
+| `f`           | Filter the list by repo (picker)                             |
 | `r` / `F5`    | Refresh the list                                             |
 | `q`           | Quit                                                         |
 
@@ -90,6 +91,14 @@ to cancel, `p` to toggle post-inline (instruct Claude to publish the
 findings as inline PR review comments via `gh api`, grouped under one
 review). The toggle defaults to on each time the modal opens; the chosen
 value is printed before Claude launches.
+
+Inside the filter modal: arrow keys to move, `Enter` to apply the
+highlighted repo (or pick **(any repo — clear filter)** to remove the
+filter), `r` to re-fetch the unfiltered PR list and pick up repos that
+appeared after boot, `Esc` to cancel. The repo list comes from the most
+recent unfiltered fetch — applying a filter doesn't shrink the picker.
+The active filter is persisted in `$GH_PR_WORKSPACE/.review_state.db`
+and restored on the next launch.
 
 ## How the Claude launch works
 
