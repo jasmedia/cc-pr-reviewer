@@ -51,9 +51,11 @@ jobs:
         uses: astral-sh/setup-uv@v7
         with:
           # No repo checked out in this job, so there's no uv.lock to key
-          # the cache on. Disable to silence "empty workdir" / "cache will
-          # never get invalidated" warnings.
+          # the cache on. Disable to silence "cache will never get
+          # invalidated" warnings, and ignore-empty-workdir to silence
+          # the empty-workdir warning.
           enable-cache: false
+          ignore-empty-workdir: true
 
       - name: Download distribution artifacts
         uses: actions/download-artifact@v8
