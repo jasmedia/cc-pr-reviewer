@@ -37,3 +37,7 @@ Single-file Textual TUI (`cc_pr_reviewer.py`) that orchestrates external CLIs ra
 - **Prereq checks** live in `check_prereqs()` and run before the TUI starts. If you add a new external dependency, add its check there so users get a clear error instead of a mid-flow crash.
 - **External CLIs assumed on PATH:** `gh` (authenticated), `claude`, `git`. The PR Review Toolkit plugin must be installed and enabled inside Claude Code; `check_prereqs()` detects this via `claude plugin list --json` and treats a missing/disabled plugin as a startup error.
 - **Review state DB.** `$GH_PR_WORKSPACE/.review_state.db` is a tiny SQLite DB (`reviews` table) tracking per-PR `count`, `last_reviewed_at`, `last_pr_updated_at`, and `last_head_sha`. It drives the "Reviews" column (`-` / `N` / `N stale`). Staleness = PR's current `updatedAt` differs from `last_pr_updated_at` captured at last review, so any PR activity (pushes, comments, label changes) flips it to stale. See `_open_review_db`, `_record_review`, `_review_cell`.
+
+## Pull requests
+
+When opening a PR, follow `.github/PULL_REQUEST_TEMPLATE.md`: pass its contents as the `--body` to `gh pr create` (preserving every section heading) and fill each section based on the actual changes. Leave a section's bullet as `-` only when it genuinely does not apply (e.g. no DB migrations, no env config); never delete sections.
