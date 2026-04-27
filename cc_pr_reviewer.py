@@ -80,6 +80,30 @@ POST_INLINE_DEDUP_SUFFIX = (
     "comment (same file+line+substantive point)."
 )
 
+# Appended to the post-inline prompt only when the existing inline review
+# comments (from `pulls/{n}/comments` — top-level review bodies and issue
+# comments are NOT included) contain at least one entry authored by the
+# current `gh` user — i.e. this tool has already reviewed this PR before.
+# Third-party review comments don't count; we don't want to raise the bar
+# just because someone else commented.
+POST_INLINE_REREVIEW_SUFFIX = (
+    " You (the authenticated `gh` user) have already reviewed this PR in a "
+    "previous pass, so raise the bar: only post findings that are clearly "
+    "important (e.g., correctness, security, data loss, broken contracts, "
+    "breaking changes, concurrency bugs, resource leaks, significant "
+    "performance regressions). Skip anything minor, stylistic, or NIT-level."
+)
+
+# Appended after POST_INLINE_REREVIEW_SUFFIX only when the PR is NOT
+# self-authored. GitHub returns 422 ("Can not approve your own pull request")
+# on `event: APPROVE` for the author, so this clause is unsafe to send when
+# the `gh` user is the PR author — but the raised bar above still applies.
+POST_INLINE_REREVIEW_APPROVE_SUFFIX = (
+    " If after filtering the only remaining findings are minor or NIT-level, "
+    "submit an APPROVE review with no inline comments (use `event: APPROVE` "
+    "and omit the `comments` array) instead of `event: COMMENT`."
+)
+
 # Appended to POST_INLINE_PROMPT when the existing-comments fetch failed. The
 # alternative (empty `existing_block`) is indistinguishable from a PR that
 # genuinely has no prior comments, so without this hint Claude would happily
@@ -222,6 +246,30 @@ def fetch_review_prs(repo: str | None = None) -> list[dict[str, Any]]:
 def fetch_my_prs(repo: str | None = None) -> list[dict[str, Any]]:
     """All open PRs across GitHub authored by @me."""
     return _search_prs(["--author=@me", *_repo_filter_arg(repo)])
+
+
+_GH_LOGIN: str | None = None
+
+
+def _current_gh_login() -> str | None:
+    """Login of the authenticated `gh` user, or None if undetectable.
+
+    Cached on first success only — a transient `gh` failure (auth blip, network
+    timeout) must not disable rereview detection for the rest of the session,
+    so failures retry on the next call. Mirrors `fetch_existing_review_comments`
+    by surfacing the underlying error to the user.
+    """
+    global _GH_LOGIN
+    if _GH_LOGIN is not None:
+        return _GH_LOGIN
+    r = run(["gh", "api", "user", "--jq", ".login"])
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout).strip() or f"exit {r.returncode}"
+        print(f"warning: could not detect gh login (rereview detection disabled): {err}")
+        return None
+    login = r.stdout.strip() or None
+    _GH_LOGIN = login
+    return login
 
 
 def fetch_existing_review_comments(repo: str, number: int) -> tuple[list[dict[str, Any]], bool]:
@@ -992,6 +1040,21 @@ class PRReviewer(App):
             existing, fetch_ok = fetch_existing_review_comments(repo_full, number)
             existing_block, shown = format_existing_comments(existing)
 
+            # Compute rereview against the raw `existing` list, not against
+            # `existing_block` — `format_existing_comments` filters out entries
+            # missing path/created_at/body, and we still want to raise the bar
+            # if the only surviving evidence is in the unfiltered list.
+            #
+            # The APPROVE clause is gated separately on authorship: GitHub
+            # rejects self-approval with 422, so we still raise the bar on
+            # self re-reviews but drop the auto-approve instruction.
+            my_login = _current_gh_login()
+            author_login = (pr.get("author") or {}).get("login")
+            rereview = bool(my_login) and any(
+                (c.get("user") or {}).get("login") == my_login for c in existing
+            )
+            rereview_can_approve = rereview and author_login != my_login
+
             sections = [REVIEW_PROMPT]
             if existing_block:
                 sections.append(existing_block)
@@ -1001,6 +1064,10 @@ class PRReviewer(App):
                     post += POST_INLINE_DEDUP_SUFFIX
                 elif not fetch_ok:
                     post += POST_INLINE_FETCH_FAILED_SUFFIX
+                if rereview:
+                    post += POST_INLINE_REREVIEW_SUFFIX
+                    if rereview_can_approve:
+                        post += POST_INLINE_REREVIEW_APPROVE_SUFFIX
                 sections.append(post)
             prompt = PROMPT_SECTION_SEP.join(sections)
 
@@ -1010,9 +1077,12 @@ class PRReviewer(App):
                 existing_desc = f"existing comments: {shown} in prompt of {len(existing)} fetched"
 
             cmd = ["claude", "--permission-mode", "acceptEdits", prompt]
+            post_inline_desc = "on" if post_inline else "off"
+            if post_inline and rereview:
+                post_inline_desc += ", rereview"
             print(
                 f"\nLaunching Claude Code "
-                f"(post-inline: {'on' if post_inline else 'off'}, "
+                f"(post-inline: {post_inline_desc}, "
                 f"{existing_desc}) "
                 "— type /exit when you're done.\n"
             )
