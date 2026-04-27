@@ -1078,7 +1078,7 @@ class PRReviewer(App):
 
             cmd = ["claude", "--permission-mode", "acceptEdits", prompt]
             post_inline_desc = "on" if post_inline else "off"
-            if rereview:
+            if post_inline and rereview:
                 post_inline_desc += ", rereview"
             print(
                 f"\nLaunching Claude Code "
