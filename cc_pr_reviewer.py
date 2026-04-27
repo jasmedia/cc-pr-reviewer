@@ -44,6 +44,7 @@ from textual.binding import Binding
 from textual.containers import Vertical
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Header, Label, OptionList, Static
+from textual.widgets._footer import FooterKey
 from textual.widgets.option_list import Option
 
 # --- Configuration ---------------------------------------------------------
@@ -243,9 +244,56 @@ def fetch_review_prs(repo: str | None = None) -> list[dict[str, Any]]:
     return _search_prs(["--review-requested=@me", *_repo_filter_arg(repo)])
 
 
+_MY_PRS_GRAPHQL = """
+query {
+  viewer {
+    pullRequests(
+      first: 100,
+      states: OPEN,
+      orderBy: {field: UPDATED_AT, direction: DESC}
+    ) {
+      nodes {
+        number
+        title
+        url
+        updatedAt
+        isDraft
+        author { login }
+        repository { nameWithOwner isArchived }
+      }
+    }
+  }
+}
+"""
+
+
 def fetch_my_prs(repo: str | None = None) -> list[dict[str, Any]]:
-    """All open PRs across GitHub authored by @me."""
-    return _search_prs(["--author=@me", *_repo_filter_arg(repo)])
+    """All open PRs across GitHub authored by @me.
+
+    Uses GraphQL `viewer.pullRequests` rather than `gh search prs --author=@me`
+    because the GitHub Search API has indexing delays — recently-pushed PRs
+    can be missing from search results for hours, especially in low-traffic
+    personal repos. `viewer.pullRequests` reads the authoritative DB and
+    surfaces PRs immediately on creation.
+    """
+    r = run(["gh", "api", "graphql", "-f", f"query={_MY_PRS_GRAPHQL}"])
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout).strip() or "gh api graphql failed")
+    try:
+        payload = json.loads(r.stdout or "{}")
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"could not parse graphql response: {e}") from e
+    # `gh api graphql` exits 0 even when the GraphQL layer returns errors
+    # (e.g. invalid query, scope issues), so check the payload explicitly.
+    if errors := payload.get("errors"):
+        msg = "; ".join(e.get("message", str(e)) for e in errors)
+        raise RuntimeError(f"graphql errors: {msg}")
+    nodes = payload.get("data", {}).get("viewer", {}).get("pullRequests", {}).get("nodes", [])
+    # Match the `--archived=false` behavior of the search-based path.
+    nodes = [n for n in nodes if not (n.get("repository") or {}).get("isArchived")]
+    if repo:
+        nodes = [n for n in nodes if (n.get("repository") or {}).get("nameWithOwner") == repo]
+    return nodes
 
 
 _GH_LOGIN: str | None = None
@@ -769,6 +817,15 @@ class PRReviewer(App):
     #filter-hint {
         margin-top: 1;
     }
+    FooterKey.-state-active .footer-key--key {
+        background: $success;
+        color: $text;
+    }
+    FooterKey.-state-active .footer-key--description {
+        background: $success;
+        color: $text;
+        text-style: bold;
+    }
     """
 
     TITLE = "GitHub PR Reviewer"
@@ -788,7 +845,6 @@ class PRReviewer(App):
     def __init__(self) -> None:
         super().__init__()
         self.prs: list[dict[str, Any]] = []
-        self.include_mine: bool = False
         # Immutable: rebound wholesale, never mutated in place (writers must
         # swap a fresh tuple to stay safe across the FilterScreen worker).
         self.repo_cache: tuple[str, ...] = ()
@@ -797,6 +853,7 @@ class PRReviewer(App):
         self.review_state: dict[str, dict[str, Any]] = _load_review_state(self.review_db)
         stored_filter = _get_setting(self.review_db, "repo_filter", "")
         self.repo_filter: str | None = stored_filter or None
+        self.include_mine: bool = _get_setting(self.review_db, "include_mine", "0") == "1"
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -810,8 +867,51 @@ class PRReviewer(App):
         table.add_columns(
             "Repository", "#", "Title", "Author", "Updated", "Reviews", "Last Review", ""
         )
+        # The Footer recomposes whenever the screen's active bindings change
+        # (e.g. on modal push/pop), which wipes any per-FooterKey class we
+        # set. Subscribing here re-applies our `-state-active` tags *after*
+        # each such recompose so the highlights survive modal interactions.
+        #
+        # `call_after_refresh` is chained twice: Footer also schedules its
+        # recompose via `call_after_refresh` from the same signal, so a
+        # single defer would land BEFORE Footer remounts its FooterKeys
+        # (causing our class to be set on doomed widgets and lost). The
+        # double defer pushes us past Footer's mount cycle.
+        self.screen.bindings_updated_signal.subscribe(
+            self,
+            lambda _screen: self.call_after_refresh(
+                lambda: self.call_after_refresh(self._refresh_footer_indicators)
+            ),
+        )
+        self._refresh_footer_indicators()
         self.action_refresh()
         self._check_for_update()
+
+    def _refresh_footer_indicators(self) -> None:
+        """Re-apply the `-state-active` class on every state-bearing key.
+
+        Centralised so that both bindings-signal callbacks and post-action
+        calls (toggle mine, apply filter) end up at the same place — adding
+        a new state-bearing key only takes a single line here.
+        """
+        self._set_footer_active("m", self.include_mine)
+        self._set_footer_active("f", self.repo_filter is not None)
+
+    def _set_footer_active(self, key: str, active: bool, retries: int = 2) -> None:
+        """Toggle the `-state-active` CSS class on the FooterKey for `key`.
+
+        Footer mounts its `FooterKey` children only after it processes the
+        `bindings_updated_signal`. If our App-level subscriber runs before
+        Footer's, the query is empty on first try — so we re-schedule via
+        `call_after_refresh` until the FooterKey appears (bounded retries
+        keep this from spinning if Footer is hidden / never mounted).
+        """
+        for fk in self.query(FooterKey):
+            if fk.key == key:
+                fk.set_class(active, "-state-active")
+                return
+        if retries > 0:
+            self.call_after_refresh(self._set_footer_active, key, active, retries - 1)
 
     # --- actions ---
 
@@ -824,23 +924,33 @@ class PRReviewer(App):
         repo = self.repo_filter
         try:
             data = fetch_review_prs(repo)
-            if self.include_mine:
-                seen = {(p["repository"]["nameWithOwner"], p["number"]) for p in data}
-                for pr in fetch_my_prs(repo):
-                    key = (pr["repository"]["nameWithOwner"], pr["number"])
-                    if key in seen:
-                        continue
-                    pr["_mine"] = True
-                    data.append(pr)
         except Exception as e:  # noqa: BLE001
-            self.call_from_thread(self._set_status, f"Error: {e}", True)
+            self.call_from_thread(self._set_status, f"Error fetching review PRs: {e}", True)
             return
-        self.call_from_thread(self._populate, data)
+
+        # Fetch my-PRs separately so a failure here doesn't drop the
+        # review-PR list, and so the user sees an explicit error rather than
+        # an empty MINE column when the my-PRs `gh search` fails.
+        mine_error: str | None = None
+        if self.include_mine:
+            try:
+                mine = fetch_my_prs(repo)
+            except Exception as e:  # noqa: BLE001
+                mine_error = str(e)
+                mine = []
+            seen = {(p["repository"]["nameWithOwner"], p["number"]) for p in data}
+            for pr in mine:
+                key = (pr["repository"]["nameWithOwner"], pr["number"])
+                if key in seen:
+                    continue
+                pr["_mine"] = True
+                data.append(pr)
+        self.call_from_thread(self._populate, data, mine_error)
 
     def _filter_desc(self) -> str:
         return f" [repo={self.repo_filter}]" if self.repo_filter else ""
 
-    def _populate(self, data: list[dict[str, Any]]) -> None:
+    def _populate(self, data: list[dict[str, Any]], mine_error: str | None = None) -> None:
         self.prs = data
         # Refresh repo cache only on unfiltered fetches; otherwise it would
         # shrink to whatever the active filter happens to allow. An empty
@@ -849,12 +959,28 @@ class PRReviewer(App):
             self.repo_cache = tuple(sorted({pr["repository"]["nameWithOwner"] for pr in data}))
         table = self.query_one("#pr-table", DataTable)
         table.clear()
-        mode = " (+mine)" if self.include_mine else ""
+        # Surface mine-count (or the my-PRs fetch error) so the user can tell
+        # at a glance whether the toggle pulled in any of their own PRs —
+        # otherwise an empty MINE column is indistinguishable from a silent
+        # `gh search --author=@me` failure.
+        if mine_error:
+            mode = f" (+mine: ERROR — {mine_error.splitlines()[0][:80]})"
+            self.notify(
+                f"Couldn't fetch your authored PRs: {mine_error}",
+                severity="error",
+                timeout=10,
+            )
+        elif self.include_mine:
+            mine_count = sum(1 for p in data if p.get("_mine"))
+            mode = f" (+mine: {mine_count})"
+        else:
+            mode = " (mine: off)"
         filter_desc = self._filter_desc()
         if not data:
             self._set_status(
                 f"No PRs awaiting your review 🎉{mode}{filter_desc}   "
-                "(f: filter, m: mine, r: refresh, u: upgrade, q: quit)"
+                "(f: filter, m: mine, r: refresh, u: upgrade, q: quit)",
+                error=bool(mine_error),
             )
             return
         for i, pr in enumerate(data):
@@ -886,7 +1012,8 @@ class PRReviewer(App):
         self._set_status(
             f"{len(data)} PR(s){mode}{filter_desc}   "
             "•  enter: review  •  d: diff  •  o: browser  •  f: filter  •  m: mine  "
-            "•  r: refresh  •  u: upgrade  •  q: quit"
+            "•  r: refresh  •  u: upgrade  •  q: quit",
+            error=bool(mine_error),
         )
 
     def _selected(self) -> dict[str, Any] | None:
@@ -953,13 +1080,29 @@ class PRReviewer(App):
 
     def action_toggle_mine(self) -> None:
         self.include_mine = not self.include_mine
-        self.action_refresh()
+        state = "on" if self.include_mine else "off"
+        # Persist so the toggle sticks across sessions. Mirrors `repo_filter`:
+        # warn but keep the in-session toggle flipped if the write fails, so
+        # the user's current view still reflects what they pressed.
+        try:
+            _set_setting(self.review_db, "include_mine", "1" if self.include_mine else "0")
+        except sqlite3.Error as e:
+            self.notify(f"Couldn't persist mine toggle: {e}", severity="warning")
+        self.notify(f"My PRs: {state}", timeout=3)
+        self._set_status(f"Refreshing… (mine {state})")
+        self._refresh_footer_indicators()
+        self._load_prs()
 
     def action_filter(self) -> None:
         def _apply(result: FilterChoice | None) -> None:
             if result is None or result.repo == self.repo_filter:
                 return
             if self._set_repo_filter(result.repo):
+                # The modal-pop's bindings_updated_signal fires before this
+                # callback runs, so the highlight refresh from the signal
+                # subscriber sees the OLD filter value. Refresh again here
+                # so the `f` key reflects the just-applied filter.
+                self._refresh_footer_indicators()
                 self.action_refresh()
 
         self.push_screen(
