@@ -556,7 +556,7 @@ class ConfirmScreen(ModalScreen[ConfirmResult | None]):
             "• [b]p[/] to toggle post-inline"
         )
         yield Vertical(
-            Label(self.prompt, id="confirm-title"),
+            Label(self.prompt, id="confirm-title", markup=False),
             Label(self._checkbox_text(), id="confirm-checkbox", markup=False),
             Label(hint, id="confirm-hint"),
             id="confirm-container",
