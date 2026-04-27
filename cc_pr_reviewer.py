@@ -33,6 +33,7 @@ import webbrowser
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import cache
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
@@ -78,6 +79,19 @@ POST_INLINE_DEDUP_SUFFIX = (
     " Before submitting, cross-check each finding against the list of existing "
     "review comments above and drop any that duplicate a previously posted "
     "comment (same file+line+substantive point)."
+)
+
+# Appended on top of POST_INLINE_DEDUP_SUFFIX only when the existing comments
+# include at least one prior review by the current `gh` user — i.e. this tool
+# has already reviewed this PR before. Third-party review comments don't count;
+# we don't want to raise the bar just because someone else commented.
+POST_INLINE_REREVIEW_SUFFIX = (
+    " You (the authenticated `gh` user) have already reviewed this PR in a "
+    "previous pass, so raise the bar: only post findings that are clearly "
+    "important (correctness, security, data loss, broken contracts, breaking "
+    "changes). Skip anything minor, stylistic, or NIT-level. If after filtering "
+    "the only remaining findings are minor or NIT-level, submit the review with "
+    "`event: APPROVE` instead of `event: COMMENT` and omit those nits."
 )
 
 # Appended to POST_INLINE_PROMPT when the existing-comments fetch failed. The
@@ -222,6 +236,15 @@ def fetch_review_prs(repo: str | None = None) -> list[dict[str, Any]]:
 def fetch_my_prs(repo: str | None = None) -> list[dict[str, Any]]:
     """All open PRs across GitHub authored by @me."""
     return _search_prs(["--author=@me", *_repo_filter_arg(repo)])
+
+
+@cache
+def _current_gh_login() -> str | None:
+    """Login of the authenticated `gh` user, or None if undetectable."""
+    r = run(["gh", "api", "user", "--jq", ".login"])
+    if r.returncode != 0:
+        return None
+    return r.stdout.strip() or None
 
 
 def fetch_existing_review_comments(repo: str, number: int) -> tuple[list[dict[str, Any]], bool]:
@@ -995,10 +1018,17 @@ class PRReviewer(App):
             sections = [REVIEW_PROMPT]
             if existing_block:
                 sections.append(existing_block)
+            rereview = False
             if post_inline:
                 post = POST_INLINE_PROMPT
                 if existing_block:
                     post += POST_INLINE_DEDUP_SUFFIX
+                    my_login = _current_gh_login()
+                    if my_login and any(
+                        (c.get("user") or {}).get("login") == my_login for c in existing
+                    ):
+                        post += POST_INLINE_REREVIEW_SUFFIX
+                        rereview = True
                 elif not fetch_ok:
                     post += POST_INLINE_FETCH_FAILED_SUFFIX
                 sections.append(post)
@@ -1010,9 +1040,12 @@ class PRReviewer(App):
                 existing_desc = f"existing comments: {shown} in prompt of {len(existing)} fetched"
 
             cmd = ["claude", "--permission-mode", "acceptEdits", prompt]
+            post_inline_desc = "on" if post_inline else "off"
+            if rereview:
+                post_inline_desc += ", rereview"
             print(
                 f"\nLaunching Claude Code "
-                f"(post-inline: {'on' if post_inline else 'off'}, "
+                f"(post-inline: {post_inline_desc}, "
                 f"{existing_desc}) "
                 "— type /exit when you're done.\n"
             )
