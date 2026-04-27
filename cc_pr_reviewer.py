@@ -91,8 +91,15 @@ POST_INLINE_REREVIEW_SUFFIX = (
     "previous pass, so raise the bar: only post findings that are clearly "
     "important (e.g., correctness, security, data loss, broken contracts, "
     "breaking changes, concurrency bugs, resource leaks, significant "
-    "performance regressions). Skip anything minor, stylistic, or NIT-level. "
-    "If after filtering the only remaining findings are minor or NIT-level, "
+    "performance regressions). Skip anything minor, stylistic, or NIT-level."
+)
+
+# Appended after POST_INLINE_REREVIEW_SUFFIX only when the PR is NOT
+# self-authored. GitHub returns 422 ("Can not approve your own pull request")
+# on `event: APPROVE` for the author, so this clause is unsafe to send when
+# the `gh` user is the PR author — but the raised bar above still applies.
+POST_INLINE_REREVIEW_APPROVE_SUFFIX = (
+    " If after filtering the only remaining findings are minor or NIT-level, "
     "submit an APPROVE review with no inline comments (use `event: APPROVE` "
     "and omit the `comments` array) instead of `event: COMMENT`."
 )
@@ -1038,18 +1045,15 @@ class PRReviewer(App):
             # missing path/created_at/body, and we still want to raise the bar
             # if the only surviving evidence is in the unfiltered list.
             #
-            # Skip rereview when the PR is self-authored: GitHub returns 422
-            # ("Can not approve your own pull request") on `event: APPROVE` for
-            # self-authored PRs, and the suffix instructs Claude to do exactly
-            # that on NIT-only re-reviews. `m` toggles authored PRs into the
-            # table, so this path is reachable in normal use.
+            # The APPROVE clause is gated separately on authorship: GitHub
+            # rejects self-approval with 422, so we still raise the bar on
+            # self re-reviews but drop the auto-approve instruction.
             my_login = _current_gh_login()
             author_login = (pr.get("author") or {}).get("login")
-            rereview = (
-                bool(my_login)
-                and author_login != my_login
-                and any((c.get("user") or {}).get("login") == my_login for c in existing)
+            rereview = bool(my_login) and any(
+                (c.get("user") or {}).get("login") == my_login for c in existing
             )
+            rereview_can_approve = rereview and author_login != my_login
 
             sections = [REVIEW_PROMPT]
             if existing_block:
@@ -1062,6 +1066,8 @@ class PRReviewer(App):
                     post += POST_INLINE_FETCH_FAILED_SUFFIX
                 if rereview:
                     post += POST_INLINE_REREVIEW_SUFFIX
+                    if rereview_can_approve:
+                        post += POST_INLINE_REREVIEW_APPROVE_SUFFIX
                 sections.append(post)
             prompt = PROMPT_SECTION_SEP.join(sections)
 
