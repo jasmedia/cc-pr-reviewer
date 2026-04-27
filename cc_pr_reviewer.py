@@ -244,31 +244,40 @@ def fetch_review_prs(repo: str | None = None) -> list[dict[str, Any]]:
     return _search_prs(["--review-requested=@me", *_repo_filter_arg(repo)])
 
 
-_MY_PRS_GRAPHQL = """
-query {
-  viewer {
+_MY_PRS_PAGE_SIZE = 100
+
+_MY_PRS_GRAPHQL = f"""
+query {{
+  viewer {{
     pullRequests(
-      first: 100,
+      first: {_MY_PRS_PAGE_SIZE},
       states: OPEN,
-      orderBy: {field: UPDATED_AT, direction: DESC}
-    ) {
-      nodes {
+      orderBy: {{field: UPDATED_AT, direction: DESC}}
+    ) {{
+      pageInfo {{ hasNextPage }}
+      nodes {{
         number
         title
         url
         updatedAt
         isDraft
-        author { login }
-        repository { nameWithOwner isArchived }
-      }
-    }
-  }
-}
+        author {{ login }}
+        repository {{ nameWithOwner isArchived }}
+      }}
+    }}
+  }}
+}}
 """
 
 
-def fetch_my_prs(repo: str | None = None) -> list[dict[str, Any]]:
+def fetch_my_prs(repo: str | None = None) -> tuple[list[dict[str, Any]], str | None]:
     """All open PRs across GitHub authored by @me.
+
+    Returns `(nodes, warning)`. `warning` is a non-fatal message the caller
+    should surface as a toast — currently used for two cases:
+      • the result was truncated at `first: _MY_PRS_PAGE_SIZE`,
+      • GraphQL returned `errors` *with* surviving `data` (partial success).
+    Hard failures (transport, parse, fully-failed query) still raise.
 
     Uses GraphQL `viewer.pullRequests` rather than `gh search prs --author=@me`
     because the GitHub Search API has indexing delays — recently-pushed PRs
@@ -283,17 +292,41 @@ def fetch_my_prs(repo: str | None = None) -> list[dict[str, Any]]:
         payload = json.loads(r.stdout or "{}")
     except json.JSONDecodeError as e:
         raise RuntimeError(f"could not parse graphql response: {e}") from e
-    # `gh api graphql` exits 0 even when the GraphQL layer returns errors
-    # (e.g. invalid query, scope issues), so check the payload explicitly.
-    if errors := payload.get("errors"):
-        msg = "; ".join(e.get("message", str(e)) for e in errors)
-        raise RuntimeError(f"graphql errors: {msg}")
-    nodes = payload.get("data", {}).get("viewer", {}).get("pullRequests", {}).get("nodes", [])
+
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else None
+    pull_requests = ((data or {}).get("viewer") or {}).get("pullRequests")
+    errors = payload.get("errors") or []
+
+    # `gh api graphql` exits 0 even when the GraphQL layer returns errors.
+    # Distinguish hard failure (no usable data) from partial success: the
+    # spec allows `data` and `errors` together (e.g. one inaccessible repo
+    # while others succeed), and discarding everything would erase a 99/100
+    # successful response on the strength of one bad node.
+    if not pull_requests:
+        if errors:
+            msg = "; ".join(e.get("message", str(e)) for e in errors)
+            raise RuntimeError(f"graphql errors: {msg}")
+        raise RuntimeError("graphql response missing data.viewer.pullRequests")
+
+    nodes = pull_requests.get("nodes") or []
+    # Drop entries whose `repository` failed to resolve — `_load_prs` keys
+    # on `repository.nameWithOwner` and would `TypeError`/`KeyError` here.
+    nodes = [n for n in nodes if isinstance(n.get("repository"), dict)]
     # Match the `--archived=false` behavior of the search-based path.
-    nodes = [n for n in nodes if not (n.get("repository") or {}).get("isArchived")]
+    nodes = [n for n in nodes if not n["repository"].get("isArchived")]
     if repo:
-        nodes = [n for n in nodes if (n.get("repository") or {}).get("nameWithOwner") == repo]
-    return nodes
+        nodes = [n for n in nodes if n["repository"].get("nameWithOwner") == repo]
+
+    warning_parts: list[str] = []
+    if errors:
+        msg = "; ".join(e.get("message", str(e)) for e in errors)
+        warning_parts.append(f"my-PRs query returned with errors (showing partial data): {msg}")
+    if (pull_requests.get("pageInfo") or {}).get("hasNextPage"):
+        warning_parts.append(
+            f"Showing {_MY_PRS_PAGE_SIZE} most-recently-updated of your open "
+            "PRs; older ones omitted."
+        )
+    return nodes, ("; ".join(warning_parts) or None)
 
 
 _GH_LOGIN: str | None = None
@@ -929,12 +962,13 @@ class PRReviewer(App):
             return
 
         # Fetch my-PRs separately so a failure here doesn't drop the
-        # review-PR list, and so the user sees an explicit error rather than
-        # an empty MINE column when the my-PRs `gh search` fails.
+        # review-PR list, and so the user sees an explicit error rather
+        # than an empty MINE column when the my-PRs fetch fails.
         mine_error: str | None = None
+        mine_warning: str | None = None
         if self.include_mine:
             try:
-                mine = fetch_my_prs(repo)
+                mine, mine_warning = fetch_my_prs(repo)
             except Exception as e:  # noqa: BLE001
                 mine_error = str(e)
                 mine = []
@@ -945,12 +979,17 @@ class PRReviewer(App):
                     continue
                 pr["_mine"] = True
                 data.append(pr)
-        self.call_from_thread(self._populate, data, mine_error)
+        self.call_from_thread(self._populate, data, mine_error, mine_warning)
 
     def _filter_desc(self) -> str:
         return f" [repo={self.repo_filter}]" if self.repo_filter else ""
 
-    def _populate(self, data: list[dict[str, Any]], mine_error: str | None = None) -> None:
+    def _populate(
+        self,
+        data: list[dict[str, Any]],
+        mine_error: str | None = None,
+        mine_warning: str | None = None,
+    ) -> None:
         self.prs = data
         # Refresh repo cache only on unfiltered fetches; otherwise it would
         # shrink to whatever the active filter happens to allow. An empty
@@ -959,12 +998,18 @@ class PRReviewer(App):
             self.repo_cache = tuple(sorted({pr["repository"]["nameWithOwner"] for pr in data}))
         table = self.query_one("#pr-table", DataTable)
         table.clear()
+        if mine_warning:
+            self.notify(mine_warning, severity="warning", timeout=8)
         # Surface mine-count (or the my-PRs fetch error) so the user can tell
         # at a glance whether the toggle pulled in any of their own PRs —
         # otherwise an empty MINE column is indistinguishable from a silent
-        # `gh search --author=@me` failure.
+        # my-PRs fetch failure.
         if mine_error:
-            mode = f" (+mine: ERROR — {mine_error.splitlines()[0][:80]})"
+            # Guard against an empty/whitespace-only error string (e.g. a
+            # bare `RuntimeError()` stringifies to "") — `"".splitlines()`
+            # is `[]`, and `[0]` would IndexError on the UI thread.
+            first_line = (mine_error.splitlines() or [""])[0][:80] or "unknown error"
+            mode = f" (+mine: ERROR — {first_line})"
             self.notify(
                 f"Couldn't fetch your authored PRs: {mine_error}",
                 severity="error",
