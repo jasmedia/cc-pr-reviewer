@@ -33,7 +33,6 @@ import webbrowser
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from functools import cache
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
@@ -81,17 +80,21 @@ POST_INLINE_DEDUP_SUFFIX = (
     "comment (same file+line+substantive point)."
 )
 
-# Appended on top of POST_INLINE_DEDUP_SUFFIX only when the existing comments
-# include at least one prior review by the current `gh` user — i.e. this tool
-# has already reviewed this PR before. Third-party review comments don't count;
-# we don't want to raise the bar just because someone else commented.
+# Appended to the post-inline prompt only when the existing inline review
+# comments (from `pulls/{n}/comments` — top-level review bodies and issue
+# comments are NOT included) contain at least one entry authored by the
+# current `gh` user — i.e. this tool has already reviewed this PR before.
+# Third-party review comments don't count; we don't want to raise the bar
+# just because someone else commented.
 POST_INLINE_REREVIEW_SUFFIX = (
     " You (the authenticated `gh` user) have already reviewed this PR in a "
     "previous pass, so raise the bar: only post findings that are clearly "
-    "important (correctness, security, data loss, broken contracts, breaking "
-    "changes). Skip anything minor, stylistic, or NIT-level. If after filtering "
-    "the only remaining findings are minor or NIT-level, submit the review with "
-    "`event: APPROVE` instead of `event: COMMENT` and omit those nits."
+    "important (e.g., correctness, security, data loss, broken contracts, "
+    "breaking changes, concurrency bugs, resource leaks, significant "
+    "performance regressions). Skip anything minor, stylistic, or NIT-level. "
+    "If after filtering the only remaining findings are minor or NIT-level, "
+    "submit an APPROVE review with no inline comments (use `event: APPROVE` "
+    "and omit the `comments` array) instead of `event: COMMENT`."
 )
 
 # Appended to POST_INLINE_PROMPT when the existing-comments fetch failed. The
@@ -238,13 +241,28 @@ def fetch_my_prs(repo: str | None = None) -> list[dict[str, Any]]:
     return _search_prs(["--author=@me", *_repo_filter_arg(repo)])
 
 
-@cache
+_GH_LOGIN: str | None = None
+
+
 def _current_gh_login() -> str | None:
-    """Login of the authenticated `gh` user, or None if undetectable."""
+    """Login of the authenticated `gh` user, or None if undetectable.
+
+    Cached on first success only — a transient `gh` failure (auth blip, network
+    timeout) must not disable rereview detection for the rest of the session,
+    so failures retry on the next call. Mirrors `fetch_existing_review_comments`
+    by surfacing the underlying error to the user.
+    """
+    global _GH_LOGIN
+    if _GH_LOGIN is not None:
+        return _GH_LOGIN
     r = run(["gh", "api", "user", "--jq", ".login"])
     if r.returncode != 0:
+        err = (r.stderr or r.stdout).strip() or f"exit {r.returncode}"
+        print(f"warning: could not detect gh login (rereview detection disabled): {err}")
         return None
-    return r.stdout.strip() or None
+    login = r.stdout.strip() or None
+    _GH_LOGIN = login
+    return login
 
 
 def fetch_existing_review_comments(repo: str, number: int) -> tuple[list[dict[str, Any]], bool]:
@@ -1015,22 +1033,26 @@ class PRReviewer(App):
             existing, fetch_ok = fetch_existing_review_comments(repo_full, number)
             existing_block, shown = format_existing_comments(existing)
 
+            # Compute rereview against the raw `existing` list, not against
+            # `existing_block` — `format_existing_comments` filters out entries
+            # missing path/created_at/body, and we still want to raise the bar
+            # if the only surviving evidence is in the unfiltered list.
+            my_login = _current_gh_login()
+            rereview = bool(my_login) and any(
+                (c.get("user") or {}).get("login") == my_login for c in existing
+            )
+
             sections = [REVIEW_PROMPT]
             if existing_block:
                 sections.append(existing_block)
-            rereview = False
             if post_inline:
                 post = POST_INLINE_PROMPT
                 if existing_block:
                     post += POST_INLINE_DEDUP_SUFFIX
-                    my_login = _current_gh_login()
-                    if my_login and any(
-                        (c.get("user") or {}).get("login") == my_login for c in existing
-                    ):
-                        post += POST_INLINE_REREVIEW_SUFFIX
-                        rereview = True
                 elif not fetch_ok:
                     post += POST_INLINE_FETCH_FAILED_SUFFIX
+                if rereview:
+                    post += POST_INLINE_REREVIEW_SUFFIX
                 sections.append(post)
             prompt = PROMPT_SECTION_SEP.join(sections)
 
