@@ -1037,9 +1037,18 @@ class PRReviewer(App):
             # `existing_block` — `format_existing_comments` filters out entries
             # missing path/created_at/body, and we still want to raise the bar
             # if the only surviving evidence is in the unfiltered list.
+            #
+            # Skip rereview when the PR is self-authored: GitHub returns 422
+            # ("Can not approve your own pull request") on `event: APPROVE` for
+            # self-authored PRs, and the suffix instructs Claude to do exactly
+            # that on NIT-only re-reviews. `m` toggles authored PRs into the
+            # table, so this path is reachable in normal use.
             my_login = _current_gh_login()
-            rereview = bool(my_login) and any(
-                (c.get("user") or {}).get("login") == my_login for c in existing
+            author_login = (pr.get("author") or {}).get("login")
+            rereview = (
+                bool(my_login)
+                and author_login != my_login
+                and any((c.get("user") or {}).get("login") == my_login for c in existing)
             )
 
             sections = [REVIEW_PROMPT]
