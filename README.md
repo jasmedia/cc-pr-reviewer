@@ -134,3 +134,7 @@ comment via a single `POST /repos/{owner}/{repo}/pulls/{n}/reviews` call
 through `gh api`, so they land grouped under one review.
 
 When you `/exit` Claude, press Enter and the TUI returns.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for the release history.
