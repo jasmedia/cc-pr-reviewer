@@ -1162,11 +1162,6 @@ class PRReviewer(App):
         mine_warning: str | None = None,
         quiet: bool = False,
     ) -> None:
-        # Sort first so `self.prs` and the row map line up — `_selected()`
-        # indexes `self.prs` via `_row_to_pr_idx`, so reordering after
-        # storing would mis-route Enter/d/o on toggle.
-        if self.sort_by == "updated":
-            data = sorted(data, key=lambda p: p.get("updatedAt", ""), reverse=True)
         self.prs = data
         # Sticky so pure render-toggles (e.g. `action_toggle_group` →
         # `_populate(self.prs, mine_error=self._last_mine_error, quiet=True)`)
@@ -1245,8 +1240,19 @@ class PRReviewer(App):
             self._row_to_pr_idx.append(i)
 
         if not self.group_by:
-            for i, pr in enumerate(data):
-                _emit_pr_row(i, pr)
+            # Reorder at render time only — `self.prs` stays in fetch order
+            # so toggling sort off restores the natural data-source ordering
+            # without needing a refresh.
+            if self.sort_by == "updated":
+                indices = sorted(
+                    range(len(data)),
+                    key=lambda i: data[i].get("updatedAt", ""),
+                    reverse=True,
+                )
+            else:
+                indices = list(range(len(data)))
+            for i in indices:
+                _emit_pr_row(i, data[i])
         else:
 
             def _key(pr: dict[str, Any]) -> str:
