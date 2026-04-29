@@ -4,6 +4,41 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] — 2026-04-29
+
+### Added
+- **Release Notes link** pinned to the top-right of the TUI header (left of
+  the clock) that opens `CHANGELOG.md` on GitHub in your browser.
+
+### Fixed
+- Diff modal was truncating long, multi-file diffs to the viewport with no
+  way to scroll. The body is now wrapped in a `VerticalScroll` and focused
+  on mount, so arrow keys, PgUp/PgDn, Home/End, and the mouse wheel all
+  scroll the diff. `q` and `Esc` still dismiss the modal.
+
+## [0.6.0] — 2026-04-29
+
+### Added
+- **Extra-prompt textbox** in the review confirmation modal: append
+  free-form context (e.g. "focus on security", "this is a hotfix") to the
+  prompt sent to Claude Code without editing `REVIEW_PROMPT`.
+- Confirm-modal keyboard ergonomics: textbox stays unfocused on open so the
+  y/n/p/Enter fast path still works; Ctrl+Y / Ctrl+N / Ctrl+P confirm,
+  cancel, and toggle post-inline from inside the textbox; Shift+Enter
+  inserts a newline.
+
+### Changed
+- Command palette moved from `ctrl+p` to bare `p` so the confirm modal's
+  `Ctrl+P` (toggle post-inline) is no longer shadowed by Textual's
+  App-level priority binding. Typing `p` inside the textbox still works
+  because priority bindings on printable keys yield to focused inputs.
+
+### Fixed
+- Diff modal no longer crashes when a diff line contains characters Rich
+  parses as markup (e.g. `[x]`); markup parsing is disabled on the body.
+- Failed diff loads now surface the error in the modal instead of leaving
+  it stalled on "Loading…".
+
 ## [0.5.0] — 2026-04-27
 
 ### Added
@@ -145,6 +180,8 @@ Initial release.
 - Prereq checks for `gh`, `claude`, `git`, and the **PR Review Toolkit**
   Claude Code plugin.
 
+[0.7.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.7.0
+[0.6.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.6.0
 [0.5.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.5.0
 [0.4.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.4.0
 [0.3.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.3.0
