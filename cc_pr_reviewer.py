@@ -38,7 +38,7 @@ from importlib.metadata import version as _pkg_version
 from pathlib import Path
 from typing import Any
 
-from textual import work
+from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
@@ -613,6 +613,28 @@ class ConfirmResult:
     extra_prompt: str = ""
 
 
+class ExtraPromptTextArea(TextArea):
+    """TextArea variant where Shift+Enter inserts a newline.
+
+    Plain Enter is reserved for the surrounding screen's confirm action,
+    which intercepts it via a `priority=True` screen binding before this
+    widget's `_on_key` ever runs (TextArea hardcodes `enter -> '\\n'` in
+    `_on_key`, so a non-priority screen binding wouldn't override it).
+
+    Note: terminals without modifyOtherKeys / kitty keyboard support
+    can't distinguish Shift+Enter from Enter; on those, multi-line
+    input isn't possible — single-line still works fine.
+    """
+
+    async def _on_key(self, event: events.Key) -> None:
+        if event.key == "shift+enter":
+            event.stop()
+            event.prevent_default()
+            self.insert("\n")
+            return
+        await super()._on_key(event)
+
+
 class ConfirmScreen(ModalScreen[ConfirmResult | None]):
     """Confirm Claude Code launch for a PR review, with a post-inline toggle
     and an optional free-form extra-prompt textbox.
@@ -622,18 +644,21 @@ class ConfirmScreen(ModalScreen[ConfirmResult | None]):
     (`if result:`) from silently swallowing the post-inline-off case.
     """
 
-    # Don't auto-focus the TextArea on push: it would swallow the y/n/p/Enter
-    # shortcuts that are the primary path for users who don't need an extra
-    # prompt. Tabbing or clicking still focuses the box for those who do.
-    AUTO_FOCUS = None
+    # Auto-focus the textbox so typing extra prompt is zero-keystroke. The
+    # priority bindings below ensure Enter / Ctrl-modified shortcuts still
+    # fire from inside the focused TextArea.
+    AUTO_FOCUS = "#confirm-extra"
 
     BINDINGS = [
-        Binding("enter,y", "confirm", "Yes"),
-        Binding("escape,n,q", "cancel", "No"),
-        Binding("p", "toggle_post_inline", "Toggle post inline"),
-        # Confirm-from-anywhere shortcut so users who tabbed into the TextArea
-        # (where Enter inserts a newline) can submit without tabbing back out.
-        Binding("ctrl+s", "confirm", "Confirm", priority=True, show=False),
+        # `priority=True` is mandatory on every binding here: TextArea has
+        # focus by default, and without priority its `_on_key` would consume
+        # Enter (insert "\n") and the Ctrl-prefixed letters before our
+        # actions ever ran.
+        Binding("enter", "confirm", "Confirm", priority=True),
+        Binding("ctrl+y", "confirm", "Confirm", priority=True, show=False),
+        Binding("escape", "cancel", "Cancel", priority=True),
+        Binding("ctrl+n", "cancel", "Cancel", priority=True, show=False),
+        Binding("ctrl+p", "toggle_post_inline", "Toggle post-inline", priority=True),
     ]
 
     def __init__(self, prompt: str):
@@ -643,15 +668,14 @@ class ConfirmScreen(ModalScreen[ConfirmResult | None]):
 
     def compose(self) -> ComposeResult:
         hint = (
-            "[b]Enter[/] / [b]y[/] proceed • [b]Esc[/] / [b]n[/] cancel "
-            "• [b]p[/] toggle post-inline • [b]Tab[/] to type extra prompt "
-            "([b]Ctrl+S[/] confirms from textbox)"
+            "[b]Enter[/] / [b]Ctrl+Y[/] confirm • [b]Esc[/] / [b]Ctrl+N[/] cancel "
+            "• [b]Ctrl+P[/] toggle post-inline • [b]Shift+Enter[/] newline"
         )
         yield Vertical(
             Label(self.prompt, id="confirm-title", markup=False),
             Label(self._checkbox_text(), id="confirm-checkbox", markup=False),
             Label("Extra prompt (optional):", id="confirm-extra-label"),
-            TextArea(id="confirm-extra"),
+            ExtraPromptTextArea(id="confirm-extra"),
             Label(hint, id="confirm-hint"),
             id="confirm-container",
         )
