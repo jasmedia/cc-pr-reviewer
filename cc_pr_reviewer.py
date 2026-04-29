@@ -585,7 +585,7 @@ class DiffScreen(ModalScreen):
                 f"Diff • {self.repo}#{self.number}   (q or Esc to close)",
                 id="diff-title",
             ),
-            Static("Loading diff…", id="diff-body"),
+            Static("Loading diff…", id="diff-body", markup=False),
             id="diff-container",
         )
 
@@ -594,11 +594,21 @@ class DiffScreen(ModalScreen):
 
     @work(thread=True)
     def _load_diff(self) -> None:
-        r = run(["gh", "pr", "diff", str(self.number), "--repo", self.repo])
-        body = r.stdout if r.returncode == 0 else f"Error:\n{r.stderr}"
+        # Catch broadly so an OSError / FileNotFoundError from `gh` doesn't
+        # kill the worker silently and leave the modal stuck on "Loading…".
+        try:
+            r = run(["gh", "pr", "diff", str(self.number), "--repo", self.repo])
+        except Exception as e:  # noqa: BLE001
+            body = f"Error launching `gh pr diff`: {e}"
+        else:
+            if r.returncode == 0:
+                body = r.stdout or "(empty diff)"
+            else:
+                err = (r.stderr or r.stdout).strip() or f"exit {r.returncode}"
+                body = f"Error (exit {r.returncode}):\n{err}"
         self.app.call_from_thread(
             self.query_one("#diff-body", Static).update,
-            body or "(empty diff)",
+            body,
         )
 
 
