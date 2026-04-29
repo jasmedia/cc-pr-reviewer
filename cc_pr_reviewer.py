@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from rich.markup import escape
+from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -598,6 +599,43 @@ def _last_reviewed_cell(pr: dict[str, Any], state: dict[str, dict[str, Any]]) ->
 # --- Diff modal ------------------------------------------------------------
 
 
+def _highlight_diff(diff: str) -> Text:
+    """Colourise a unified-diff string the way `git diff` does.
+
+    Returns a Rich `Text` so the modal can render it directly without going
+    through markup parsing (diff bodies routinely contain `[` characters that
+    would otherwise be mis-parsed).
+    """
+    file_header_prefixes = (
+        "diff --git",
+        "index ",
+        "similarity ",
+        "rename ",
+        "new file",
+        "deleted file",
+        "+++",
+        "---",
+    )
+    out = Text()
+    for raw_line in diff.splitlines(keepends=True):
+        line = raw_line.rstrip("\n")
+        nl = raw_line[len(line) :]
+        if line.startswith(file_header_prefixes):
+            style = "bold"
+        elif line.startswith("@@"):
+            style = "cyan"
+        elif line.startswith("+"):
+            style = "green"
+        elif line.startswith("-"):
+            style = "red"
+        else:
+            style = ""
+        out.append(line, style=style)
+        if nl:
+            out.append(nl)
+    return out
+
+
 class DiffScreen(ModalScreen):
     """A full-screen view of `gh pr diff` output."""
 
@@ -632,13 +670,14 @@ class DiffScreen(ModalScreen):
     def _load_diff(self) -> None:
         # Catch broadly so an OSError / FileNotFoundError from `gh` doesn't
         # kill the worker silently and leave the modal stuck on "Loading…".
+        body: str | Text
         try:
             r = run(["gh", "pr", "diff", str(self.number), "--repo", self.repo])
         except Exception as e:  # noqa: BLE001
             body = f"Error launching `gh pr diff`: {e}"
         else:
             if r.returncode == 0:
-                body = r.stdout or "(empty diff)"
+                body = _highlight_diff(r.stdout) if r.stdout else "(empty diff)"
             else:
                 err = (r.stderr or r.stdout).strip() or f"exit {r.returncode}"
                 body = f"Error (exit {r.returncode}):\n{err}"
