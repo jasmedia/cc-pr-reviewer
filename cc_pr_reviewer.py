@@ -152,6 +152,12 @@ CHANGELOG_URL = "https://github.com/jasmedia/cc-pr-reviewer/blob/main/CHANGELOG.
 GroupBy = Literal["", "repo", "author"]
 _GROUP_CYCLE: dict[GroupBy, GroupBy] = {"": "repo", "repo": "author", "author": ""}
 
+# Same pattern for the sort cycle. "" preserves the natural order from the
+# data sources (best-match for `gh search prs`, updated-desc from the my-PRs
+# GraphQL query); "updated" sorts the merged list by `updatedAt` descending.
+SortBy = Literal["", "updated"]
+_SORT_CYCLE: dict[SortBy, SortBy] = {"": "updated", "updated": ""}
+
 
 def _installed_version() -> str | None:
     try:
@@ -1018,6 +1024,7 @@ class PRReviewer(App):
         Binding("m", "toggle_mine", "Toggle my PRs"),
         Binding("f", "filter", "Filter by repo"),
         Binding("g", "toggle_group", "Group by"),
+        Binding("s", "toggle_sort", "Sort by"),
         Binding("u", "upgrade", "Upgrade"),
         Binding("q", "quit", "Quit"),
     ]
@@ -1036,6 +1043,8 @@ class PRReviewer(App):
         self.include_mine: bool = _get_setting(self.review_db, "include_mine", "0") == "1"
         stored_group = _get_setting(self.review_db, "group_by", "")
         self.group_by: GroupBy = stored_group if stored_group in _GROUP_CYCLE else ""
+        stored_sort = _get_setting(self.review_db, "sort_by", "")
+        self.sort_by: SortBy = stored_sort if stored_sort in _SORT_CYCLE else ""
         self._row_to_pr_idx: list[int | None] = []
         # Last mine-fetch error from `_load_prs`. Forwarded into pure
         # render-toggle calls of `_populate` so a previously-shown ERROR
@@ -1084,6 +1093,7 @@ class PRReviewer(App):
         self._set_footer_active("m", self.include_mine)
         self._set_footer_active("f", self.repo_filter is not None)
         self._set_footer_active("g", bool(self.group_by))
+        self._set_footer_active("s", bool(self.sort_by))
 
     def _set_footer_active(self, key: str, active: bool, retries: int = 2) -> None:
         """Toggle the `-state-active` CSS class on the FooterKey for `key`.
@@ -1142,6 +1152,9 @@ class PRReviewer(App):
     def _group_desc(self) -> str:
         return f" [group={self.group_by}]" if self.group_by else ""
 
+    def _sort_desc(self) -> str:
+        return f" [sort={self.sort_by}]" if self.sort_by else ""
+
     def _populate(
         self,
         data: list[dict[str, Any]],
@@ -1191,10 +1204,11 @@ class PRReviewer(App):
             mode = " (mine: off)"
         filter_desc = self._filter_desc()
         group_desc = self._group_desc()
+        sort_desc = self._sort_desc()
         if not data:
             self._set_status(
-                f"No PRs awaiting your review 🎉{mode}{filter_desc}{group_desc}   "
-                "(f: filter, m: mine, g: group, r: refresh, u: upgrade, q: quit)",
+                f"No PRs awaiting your review 🎉{mode}{filter_desc}{group_desc}{sort_desc}   "
+                "(f: filter, m: mine, g: group, s: sort, r: refresh, u: upgrade, q: quit)",
                 error=bool(mine_error),
             )
             return
@@ -1226,8 +1240,19 @@ class PRReviewer(App):
             self._row_to_pr_idx.append(i)
 
         if not self.group_by:
-            for i, pr in enumerate(data):
-                _emit_pr_row(i, pr)
+            # Reorder at render time only — `self.prs` stays in fetch order
+            # so toggling sort off restores the natural data-source ordering
+            # without needing a refresh.
+            if self.sort_by == "updated":
+                indices = sorted(
+                    range(len(data)),
+                    key=lambda i: data[i].get("updatedAt", ""),
+                    reverse=True,
+                )
+            else:
+                indices = list(range(len(data)))
+            for i in indices:
+                _emit_pr_row(i, data[i])
         else:
 
             def _key(pr: dict[str, Any]) -> str:
@@ -1277,9 +1302,9 @@ class PRReviewer(App):
                 for i in idxs:
                     _emit_pr_row(i, data[i])
         self._set_status(
-            f"{len(data)} PR(s){mode}{filter_desc}{group_desc}   "
+            f"{len(data)} PR(s){mode}{filter_desc}{group_desc}{sort_desc}   "
             "•  enter: review  •  d: diff  •  o: browser  •  f: filter  •  m: mine  "
-            "•  g: group  •  r: refresh  •  u: upgrade  •  q: quit",
+            "•  g: group  •  s: sort  •  r: refresh  •  u: upgrade  •  q: quit",
             error=bool(mine_error),
         )
 
@@ -1397,6 +1422,37 @@ class PRReviewer(App):
         # Render-only re-populate: forward the last fetch's mine_error so
         # the ERROR badge isn't lost, and `quiet=True` to suppress
         # re-toasting toasts the user already saw on the original fetch.
+        self._populate(self.prs, mine_error=self._last_mine_error, quiet=True)
+
+        if prev_key is not None:
+            for row, idx in enumerate(self._row_to_pr_idx):
+                if idx is None:
+                    continue
+                p = self.prs[idx]
+                if (p["repository"]["nameWithOwner"], p["number"]) == prev_key:
+                    table.move_cursor(row=row)
+                    break
+
+    def action_toggle_sort(self) -> None:
+        # Mirrors `action_toggle_group`: capture cursor PR identity, cycle the
+        # mode, persist, render-only re-populate, then restore the cursor onto
+        # the same PR at its new row.
+        table = self.query_one("#pr-table", DataTable)
+        prev_key: tuple[str, int] | None = None
+        if table.row_count and 0 <= (table.cursor_row or 0) < len(self._row_to_pr_idx):
+            idx = self._row_to_pr_idx[table.cursor_row]
+            if idx is not None:
+                p = self.prs[idx]
+                prev_key = (p["repository"]["nameWithOwner"], p["number"])
+
+        nxt = _SORT_CYCLE[self.sort_by]
+        self.sort_by = nxt
+        try:
+            _set_setting(self.review_db, "sort_by", nxt)
+        except sqlite3.Error as e:
+            self.notify(f"Couldn't persist sort toggle: {e}", severity="warning")
+        self.notify(f"Sort: {nxt or 'default'}", timeout=3)
+        self._refresh_footer_indicators()
         self._populate(self.prs, mine_error=self._last_mine_error, quiet=True)
 
         if prev_key is not None:
