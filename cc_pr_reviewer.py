@@ -36,8 +36,9 @@ from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
+from rich.markup import escape
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -144,6 +145,12 @@ PACKAGE_NAME = "cc-pr-reviewer"
 PYPI_JSON_URL = f"https://pypi.org/pypi/{PACKAGE_NAME}/json"
 RELEASES_URL = "https://github.com/jasmedia/cc-pr-reviewer/releases"
 CHANGELOG_URL = "https://github.com/jasmedia/cc-pr-reviewer/blob/main/CHANGELOG.md"
+
+# Single source of truth for the group-by cycle. Adding a new mode means
+# editing only this dict — `__init__`'s whitelist load and the toggle action
+# both consult it, so the legal-value list never drifts.
+GroupBy = Literal["", "repo", "author"]
+_GROUP_CYCLE: dict[GroupBy, GroupBy] = {"": "repo", "repo": "author", "author": ""}
 
 
 def _installed_version() -> str | None:
@@ -1028,8 +1035,12 @@ class PRReviewer(App):
         self.repo_filter: str | None = stored_filter or None
         self.include_mine: bool = _get_setting(self.review_db, "include_mine", "0") == "1"
         stored_group = _get_setting(self.review_db, "group_by", "")
-        self.group_by: str = stored_group if stored_group in ("repo", "author") else ""
+        self.group_by: GroupBy = stored_group if stored_group in _GROUP_CYCLE else ""
         self._row_to_pr_idx: list[int | None] = []
+        # Last mine-fetch error from `_load_prs`. Forwarded into pure
+        # render-toggle calls of `_populate` so a previously-shown ERROR
+        # badge isn't silently dropped when the user presses `g`.
+        self._last_mine_error: str | None = None
 
     def compose(self) -> ComposeResult:
         yield HeaderWithChangelog(show_clock=True)
@@ -1136,8 +1147,18 @@ class PRReviewer(App):
         data: list[dict[str, Any]],
         mine_error: str | None = None,
         mine_warning: str | None = None,
+        quiet: bool = False,
     ) -> None:
         self.prs = data
+        # Sticky so pure render-toggles (e.g. `action_toggle_group` →
+        # `_populate(self.prs, mine_error=self._last_mine_error, quiet=True)`)
+        # can preserve the ERROR badge a previous fetch produced.
+        self._last_mine_error = mine_error
+        # Always reset before any early-return so an empty-data populate
+        # leaves the row map consistent with the rendered table — `_selected`
+        # already short-circuits on `row_count == 0`, but a stale list here
+        # is a latent trap for future call sites.
+        self._row_to_pr_idx = []
         # Refresh repo cache only on unfiltered fetches; otherwise it would
         # shrink to whatever the active filter happens to allow. An empty
         # result is a legitimate "no repos" signal, so don't gate on `data`.
@@ -1145,7 +1166,7 @@ class PRReviewer(App):
             self.repo_cache = tuple(sorted({pr["repository"]["nameWithOwner"] for pr in data}))
         table = self.query_one("#pr-table", DataTable)
         table.clear()
-        if mine_warning:
+        if mine_warning and not quiet:
             self.notify(mine_warning, severity="warning", timeout=8)
         # Surface mine-count (or the my-PRs fetch error) so the user can tell
         # at a glance whether the toggle pulled in any of their own PRs —
@@ -1157,11 +1178,12 @@ class PRReviewer(App):
             # is `[]`, and `[0]` would IndexError on the UI thread.
             first_line = (mine_error.splitlines() or [""])[0][:80] or "unknown error"
             mode = f" (+mine: ERROR — {first_line})"
-            self.notify(
-                f"Couldn't fetch your authored PRs: {mine_error}",
-                severity="error",
-                timeout=10,
-            )
+            if not quiet:
+                self.notify(
+                    f"Couldn't fetch your authored PRs: {mine_error}",
+                    severity="error",
+                    timeout=10,
+                )
         elif self.include_mine:
             mine_count = sum(1 for p in data if p.get("_mine"))
             mode = f" (+mine: {mine_count})"
@@ -1176,8 +1198,6 @@ class PRReviewer(App):
                 error=bool(mine_error),
             )
             return
-
-        self._row_to_pr_idx = []
 
         def _emit_pr_row(i: int, pr: dict[str, Any]) -> None:
             repo = pr["repository"]["nameWithOwner"]
@@ -1215,6 +1235,16 @@ class PRReviewer(App):
                     return pr["repository"]["nameWithOwner"]
                 return (pr.get("author") or {}).get("login", "?")
 
+            # `updatedAt` drives both within-group and across-group ordering
+            # below; the silent `""` default would bucket schema-broken PRs
+            # at the bottom of their group where they're easy to miss. Surface
+            # it once per populate so a real upstream break is visible.
+            if not quiet and any(not p.get("updatedAt") for p in data):
+                self.notify(
+                    "Some PRs are missing `updatedAt` — group ordering may be off.",
+                    severity="warning",
+                    timeout=6,
+                )
             buckets: dict[str, list[int]] = {}
             for i, pr in enumerate(data):
                 buckets.setdefault(_key(pr), []).append(i)
@@ -1229,8 +1259,11 @@ class PRReviewer(App):
             )
             for gk in group_order:
                 idxs = buckets[gk]
+                # `escape(gk)` — `gk` is a GitHub login or `nameWithOwner`,
+                # both of which can contain `[` (notably `dependabot[bot]`),
+                # which Rich would otherwise parse as a markup tag and crash.
                 table.add_row(
-                    f"[bold]▼ {gk}[/]  [dim]({len(idxs)})[/]",
+                    f"[bold]▼ {escape(gk)}[/]  [dim]({len(idxs)})[/]",
                     "",
                     "",
                     "",
@@ -1259,6 +1292,10 @@ class PRReviewer(App):
             return None
         idx = self._row_to_pr_idx[row]
         if idx is None:
+            # Cursor is on a group-header row — distinguish from an empty
+            # table so the user gets feedback rather than thinking Enter
+            # is broken.
+            self.notify("Group header — select a PR row", severity="information", timeout=2)
             return None
         return self.prs[idx]
 
@@ -1334,7 +1371,22 @@ class PRReviewer(App):
         self._load_prs()
 
     def action_toggle_group(self) -> None:
-        nxt = {"": "repo", "repo": "author", "author": ""}[self.group_by]
+        # Capture the cursor's PR identity before re-populate clears the
+        # table — without this, toggling on always parks the cursor on the
+        # first group header (a no-op row), which combined with `_selected`
+        # returning None for headers makes Enter/d/o appear broken until
+        # the user manually moves down. Inlined (rather than via
+        # `_selected()`) so the read doesn't fire `_selected`'s
+        # header-row notify.
+        table = self.query_one("#pr-table", DataTable)
+        prev_key: tuple[str, int] | None = None
+        if table.row_count and 0 <= (table.cursor_row or 0) < len(self._row_to_pr_idx):
+            idx = self._row_to_pr_idx[table.cursor_row]
+            if idx is not None:
+                p = self.prs[idx]
+                prev_key = (p["repository"]["nameWithOwner"], p["number"])
+
+        nxt = _GROUP_CYCLE[self.group_by]
         self.group_by = nxt
         try:
             _set_setting(self.review_db, "group_by", nxt)
@@ -1342,7 +1394,19 @@ class PRReviewer(App):
             self.notify(f"Couldn't persist group toggle: {e}", severity="warning")
         self.notify(f"Group: {nxt or 'off'}", timeout=3)
         self._refresh_footer_indicators()
-        self._populate(self.prs)
+        # Render-only re-populate: forward the last fetch's mine_error so
+        # the ERROR badge isn't lost, and `quiet=True` to suppress
+        # re-toasting toasts the user already saw on the original fetch.
+        self._populate(self.prs, mine_error=self._last_mine_error, quiet=True)
+
+        if prev_key is not None:
+            for row, idx in enumerate(self._row_to_pr_idx):
+                if idx is None:
+                    continue
+                p = self.prs[idx]
+                if (p["repository"]["nameWithOwner"], p["number"]) == prev_key:
+                    table.move_cursor(row=row)
+                    break
 
     def action_filter(self) -> None:
         def _apply(result: FilterChoice | None) -> None:
