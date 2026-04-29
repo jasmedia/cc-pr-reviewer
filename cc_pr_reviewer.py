@@ -43,7 +43,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
 from textual.screen import ModalScreen
-from textual.widgets import DataTable, Footer, Header, Label, OptionList, Static
+from textual.widgets import DataTable, Footer, Header, Label, OptionList, Static, TextArea
 from textual.widgets._footer import FooterKey
 from textual.widgets.option_list import Option
 
@@ -610,20 +610,30 @@ class ConfirmResult:
     """Outcome of a confirmed ConfirmScreen — distinct from cancel (None)."""
 
     post_inline: bool
+    extra_prompt: str = ""
 
 
 class ConfirmScreen(ModalScreen[ConfirmResult | None]):
-    """Confirm Claude Code launch for a PR review, with a post-inline toggle.
+    """Confirm Claude Code launch for a PR review, with a post-inline toggle
+    and an optional free-form extra-prompt textbox.
 
     Dismisses with None on cancel, or a ConfirmResult on confirm. Keeping
     cancel and confirm in separate shapes prevents a future truthy check
     (`if result:`) from silently swallowing the post-inline-off case.
     """
 
+    # Don't auto-focus the TextArea on push: it would swallow the y/n/p/Enter
+    # shortcuts that are the primary path for users who don't need an extra
+    # prompt. Tabbing or clicking still focuses the box for those who do.
+    AUTO_FOCUS = None
+
     BINDINGS = [
         Binding("enter,y", "confirm", "Yes"),
         Binding("escape,n,q", "cancel", "No"),
         Binding("p", "toggle_post_inline", "Toggle post inline"),
+        # Confirm-from-anywhere shortcut so users who tabbed into the TextArea
+        # (where Enter inserts a newline) can submit without tabbing back out.
+        Binding("ctrl+s", "confirm", "Confirm", priority=True, show=False),
     ]
 
     def __init__(self, prompt: str):
@@ -633,12 +643,15 @@ class ConfirmScreen(ModalScreen[ConfirmResult | None]):
 
     def compose(self) -> ComposeResult:
         hint = (
-            "[b]Enter[/] / [b]y[/] to proceed • [b]Esc[/] / [b]n[/] to cancel "
-            "• [b]p[/] to toggle post-inline"
+            "[b]Enter[/] / [b]y[/] proceed • [b]Esc[/] / [b]n[/] cancel "
+            "• [b]p[/] toggle post-inline • [b]Tab[/] to type extra prompt "
+            "([b]Ctrl+S[/] confirms from textbox)"
         )
         yield Vertical(
             Label(self.prompt, id="confirm-title", markup=False),
             Label(self._checkbox_text(), id="confirm-checkbox", markup=False),
+            Label("Extra prompt (optional):", id="confirm-extra-label"),
+            TextArea(id="confirm-extra"),
             Label(hint, id="confirm-hint"),
             id="confirm-container",
         )
@@ -648,7 +661,8 @@ class ConfirmScreen(ModalScreen[ConfirmResult | None]):
         return f"{mark} Post findings as inline PR comments"
 
     def action_confirm(self) -> None:
-        self.dismiss(ConfirmResult(post_inline=self.post_inline))
+        text = self.query_one("#confirm-extra", TextArea).text.strip()
+        self.dismiss(ConfirmResult(post_inline=self.post_inline, extra_prompt=text))
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -841,6 +855,14 @@ class PRReviewer(App):
     }
     #confirm-hint, #filter-hint {
         color: $text-muted;
+    }
+    #confirm-extra-label {
+        margin-top: 1;
+        color: $text-muted;
+    }
+    #confirm-extra {
+        height: 5;
+        margin-bottom: 1;
     }
     #filter-list {
         height: auto;
@@ -1119,7 +1141,7 @@ class PRReviewer(App):
 
         def _proceed(result: ConfirmResult | None) -> None:
             if result is not None:
-                self._launch_claude(pr, result.post_inline)
+                self._launch_claude(pr, result.post_inline, result.extra_prompt)
 
         self.push_screen(ConfirmScreen(prompt), _proceed)
 
@@ -1185,7 +1207,7 @@ class PRReviewer(App):
 
     # --- launching claude ---
 
-    def _launch_claude(self, pr: dict[str, Any], post_inline: bool) -> None:
+    def _launch_claude(self, pr: dict[str, Any], post_inline: bool, extra_prompt: str = "") -> None:
         repo_full = pr["repository"]["nameWithOwner"]
         owner, name = repo_full.split("/", 1)
         number = pr["number"]
@@ -1244,6 +1266,8 @@ class PRReviewer(App):
             rereview_can_approve = rereview and author_login != my_login
 
             sections = [REVIEW_PROMPT]
+            if extra_prompt:
+                sections.append(f"Additional instructions from reviewer:\n{extra_prompt}")
             if existing_block:
                 sections.append(existing_block)
             if post_inline:
@@ -1268,10 +1292,11 @@ class PRReviewer(App):
             post_inline_desc = "on" if post_inline else "off"
             if post_inline and rereview:
                 post_inline_desc += ", rereview"
+            extra_desc = ", extra prompt provided" if extra_prompt else ""
             print(
                 f"\nLaunching Claude Code "
                 f"(post-inline: {post_inline_desc}, "
-                f"{existing_desc}) "
+                f"{existing_desc}{extra_desc}) "
                 "— type /exit when you're done.\n"
             )
             rc = subprocess.call(cmd, cwd=local_path)
