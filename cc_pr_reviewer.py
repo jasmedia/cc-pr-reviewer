@@ -43,7 +43,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
 from textual.screen import ModalScreen
-from textual.widgets import DataTable, Footer, Header, Label, OptionList, Static
+from textual.widgets import DataTable, Footer, Header, Label, OptionList, Static, TextArea
 from textual.widgets._footer import FooterKey
 from textual.widgets.option_list import Option
 
@@ -123,6 +123,11 @@ PROMPT_SECTION_SEP = "\n\n"
 # size on PRs with lots of prior review activity.
 EXISTING_COMMENT_BODY_CAP = 200
 EXISTING_COMMENT_LIST_CAP = 50
+
+# Cap for the reviewer-supplied extra prompt echoed in the launch banner.
+# The full text still goes to claude; this only bounds the on-screen preview
+# so the banner stays one terminal row on long pastes.
+EXTRA_PROMPT_BANNER_CAP = 200
 
 # Update check: once per startup, silent on failure.
 PACKAGE_NAME = "cc-pr-reviewer"
@@ -617,23 +622,77 @@ class DiffScreen(ModalScreen):
 
 @dataclass(frozen=True)
 class ConfirmResult:
-    """Outcome of a confirmed ConfirmScreen — distinct from cancel (None)."""
+    """Outcome of a confirmed ConfirmScreen — distinct from cancel (None).
+
+    `extra_prompt` is normalised on construction: leading/trailing whitespace
+    is stripped so a whitespace-only value can never reach the prompt-builder
+    and inject an empty `Additional instructions from reviewer:` section.
+    """
 
     post_inline: bool
+    extra_prompt: str = ""
+
+    def __post_init__(self) -> None:
+        # `frozen=True` blocks attribute assignment; bypass via __setattr__
+        # to enforce the strip invariant on the type itself rather than at
+        # each call site.
+        object.__setattr__(self, "extra_prompt", self.extra_prompt.strip())
+
+
+class ExtraPromptTextArea(TextArea):
+    """TextArea variant where Shift+Enter inserts a newline.
+
+    TextArea consumes plain Enter to insert a newline internally, so the
+    surrounding screen must use a `priority=True` binding to win and
+    route Enter to confirm. The Shift+Enter handling here is added via
+    the public BINDINGS extension point rather than overriding the
+    private `_on_key` hook — that way an upstream rename or signature
+    change can't silently turn Shift+Enter into a confirm-and-submit
+    (which would happen if the override became dead code while the
+    screen's priority Enter binding kept firing).
+
+    Note: terminals without modifyOtherKeys / kitty keyboard support
+    can't distinguish Shift+Enter from Enter; on those, Shift+Enter
+    behaves like Enter (confirms). Pasting multi-line text still works
+    for multi-line input.
+    """
+
+    BINDINGS = [
+        Binding("shift+enter", "insert_newline", priority=True, show=False),
+    ]
+
+    def action_insert_newline(self) -> None:
+        self.insert("\n")
 
 
 class ConfirmScreen(ModalScreen[ConfirmResult | None]):
-    """Confirm Claude Code launch for a PR review, with a post-inline toggle.
+    """Confirm Claude Code launch for a PR review, with a post-inline toggle
+    and an optional free-form extra-prompt textbox.
 
     Dismisses with None on cancel, or a ConfirmResult on confirm. Keeping
     cancel and confirm in separate shapes prevents a future truthy check
     (`if result:`) from silently swallowing the post-inline-off case.
     """
 
+    # Auto-focus the textbox so typing extra prompt is zero-keystroke. The
+    # priority bindings below ensure Enter / Ctrl-modified shortcuts still
+    # fire from inside the focused TextArea.
+    AUTO_FOCUS = "#confirm-extra"
+
     BINDINGS = [
-        Binding("enter,y", "confirm", "Yes"),
-        Binding("escape,n,q", "cancel", "No"),
-        Binding("p", "toggle_post_inline", "Toggle post inline"),
+        # `priority=True` is mandatory on every binding here: TextArea has
+        # focus by default, and without priority its `_on_key` would consume
+        # Enter (insert "\n") and the Ctrl-prefixed letters before our
+        # actions ever ran.
+        #
+        # Toggle is on `ctrl+t` (not `ctrl+p`) because Textual's command
+        # palette is a `priority=True` App-level binding on `ctrl+p` and
+        # would otherwise win.
+        Binding("enter", "confirm", "Confirm", priority=True),
+        Binding("ctrl+y", "confirm", "Confirm", priority=True, show=False),
+        Binding("escape", "cancel", "Cancel", priority=True),
+        Binding("ctrl+n", "cancel", "Cancel", priority=True, show=False),
+        Binding("ctrl+t", "toggle_post_inline", "Toggle post-inline", priority=True),
     ]
 
     def __init__(self, prompt: str):
@@ -643,12 +702,14 @@ class ConfirmScreen(ModalScreen[ConfirmResult | None]):
 
     def compose(self) -> ComposeResult:
         hint = (
-            "[b]Enter[/] / [b]y[/] to proceed • [b]Esc[/] / [b]n[/] to cancel "
-            "• [b]p[/] to toggle post-inline"
+            "[b]Enter[/] / [b]Ctrl+Y[/] confirm • [b]Esc[/] / [b]Ctrl+N[/] cancel "
+            "• [b]Ctrl+T[/] toggle post-inline • [b]Shift+Enter[/] newline"
         )
         yield Vertical(
             Label(self.prompt, id="confirm-title", markup=False),
             Label(self._checkbox_text(), id="confirm-checkbox", markup=False),
+            Label("Extra prompt (optional):", id="confirm-extra-label"),
+            ExtraPromptTextArea(id="confirm-extra"),
             Label(hint, id="confirm-hint"),
             id="confirm-container",
         )
@@ -658,7 +719,8 @@ class ConfirmScreen(ModalScreen[ConfirmResult | None]):
         return f"{mark} Post findings as inline PR comments"
 
     def action_confirm(self) -> None:
-        self.dismiss(ConfirmResult(post_inline=self.post_inline))
+        text = self.query_one("#confirm-extra", TextArea).text
+        self.dismiss(ConfirmResult(post_inline=self.post_inline, extra_prompt=text))
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -851,6 +913,14 @@ class PRReviewer(App):
     }
     #confirm-hint, #filter-hint {
         color: $text-muted;
+    }
+    #confirm-extra-label {
+        margin-top: 1;
+        color: $text-muted;
+    }
+    #confirm-extra {
+        height: 5;
+        margin-bottom: 1;
     }
     #filter-list {
         height: auto;
@@ -1129,7 +1199,7 @@ class PRReviewer(App):
 
         def _proceed(result: ConfirmResult | None) -> None:
             if result is not None:
-                self._launch_claude(pr, result.post_inline)
+                self._launch_claude(pr, result.post_inline, result.extra_prompt)
 
         self.push_screen(ConfirmScreen(prompt), _proceed)
 
@@ -1195,7 +1265,7 @@ class PRReviewer(App):
 
     # --- launching claude ---
 
-    def _launch_claude(self, pr: dict[str, Any], post_inline: bool) -> None:
+    def _launch_claude(self, pr: dict[str, Any], post_inline: bool, extra_prompt: str) -> None:
         repo_full = pr["repository"]["nameWithOwner"]
         owner, name = repo_full.split("/", 1)
         number = pr["number"]
@@ -1254,6 +1324,8 @@ class PRReviewer(App):
             rereview_can_approve = rereview and author_login != my_login
 
             sections = [REVIEW_PROMPT]
+            if extra_prompt:
+                sections.append(f"Additional instructions from reviewer:\n{extra_prompt}")
             if existing_block:
                 sections.append(existing_block)
             if post_inline:
@@ -1278,12 +1350,19 @@ class PRReviewer(App):
             post_inline_desc = "on" if post_inline else "off"
             if post_inline and rereview:
                 post_inline_desc += ", rereview"
-            print(
-                f"\nLaunching Claude Code "
-                f"(post-inline: {post_inline_desc}, "
-                f"{existing_desc}) "
-                "— type /exit when you're done.\n"
-            )
+            parts = [f"post-inline: {post_inline_desc}", existing_desc]
+            if extra_prompt:
+                # `!r` keeps newlines/control chars visible so a misclick paste
+                # (e.g. a secret) is spottable before claude consumes it. The
+                # explicit `(+N more chars)` suffix is the load-bearing piece:
+                # without it, a 201-char paste renders identically to a clean
+                # 200-char one while the full text still flows into claude's
+                # argv, defeating the whole point of the preview.
+                shown = extra_prompt[:EXTRA_PROMPT_BANNER_CAP]
+                hidden = len(extra_prompt) - len(shown)
+                suffix = f" (+{hidden} more chars)" if hidden else ""
+                parts.append(f"extra prompt: {shown!r}{suffix}")
+            print(f"\nLaunching Claude Code ({', '.join(parts)}) — type /exit when you're done.\n")
             rc = subprocess.call(cmd, cwd=local_path)
 
             # Only count this as a review if Claude exited cleanly. Ctrl-C,
