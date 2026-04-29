@@ -41,7 +41,7 @@ from typing import Any
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical
+from textual.containers import Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Header, Label, OptionList, Static, TextArea
 from textual.widgets._footer import FooterKey
@@ -590,11 +590,18 @@ class DiffScreen(ModalScreen):
                 f"Diff • {self.repo}#{self.number}   (q or Esc to close)",
                 id="diff-title",
             ),
-            Static("Loading diff…", id="diff-body", markup=False),
+            VerticalScroll(
+                Static("Loading diff…", id="diff-body", markup=False),
+                id="diff-scroll",
+            ),
             id="diff-container",
         )
 
     def on_mount(self) -> None:
+        # Focus the scroll container so arrow keys / PgUp / PgDn / Home / End
+        # scroll the diff. `Static` isn't focusable, so without this the modal
+        # would receive keys but have nowhere to send them.
+        self.query_one("#diff-scroll", VerticalScroll).focus()
         self._load_diff()
 
     @work(thread=True)
@@ -895,10 +902,12 @@ class PRReviewer(App):
         margin-bottom: 1;
         color: $accent;
     }
-    #diff-body {
+    #diff-scroll {
         height: 1fr;
-        overflow-y: auto;
         padding: 1;
+    }
+    #diff-body {
+        height: auto;
     }
     #confirm-container, #filter-container {
         border: round $primary;
