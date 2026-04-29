@@ -38,7 +38,7 @@ from importlib.metadata import version as _pkg_version
 from pathlib import Path
 from typing import Any
 
-from textual import events, work
+from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
@@ -632,12 +632,14 @@ class ConfirmResult:
 class ExtraPromptTextArea(TextArea):
     """TextArea variant where Shift+Enter inserts a newline.
 
-    TextArea binds plain Enter to insert a newline internally, so the
+    TextArea consumes plain Enter to insert a newline internally, so the
     surrounding screen must use a `priority=True` binding to win and
-    route Enter to confirm — implementation details (currently in
-    `TextArea._on_key`, verified against `textual>=0.60` as pinned in
-    `pyproject.toml`) may move across Textual versions; re-check on
-    upgrade.
+    route Enter to confirm. The Shift+Enter handling here is added via
+    the public BINDINGS extension point rather than overriding the
+    private `_on_key` hook — that way an upstream rename or signature
+    change can't silently turn Shift+Enter into a confirm-and-submit
+    (which would happen if the override became dead code while the
+    screen's priority Enter binding kept firing).
 
     Note: terminals without modifyOtherKeys / kitty keyboard support
     can't distinguish Shift+Enter from Enter; on those, Shift+Enter
@@ -645,13 +647,12 @@ class ExtraPromptTextArea(TextArea):
     for multi-line input.
     """
 
-    async def _on_key(self, event: events.Key) -> None:
-        if event.key == "shift+enter":
-            event.stop()
-            event.prevent_default()
-            self.insert("\n")
-            return
-        await super()._on_key(event)
+    BINDINGS = [
+        Binding("shift+enter", "insert_newline", priority=True, show=False),
+    ]
+
+    def action_insert_newline(self) -> None:
+        self.insert("\n")
 
 
 class ConfirmScreen(ModalScreen[ConfirmResult | None]):
@@ -1342,9 +1343,15 @@ class PRReviewer(App):
             parts = [f"post-inline: {post_inline_desc}", existing_desc]
             if extra_prompt:
                 # `!r` keeps newlines/control chars visible so a misclick paste
-                # (e.g. a secret) is spottable before claude consumes it; cap
-                # at EXTRA_PROMPT_BANNER_CAP so the banner stays one screen.
-                parts.append(f"extra prompt: {extra_prompt[:EXTRA_PROMPT_BANNER_CAP]!r}")
+                # (e.g. a secret) is spottable before claude consumes it. The
+                # explicit `(+N more chars)` suffix is the load-bearing piece:
+                # without it, a 201-char paste renders identically to a clean
+                # 200-char one while the full text still flows into claude's
+                # argv, defeating the whole point of the preview.
+                shown = extra_prompt[:EXTRA_PROMPT_BANNER_CAP]
+                hidden = len(extra_prompt) - len(shown)
+                suffix = f" (+{hidden} more chars)" if hidden else ""
+                parts.append(f"extra prompt: {shown!r}{suffix}")
             print(f"\nLaunching Claude Code ({', '.join(parts)}) — type /exit when you're done.\n")
             rc = subprocess.call(cmd, cwd=local_path)
 
