@@ -606,6 +606,11 @@ def _highlight_diff(diff: str) -> Text:
     through markup parsing (diff bodies routinely contain `[` characters that
     would otherwise be mis-parsed).
     """
+    # File-header lines from `git diff` / `gh pr diff` are matched with their
+    # full leading sigil so they don't collide with content-line deletions of
+    # comments such as `-- sql` (diff line `--- sql`) or YAML separators
+    # (`---` → diff line `----`). The `--- a/`, `--- b/`, `--- /dev/null` form
+    # is what git always emits for the file-header lines themselves.
     file_header_prefixes = (
         "diff --git",
         "index ",
@@ -613,8 +618,12 @@ def _highlight_diff(diff: str) -> Text:
         "rename ",
         "new file",
         "deleted file",
-        "+++",
-        "---",
+        "--- a/",
+        "--- b/",
+        "--- /dev/null",
+        "+++ a/",
+        "+++ b/",
+        "+++ /dev/null",
     )
     out = Text()
     for raw_line in diff.splitlines(keepends=True):
