@@ -910,6 +910,12 @@ class PRReviewer(App):
     TITLE = "GitHub PR Reviewer"
     SUB_TITLE = "Review PRs with Claude Code"
 
+    # Move the command palette off Textual's default `ctrl+p` so the modal's
+    # `ctrl+p` (toggle post-inline) wins. Textual's priority bindings on
+    # *printable* keys yield to a focused text input, so bare `p` here doesn't
+    # block typing the letter `p` inside the extra-prompt textbox.
+    COMMAND_PALETTE_BINDING = "p"
+
     BINDINGS = [
         Binding("r,f5", "refresh", "Refresh"),
         Binding("enter", "review", "Review w/ Claude"),
