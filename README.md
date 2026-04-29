@@ -89,7 +89,10 @@ before checking out the PR.
 | `o`           | Open PR in browser                                           |
 | `m`           | Toggle inclusion of PRs you authored                         |
 | `f`           | Filter the list by repo (picker)                             |
+| `g`           | Cycle grouping: none → repo → author → none                  |
+| `s`           | Toggle sort by most recently updated                         |
 | `r` / `F5`    | Refresh the list                                             |
+| `u`           | Upgrade `cc-pr-reviewer` via `uv tool upgrade`               |
 | `q`           | Quit                                                         |
 
 Inside the confirmation modal: `Enter` / `y` to proceed, `Esc` / `n` / `q`

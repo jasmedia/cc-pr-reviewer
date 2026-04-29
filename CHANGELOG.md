@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] — 2026-04-29
+
+### Added
+- **Group PRs by repo or author**: new `g` keybinding cycles through
+  `none → repo → author → none`, inserting non-selectable group-header
+  rows into the table. The cursor seeks back to the previously selected
+  PR when toggling, so you don't get stranded on a header row. The
+  chosen mode is persisted across restarts and reflected by the footer
+  highlight on `g`.
+- **Sort by updated time**: new `s` keybinding toggles a "most recently
+  updated first" ordering at render time. The underlying `self.prs`
+  list is kept in fetch order; sorting only affects how rows are laid
+  out, so grouping and filtering remain composable. Also persisted.
+- **Colourised diff modal**: the `d` diff view now mirrors `git diff`
+  styling — file headers, hunk headers, and added/removed lines are
+  syntax-highlighted for faster scanning.
+
+### Fixed
+- Tightened the diff file-header regex so content lines that happen to
+  start with `diff `, `+++`, or `---` are no longer mis-coloured as
+  headers.
+
 ## [0.7.0] — 2026-04-29
 
 ### Added
@@ -180,6 +202,7 @@ Initial release.
 - Prereq checks for `gh`, `claude`, `git`, and the **PR Review Toolkit**
   Claude Code plugin.
 
+[0.8.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.8.0
 [0.7.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.7.0
 [0.6.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.6.0
 [0.5.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.5.0
