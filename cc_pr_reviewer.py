@@ -585,7 +585,7 @@ class DiffScreen(ModalScreen):
                 f"Diff • {self.repo}#{self.number}   (q or Esc to close)",
                 id="diff-title",
             ),
-            Static("Loading diff…", id="diff-body"),
+            Static("Loading diff…", id="diff-body", markup=False),
             id="diff-container",
         )
 
