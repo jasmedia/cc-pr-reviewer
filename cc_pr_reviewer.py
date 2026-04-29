@@ -43,8 +43,18 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import DataTable, Footer, Header, Label, OptionList, Static, TextArea
+from textual.widgets import (
+    DataTable,
+    Footer,
+    Header,
+    Label,
+    Link,
+    OptionList,
+    Static,
+    TextArea,
+)
 from textual.widgets._footer import FooterKey
+from textual.widgets._header import HeaderClock, HeaderClockSpace, HeaderIcon, HeaderTitle
 from textual.widgets.option_list import Option
 
 # --- Configuration ---------------------------------------------------------
@@ -133,6 +143,7 @@ EXTRA_PROMPT_BANNER_CAP = 200
 PACKAGE_NAME = "cc-pr-reviewer"
 PYPI_JSON_URL = f"https://pypi.org/pypi/{PACKAGE_NAME}/json"
 RELEASES_URL = "https://github.com/jasmedia/cc-pr-reviewer/releases"
+CHANGELOG_URL = "https://github.com/jasmedia/cc-pr-reviewer/blob/main/CHANGELOG.md"
 
 
 def _installed_version() -> str | None:
@@ -868,6 +879,45 @@ class PRDataTable(DataTable):
         self.app.action_review()  # type: ignore[attr-defined]
 
 
+class _HeaderLink(Link):
+    # Suppress Link's default `enter → Open link` footer entry; clicking still
+    # works, and we don't want it crowding the bindings row.
+    BINDINGS = [Binding("enter", "open_link", "Open link", show=False)]
+
+
+class HeaderWithChangelog(Header):
+    # `margin-right: 10` reserves the clock's column width — without it the
+    # link and the (also dock: right) clock pile on the same edge and overlap.
+    DEFAULT_CSS = """
+    HeaderWithChangelog #changelog-link {
+        dock: right;
+        width: auto;
+        padding: 0 1;
+        margin-right: 10;
+        content-align: center middle;
+        background: transparent;
+        text-style: none;
+        pointer: pointer;
+    }
+    HeaderWithChangelog #changelog-link:hover {
+        pointer: pointer;
+    }
+    HeaderWithChangelog #changelog-link:focus {
+        background: transparent;
+        text-style: bold;
+        pointer: pointer;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield HeaderIcon().data_bind(Header.icon)
+        yield HeaderTitle()
+        yield _HeaderLink("📝 Release Notes", url=CHANGELOG_URL, id="changelog-link")
+        yield (
+            HeaderClock().data_bind(Header.time_format) if self._show_clock else HeaderClockSpace()
+        )
+
+
 class PRReviewer(App):
     CSS = """
     Screen { background: $surface; }
@@ -978,7 +1028,7 @@ class PRReviewer(App):
         self.include_mine: bool = _get_setting(self.review_db, "include_mine", "0") == "1"
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
+        yield HeaderWithChangelog(show_clock=True)
         yield Static("", id="version-badge")
         yield PRDataTable(id="pr-table", cursor_type="row", zebra_stripes=True)
         yield Static("Loading…", id="status", markup=False)
