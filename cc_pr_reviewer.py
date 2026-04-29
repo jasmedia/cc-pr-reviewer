@@ -1010,6 +1010,7 @@ class PRReviewer(App):
         Binding("d", "show_diff", "View diff"),
         Binding("m", "toggle_mine", "Toggle my PRs"),
         Binding("f", "filter", "Filter by repo"),
+        Binding("g", "toggle_group", "Group by"),
         Binding("u", "upgrade", "Upgrade"),
         Binding("q", "quit", "Quit"),
     ]
@@ -1026,6 +1027,9 @@ class PRReviewer(App):
         stored_filter = _get_setting(self.review_db, "repo_filter", "")
         self.repo_filter: str | None = stored_filter or None
         self.include_mine: bool = _get_setting(self.review_db, "include_mine", "0") == "1"
+        stored_group = _get_setting(self.review_db, "group_by", "")
+        self.group_by: str = stored_group if stored_group in ("repo", "author") else ""
+        self._row_to_pr_idx: list[int | None] = []
 
     def compose(self) -> ComposeResult:
         yield HeaderWithChangelog(show_clock=True)
@@ -1068,6 +1072,7 @@ class PRReviewer(App):
         """
         self._set_footer_active("m", self.include_mine)
         self._set_footer_active("f", self.repo_filter is not None)
+        self._set_footer_active("g", bool(self.group_by))
 
     def _set_footer_active(self, key: str, active: bool, retries: int = 2) -> None:
         """Toggle the `-state-active` CSS class on the FooterKey for `key`.
@@ -1123,6 +1128,9 @@ class PRReviewer(App):
     def _filter_desc(self) -> str:
         return f" [repo={self.repo_filter}]" if self.repo_filter else ""
 
+    def _group_desc(self) -> str:
+        return f" [group={self.group_by}]" if self.group_by else ""
+
     def _populate(
         self,
         data: list[dict[str, Any]],
@@ -1160,14 +1168,18 @@ class PRReviewer(App):
         else:
             mode = " (mine: off)"
         filter_desc = self._filter_desc()
+        group_desc = self._group_desc()
         if not data:
             self._set_status(
-                f"No PRs awaiting your review 🎉{mode}{filter_desc}   "
-                "(f: filter, m: mine, r: refresh, u: upgrade, q: quit)",
+                f"No PRs awaiting your review 🎉{mode}{filter_desc}{group_desc}   "
+                "(f: filter, m: mine, g: group, r: refresh, u: upgrade, q: quit)",
                 error=bool(mine_error),
             )
             return
-        for i, pr in enumerate(data):
+
+        self._row_to_pr_idx = []
+
+        def _emit_pr_row(i: int, pr: dict[str, Any]) -> None:
             repo = pr["repository"]["nameWithOwner"]
             num = pr["number"]
             title = pr["title"]
@@ -1180,23 +1192,61 @@ class PRReviewer(App):
                 tags.append("MINE")
             if pr.get("isDraft"):
                 tags.append("DRAFT")
-            reviews = _review_cell(pr, self.review_state)
-            last_reviewed = _last_reviewed_cell(pr, self.review_state)
             table.add_row(
                 repo,
                 f"#{num}",
                 title,
                 author,
                 updated,
-                reviews,
-                last_reviewed,
+                _review_cell(pr, self.review_state),
+                _last_reviewed_cell(pr, self.review_state),
                 " ".join(tags),
                 key=str(i),
             )
+            self._row_to_pr_idx.append(i)
+
+        if not self.group_by:
+            for i, pr in enumerate(data):
+                _emit_pr_row(i, pr)
+        else:
+
+            def _key(pr: dict[str, Any]) -> str:
+                if self.group_by == "repo":
+                    return pr["repository"]["nameWithOwner"]
+                return (pr.get("author") or {}).get("login", "?")
+
+            buckets: dict[str, list[int]] = {}
+            for i, pr in enumerate(data):
+                buckets.setdefault(_key(pr), []).append(i)
+            for k in buckets:
+                buckets[k].sort(key=lambda i: data[i].get("updatedAt", ""), reverse=True)
+            # Sort groups by their most-recently-updated PR (desc) so active
+            # repos/authors float to the top — alphabetical buries hot groups.
+            group_order = sorted(
+                buckets.keys(),
+                key=lambda k: data[buckets[k][0]].get("updatedAt", ""),
+                reverse=True,
+            )
+            for gk in group_order:
+                idxs = buckets[gk]
+                table.add_row(
+                    f"[bold]▼ {gk}[/]  [dim]({len(idxs)})[/]",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    key=f"hdr:{gk}",
+                )
+                self._row_to_pr_idx.append(None)
+                for i in idxs:
+                    _emit_pr_row(i, data[i])
         self._set_status(
-            f"{len(data)} PR(s){mode}{filter_desc}   "
+            f"{len(data)} PR(s){mode}{filter_desc}{group_desc}   "
             "•  enter: review  •  d: diff  •  o: browser  •  f: filter  •  m: mine  "
-            "•  r: refresh  •  u: upgrade  •  q: quit",
+            "•  g: group  •  r: refresh  •  u: upgrade  •  q: quit",
             error=bool(mine_error),
         )
 
@@ -1204,7 +1254,13 @@ class PRReviewer(App):
         table = self.query_one("#pr-table", DataTable)
         if table.row_count == 0:
             return None
-        return self.prs[table.cursor_row]
+        row = table.cursor_row
+        if row is None or row >= len(self._row_to_pr_idx):
+            return None
+        idx = self._row_to_pr_idx[row]
+        if idx is None:
+            return None
+        return self.prs[idx]
 
     def action_open_web(self) -> None:
         pr = self._selected()
@@ -1276,6 +1332,17 @@ class PRReviewer(App):
         self._set_status(f"Refreshing… (mine {state})")
         self._refresh_footer_indicators()
         self._load_prs()
+
+    def action_toggle_group(self) -> None:
+        nxt = {"": "repo", "repo": "author", "author": ""}[self.group_by]
+        self.group_by = nxt
+        try:
+            _set_setting(self.review_db, "group_by", nxt)
+        except sqlite3.Error as e:
+            self.notify(f"Couldn't persist group toggle: {e}", severity="warning")
+        self.notify(f"Group: {nxt or 'off'}", timeout=3)
+        self._refresh_footer_indicators()
+        self._populate(self.prs)
 
     def action_filter(self) -> None:
         def _apply(result: FilterChoice | None) -> None:
