@@ -1398,7 +1398,7 @@ class PRReviewer(App):
 
     def action_upgrade(self) -> None:
         if self.update_check_state == "pending":
-            self.notify("Checking for updates…", timeout=3)
+            self.notify("Checking for updates…", title="Upgrade", timeout=3)
             return
         if self.update_check_state == "current":
             self.notify(
