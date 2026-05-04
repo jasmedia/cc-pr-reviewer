@@ -159,6 +159,12 @@ _GROUP_CYCLE: dict[GroupBy, GroupBy] = {"": "repo", "repo": "author", "author": 
 SortBy = Literal["", "updated"]
 _SORT_CYCLE: dict[SortBy, SortBy] = {"": "updated", "updated": ""}
 
+# PyPI update-check lifecycle. "unavailable" is for source/editable installs
+# where `_installed_version()` returns None and there's nothing to compare;
+# the worker doesn't run and `action_upgrade` shows a tailored message rather
+# than a misleading "check failed" error.
+UpdateCheckState = Literal["pending", "current", "available", "failed", "unavailable"]
+
 
 def _installed_version() -> str | None:
     try:
@@ -947,9 +953,19 @@ class _HeaderLink(Link):
 
 
 class HeaderWithChangelog(Header):
-    # `margin-right: 10` reserves the clock's column width — without it the
-    # link and the (also dock: right) clock pile on the same edge and overlap.
+    # `margin-right` on each non-rightmost docked widget reserves space for
+    # the widgets to its right (the clock and, for the version label, also
+    # the changelog link). Without it the dock:right widgets pile up and
+    # overlap.
     DEFAULT_CSS = """
+    HeaderWithChangelog #header-version {
+        dock: right;
+        width: auto;
+        padding: 0 1;
+        margin-right: 28;
+        content-align: center middle;
+        color: $text-muted;
+    }
     HeaderWithChangelog #changelog-link {
         dock: right;
         width: auto;
@@ -973,6 +989,13 @@ class HeaderWithChangelog(Header):
     def compose(self) -> ComposeResult:
         yield HeaderIcon().data_bind(Header.icon)
         yield HeaderTitle()
+        # Pull from the App so the header tracks the same value the lifecycle
+        # state machine sees, and wrap in Text() since Static parses Rich
+        # markup by default — a PEP 440 local segment like "1.0+local[x]"
+        # would otherwise raise MarkupError and kill header mount.
+        version = self.app.installed_version  # type: ignore[attr-defined]
+        if version:
+            yield Static(Text(f"v{version}"), id="header-version")
         yield _HeaderLink("📝 Release Notes", url=CHANGELOG_URL, id="changelog-link")
         yield (
             HeaderClock().data_bind(Header.time_format) if self._show_clock else HeaderClockSpace()
@@ -1083,7 +1106,14 @@ class PRReviewer(App):
         # Immutable: rebound wholesale, never mutated in place (writers must
         # swap a fresh tuple to stay safe across the FilterScreen worker).
         self.repo_cache: tuple[str, ...] = ()
+        self.installed_version: str | None = _installed_version()
         self.latest_version: str | None = None
+        # Update-check lifecycle: "pending" until the PyPI fetch returns,
+        # then one of "current" / "available" / "failed" / "unavailable".
+        # Drives both the badge (only shown for "available") and
+        # `action_upgrade`'s status message (which needs to tell the user
+        # *why* there's nothing to do).
+        self.update_check_state: UpdateCheckState = "pending"
         self.review_db: sqlite3.Connection = _open_review_db()
         self.review_state: dict[str, dict[str, Any]] = _load_review_state(self.review_db)
         stored_filter = _get_setting(self.review_db, "repo_filter", "")
@@ -1129,7 +1159,12 @@ class PRReviewer(App):
         )
         self._refresh_footer_indicators()
         self.action_refresh()
-        self._check_for_update()
+        if self.installed_version is None:
+            # Source/editable install: nothing to compare against on PyPI, so
+            # skip the worker and surface a tailored message via `u`.
+            self.update_check_state = "unavailable"
+        else:
+            self._check_for_update()
 
     def _refresh_footer_indicators(self) -> None:
         """Re-apply the `-state-active` class on every state-bearing key.
@@ -1378,14 +1413,40 @@ class PRReviewer(App):
             webbrowser.open(pr["url"])
 
     def action_upgrade(self) -> None:
-        if self.latest_version is None:
-            self._set_status("No update available (or check is still in progress).")
+        if self.update_check_state == "pending":
+            self.notify("Checking for updates…", title="Upgrade", timeout=3)
             return
+        if self.update_check_state == "current":
+            self.notify(
+                f"Already up to date (v{self.installed_version}).",
+                title="Upgrade",
+                timeout=4,
+            )
+            return
+        if self.update_check_state == "unavailable":
+            self.notify(
+                "Running from source — no upgrade available. "
+                f"Install via `uv tool install {PACKAGE_NAME}` to enable upgrades.",
+                title="Upgrade",
+                timeout=5,
+            )
+            return
+        if self.update_check_state == "failed":
+            self.notify(
+                f"Update check failed — see {RELEASES_URL}",
+                title="Upgrade",
+                severity="error",
+                timeout=5,
+            )
+            return
+        assert self.latest_version is not None  # narrowed by "available" branch
         if shutil.which("uv") is None:
-            self._set_status(
+            self.notify(
                 f"`uv` not on PATH — install uv (https://docs.astral.sh/uv/) "
                 f"then run: uv tool upgrade {PACKAGE_NAME}",
-                error=True,
+                title="Upgrade",
+                severity="error",
+                timeout=6,
             )
             return
         cmd = ["uv", "tool", "upgrade", PACKAGE_NAME]
@@ -1689,18 +1750,30 @@ class PRReviewer(App):
 
     @work(thread=True, exclusive=True)
     def _check_for_update(self) -> None:
-        current = _installed_version()
-        if current is None:
-            return
+        # Caller (`on_mount`) only reaches here when installed_version is set;
+        # source installs short-circuit to "unavailable" without enqueueing.
+        current = self.installed_version
+        assert current is not None
         latest = _fetch_latest_version()
-        if latest and _is_newer(latest, current):
-            self.call_from_thread(self._show_update_badge, latest)
+        if latest is None:
+            self.call_from_thread(self._set_update_check_result, "failed", None)
+            return
+        state: UpdateCheckState = "available" if _is_newer(latest, current) else "current"
+        self.call_from_thread(self._set_update_check_result, state, latest)
 
-    def _show_update_badge(self, latest: str) -> None:
+    def _set_update_check_result(self, state: UpdateCheckState, latest: str | None) -> None:
+        # Guard against the worker firing after teardown: query_one would
+        # raise NoMatches and surface in Textual's error log otherwise.
+        if not self.is_mounted:
+            return
+        self.update_check_state = state
         self.latest_version = latest
-        w = self.query_one("#version-badge", Static)
-        w.update(f" ▲ v{latest} available — uv tool upgrade {PACKAGE_NAME} (press u) ")
-        w.add_class("-visible")
+        if state == "available" and latest is not None:
+            w = self.query_one("#version-badge", Static)
+            # Wrap dynamic parts in Text() — `latest` comes from external
+            # PyPI JSON and shouldn't be trusted to be Rich-markup-safe.
+            w.update(Text(f" ▲ v{latest} available — uv tool upgrade {PACKAGE_NAME} (press u) "))
+            w.add_class("-visible")
 
 
 # --- Entry point -----------------------------------------------------------
