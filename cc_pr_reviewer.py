@@ -118,23 +118,37 @@ POST_INLINE_REREVIEW_APPROVE_SUFFIX = (
 )
 
 # Appended after POST_INLINE_REREVIEW_APPROVE_SUFFIX (so it inherits the same
-# gate: rereview AND not self-authored). When we auto-approve, our own prior
-# review threads on GitHub are still open — leaving them that way next to an
-# APPROVE looks contradictory. This tells Claude to resolve the threads it
-# considers addressed before submitting the APPROVE. Scoped deliberately to
-# threads whose latest comment author is the current `gh` user; we don't
-# presume to close out other reviewers' threads.
+# gate: rereview AND the PR is NOT authored by the `gh` user). When we
+# auto-approve, our own prior review threads on GitHub are still open —
+# leaving them that way next to an APPROVE looks contradictory. This tells
+# Claude to resolve the threads it considers addressed before submitting the
+# APPROVE. Scoped to threads the `gh` user originally opened (first/root
+# comment author == `gh` user); a "latest comment author" check would skip
+# the common case where the PR author replied "fixed" or pushed a fix
+# without replying. The fetched existing-comments list is capped/filtered
+# (so not authoritative), so the prompt directs Claude to query
+# `pullRequestReviewThreads` as the source of truth.
 POST_INLINE_REREVIEW_RESOLVE_SUFFIX = (
     " If you do submit that APPROVE, first resolve any of your own "
     "previously-posted review threads that the current PR code has addressed. "
-    "Identify candidates from the existing-comments list above — entries whose "
-    "author matches the current `gh` user (confirm the login via "
-    "`gh api user --jq .login`). For each one you judge addressed, look up "
-    "the thread node ID via the GraphQL `pullRequestReviewThreads` field on "
-    "the pull request, then call the `resolveReviewThread` mutation via "
-    "`gh api graphql`. Only resolve threads whose latest comment author "
-    "matches the current `gh` user; leave other reviewers' threads untouched. "
-    "Submit the APPROVE only after the resolutions land."
+    "Get the current `gh` user via `gh api user --jq .login`; if that fails "
+    "or returns empty, skip the resolve step entirely (note it in your final "
+    "summary) and proceed to submit the APPROVE — do not guess the login. "
+    "Otherwise, fetch the authoritative thread list via `gh api graphql` "
+    "using the `pullRequestReviewThreads` field on the pull request, "
+    "requesting `id`, `isResolved`, and the first comment's author login. "
+    "In-scope threads are those whose first (root) comment author matches "
+    "the current `gh` user and that are not already resolved; skip every "
+    "other thread (don't touch other reviewers' threads). For each in-scope "
+    "thread you judge addressed by the current code, call the "
+    "`resolveReviewThread` mutation via `gh api graphql`. If a mutation "
+    "fails, record the failure and continue with the remaining candidates — "
+    "do not stall the APPROVE on a single mutation error. Zero resolutions "
+    "is a valid outcome; the gate is finishing the candidate walk, not "
+    "landing any specific number of resolutions. In your final terminal "
+    "summary, list the threads you resolved, the ones you judged "
+    "not-yet-addressed (one-line reason), and any that failed to resolve "
+    "(with the GraphQL error)."
 )
 
 # Appended to POST_INLINE_PROMPT when the existing-comments fetch failed. The
