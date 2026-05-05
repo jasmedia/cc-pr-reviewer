@@ -546,9 +546,22 @@ def build_review_prompt(
     """Assemble the user message for `claude`. Pure — no I/O.
 
     Isolated from `_launch_claude` so the conditional `POST_INLINE_*`
-    suffix layering (5 suffixes, 3 binary gates) is unit-testable in
-    isolation; the matrix is the most regression-prone part of the file.
+    suffix matrix (locked by `tests/test_cc_pr_reviewer.py`) is
+    unit-testable in isolation; that matrix is the most regression-prone
+    part of the file.
+
+    Contract: `fetch_existing_review_comments` guarantees that
+    `fetch_ok=False` always returns `existing=[]`. Passing a non-empty
+    `existing` with `fetch_ok=False` is a contradictory state — caught
+    here at the API seam because, post-extraction, the two flags are
+    independent kwargs and the contradiction is easy to construct
+    accidentally (e.g. from a test stub).
     """
+    if not fetch_ok and existing:
+        raise AssertionError(
+            "build_review_prompt: fetch_ok=False with non-empty existing is contradictory"
+        )
+
     existing_block, shown = format_existing_comments(existing)
 
     # Compute against the raw `existing` list, not against `existing_block` —
@@ -565,8 +578,14 @@ def build_review_prompt(
     rereview_can_approve = rereview and author_login != my_login
 
     sections = [REVIEW_PROMPT]
-    if extra_prompt:
-        sections.append(f"Additional instructions from reviewer:\n{extra_prompt}")
+    # Strip defensively — the current ConfirmResult dataclass already strips,
+    # but `build_review_prompt` is now an API boundary and a future caller
+    # (or test) passing whitespace-only `extra_prompt` would otherwise render
+    # an empty "Additional instructions from reviewer:" header followed by
+    # nothing.
+    stripped_extra = extra_prompt.strip()
+    if stripped_extra:
+        sections.append(f"Additional instructions from reviewer:\n{stripped_extra}")
     if existing_block:
         sections.append(existing_block)
     if post_inline:
@@ -1772,12 +1791,19 @@ class PRReviewer(App):
             print("Fetching existing review comments…")
             existing, fetch_ok = fetch_existing_review_comments(repo_full, number)
 
+            # Capture once so the banner can disambiguate a structural
+            # `rereview=False` (no prior comment from us) from a missing-data
+            # `rereview=False` (login lookup failed, bar-raise silently dropped).
+            # Without this seam the user can't tell the two apart, and the
+            # `_current_gh_login` warning may have scrolled past during clone
+            # or checkout output.
+            my_login = _current_gh_login()
             built = build_review_prompt(
                 post_inline=post_inline,
                 extra_prompt=extra_prompt,
                 existing=existing,
                 fetch_ok=fetch_ok,
-                my_login=_current_gh_login(),
+                my_login=my_login,
                 author_login=(pr.get("author") or {}).get("login"),
             )
 
@@ -1793,6 +1819,8 @@ class PRReviewer(App):
             post_inline_desc = "on" if post_inline else "off"
             if post_inline and built.rereview:
                 post_inline_desc += ", rereview"
+            elif post_inline and my_login is None:
+                post_inline_desc += ", rereview-detection-unavailable"
             parts = [f"post-inline: {post_inline_desc}", existing_desc]
             if extra_prompt:
                 # `!r` keeps newlines/control chars visible so a misclick paste

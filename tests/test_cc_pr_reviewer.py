@@ -1,12 +1,14 @@
 """Tests for the pure helpers in cc_pr_reviewer.
 
 Scope is deliberately narrow: only the I/O-free functions that gate
-launch behavior. The TUI, subprocess flow, and gh-CLI shellouts are not
-covered (they need integration testing, not unit tests).
+launch behavior. The TUI, subprocess flow, and gh-CLI shellouts are
+intentionally out of scope here; they're better covered by integration
+tests.
 """
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from cc_pr_reviewer import (
@@ -18,6 +20,7 @@ from cc_pr_reviewer import (
     POST_INLINE_REREVIEW_APPROVE_SUFFIX,
     POST_INLINE_REREVIEW_RESOLVE_SUFFIX,
     POST_INLINE_REREVIEW_SUFFIX,
+    PROMPT_SECTION_SEP,
     REVIEW_PROMPT,
     _is_newer,
     _parse_semver,
@@ -103,6 +106,24 @@ def test_third_party_comments_trigger_dedup_but_not_rereview() -> None:
     assert not built.rereview
 
 
+def test_existing_block_appears_on_plain_review() -> None:
+    """Reviewer-context block is rendered even with post_inline=False.
+    Existing inline comments are prior context, not a posting instruction
+    — a future refactor that nests the existing-comments append under
+    `if post_inline:` would silently drop that context on local-only
+    reviews."""
+    built = build_review_prompt(
+        post_inline=False,
+        extra_prompt="",
+        existing=[_comment("charlie")],
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+    )
+    assert "Existing review comments" in built.text
+    assert POST_INLINE_PROMPT not in built.text
+
+
 def test_my_comment_on_others_pr_triggers_full_rereview_chain() -> None:
     """The full APPROVE+RESOLVE chain only fires when the gh user is NOT
     the PR author (GitHub 422 gate)."""
@@ -118,6 +139,36 @@ def test_my_comment_on_others_pr_triggers_full_rereview_chain() -> None:
     assert POST_INLINE_REREVIEW_SUFFIX in built.text
     assert POST_INLINE_REREVIEW_APPROVE_SUFFIX in built.text
     assert POST_INLINE_REREVIEW_RESOLVE_SUFFIX in built.text
+
+
+def test_full_chain_assembles_in_canonical_order() -> None:
+    """Lock the canonical assembly for a representative non-trivial
+    composition. The other tests use `in`/`not in` against `built.text`
+    and would let through regressions that swap `PROMPT_SECTION_SEP`
+    for `\\n`, duplicate a section, or reorder sections — exactly the
+    kind of bug suffix-matrix changes are most likely to introduce."""
+    existing = [_comment("alice")]
+    built = build_review_prompt(
+        post_inline=True,
+        extra_prompt="x",
+        existing=existing,
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+    )
+    expected = PROMPT_SECTION_SEP.join(
+        [
+            REVIEW_PROMPT,
+            "Additional instructions from reviewer:\nx",
+            format_existing_comments(existing)[0],
+            POST_INLINE_PROMPT
+            + POST_INLINE_DEDUP_SUFFIX
+            + POST_INLINE_REREVIEW_SUFFIX
+            + POST_INLINE_REREVIEW_APPROVE_SUFFIX
+            + POST_INLINE_REREVIEW_RESOLVE_SUFFIX,
+        ]
+    )
+    assert built.text == expected
 
 
 def test_my_comment_on_my_own_pr_raises_bar_but_skips_approve() -> None:
@@ -172,7 +223,9 @@ def test_rereview_uses_raw_list_not_formatted_block() -> None:
 
 def test_my_login_none_never_triggers_rereview() -> None:
     """When `gh api user --jq .login` fails we get my_login=None — no
-    way to know it's a re-review, so the gate must short-circuit."""
+    way to know it's a re-review, so the gate must short-circuit. The
+    paired APPROVE/RESOLVE asserts catch a bug that decoupled them from
+    the REREVIEW gate (e.g. nesting them under a different condition)."""
     built = build_review_prompt(
         post_inline=True,
         extra_prompt="",
@@ -183,6 +236,8 @@ def test_my_login_none_never_triggers_rereview() -> None:
     )
     assert not built.rereview
     assert POST_INLINE_REREVIEW_SUFFIX not in built.text
+    assert POST_INLINE_REREVIEW_APPROVE_SUFFIX not in built.text
+    assert POST_INLINE_REREVIEW_RESOLVE_SUFFIX not in built.text
 
 
 # --- _parse_semver / _is_newer ---------------------------------------------
@@ -282,26 +337,36 @@ def test_format_existing_comments_marks_outdated_when_line_is_null() -> None:
 
 
 def test_format_existing_comments_truncates_long_body() -> None:
-    """Bodies longer than EXISTING_COMMENT_BODY_CAP get sliced and
-    '…'-suffixed; the cap keeps the prompt size bounded on PRs with
-    novella-length nits."""
+    """Bodies longer than EXISTING_COMMENT_BODY_CAP are sliced to
+    `body[:CAP-1] + "…"`, so the rendered body is exactly CAP chars and
+    ends with the marker. Asserting both protects against off-by-one
+    regressions (dropping the `-1`, doubling the `…`, or accidentally
+    truncating to CAP chars without the marker)."""
     long_body = "x" * (EXISTING_COMMENT_BODY_CAP * 3)
     block, _ = format_existing_comments([_comment("alice", body=long_body)])
-    assert "…" in block
-    # The cap is total chars; we can't assert exact length without re-
-    # implementing the function, but we can assert we didn't pass it
-    # through verbatim.
-    assert long_body not in block
+    # The rendered line is `- @user on path:N — "<body>"`; pull the body
+    # back out from between the surrounding quotes.
+    m = re.search(r'"(.*)"', block)
+    assert m is not None
+    rendered_body = m.group(1)
+    assert len(rendered_body) == EXISTING_COMMENT_BODY_CAP
+    assert rendered_body.endswith("…")
 
 
 def test_format_existing_comments_caps_list_at_recent_n() -> None:
     """Past EXISTING_COMMENT_LIST_CAP only the most-recent entries are
     kept, and a count footer is appended."""
-    # Build enough entries to overflow the cap. created_at sort is
-    # descending, so larger dates win.
+    # Distribute timestamps across hours/minutes within a single valid
+    # day so every `created_at` is parseable ISO 8601 regardless of how
+    # the cap might grow in the future. Lexicographic sort still
+    # descends correctly because all components are zero-padded.
     overflow = EXISTING_COMMENT_LIST_CAP + 5
     comments = [
-        _comment("alice", created_at=f"2025-01-{i + 1:02d}T00:00:00Z", body=f"c{i}")
+        _comment(
+            "alice",
+            created_at=f"2025-01-01T{i // 60:02d}:{i % 60:02d}:00Z",
+            body=f"c{i}",
+        )
         for i in range(overflow)
     ]
     block, shown = format_existing_comments(comments)
