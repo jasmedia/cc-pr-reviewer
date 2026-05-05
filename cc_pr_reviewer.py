@@ -524,6 +524,91 @@ def format_existing_comments(comments: list[dict[str, Any]]) -> tuple[str, int]:
     return "\n".join(lines), len(shown)
 
 
+@dataclass(frozen=True)
+class BuiltPrompt:
+    """Result of `build_review_prompt` — prompt text plus banner metadata."""
+
+    text: str
+    rereview: bool
+    existing_shown: int
+    existing_total: int
+
+
+def build_review_prompt(
+    *,
+    post_inline: bool,
+    extra_prompt: str,
+    existing: list[dict[str, Any]],
+    fetch_ok: bool,
+    my_login: str | None,
+    author_login: str | None,
+) -> BuiltPrompt:
+    """Assemble the user message for `claude`. Pure — no I/O.
+
+    Isolated from `_launch_claude` so the conditional `POST_INLINE_*`
+    suffix matrix (locked by `tests/test_cc_pr_reviewer.py`) is
+    unit-testable in isolation; that matrix is the most regression-prone
+    part of the file.
+
+    Contract: `fetch_existing_review_comments` guarantees that
+    `fetch_ok=False` always returns `existing=[]`. Passing a non-empty
+    `existing` with `fetch_ok=False` is a contradictory state — caught
+    here at the API seam because, post-extraction, the two flags are
+    independent kwargs and the contradiction is easy to construct
+    accidentally (e.g. from a test stub).
+    """
+    if not fetch_ok and existing:
+        raise AssertionError(
+            "build_review_prompt: fetch_ok=False with non-empty existing is contradictory"
+        )
+
+    existing_block, shown = format_existing_comments(existing)
+
+    # Compute against the raw `existing` list, not against `existing_block` —
+    # `format_existing_comments` filters out entries missing path/created_at/
+    # body, and we still want to raise the bar if the only surviving evidence
+    # is in the unfiltered list.
+    rereview = bool(my_login) and any(
+        (c.get("user") or {}).get("login") == my_login for c in existing
+    )
+    # GitHub returns 422 ("Can not approve your own pull request") on
+    # `event: APPROVE` for the author, so the auto-approve clause is gated
+    # separately on authorship — we still raise the bar on self re-reviews
+    # but drop the auto-approve instruction.
+    rereview_can_approve = rereview and author_login != my_login
+
+    sections = [REVIEW_PROMPT]
+    # Strip defensively — the current ConfirmResult dataclass already strips,
+    # but `build_review_prompt` is now an API boundary and a future caller
+    # (or test) passing whitespace-only `extra_prompt` would otherwise render
+    # an empty "Additional instructions from reviewer:" header followed by
+    # nothing.
+    stripped_extra = extra_prompt.strip()
+    if stripped_extra:
+        sections.append(f"Additional instructions from reviewer:\n{stripped_extra}")
+    if existing_block:
+        sections.append(existing_block)
+    if post_inline:
+        post = POST_INLINE_PROMPT
+        if existing_block:
+            post += POST_INLINE_DEDUP_SUFFIX
+        elif not fetch_ok:
+            post += POST_INLINE_FETCH_FAILED_SUFFIX
+        if rereview:
+            post += POST_INLINE_REREVIEW_SUFFIX
+            if rereview_can_approve:
+                post += POST_INLINE_REREVIEW_APPROVE_SUFFIX
+                post += POST_INLINE_REREVIEW_RESOLVE_SUFFIX
+        sections.append(post)
+
+    return BuiltPrompt(
+        text=PROMPT_SECTION_SEP.join(sections),
+        rereview=rereview,
+        existing_shown=shown,
+        existing_total=len(existing),
+    )
+
+
 def humanise(iso: str) -> str:
     """'2025-04-18T10:30:00Z' -> '3h'."""
     if not iso:
@@ -1705,51 +1790,37 @@ class PRReviewer(App):
 
             print("Fetching existing review comments…")
             existing, fetch_ok = fetch_existing_review_comments(repo_full, number)
-            existing_block, shown = format_existing_comments(existing)
 
-            # Compute rereview against the raw `existing` list, not against
-            # `existing_block` — `format_existing_comments` filters out entries
-            # missing path/created_at/body, and we still want to raise the bar
-            # if the only surviving evidence is in the unfiltered list.
-            #
-            # The APPROVE clause is gated separately on authorship: GitHub
-            # rejects self-approval with 422, so we still raise the bar on
-            # self re-reviews but drop the auto-approve instruction.
+            # Capture once so the banner can disambiguate a structural
+            # `rereview=False` (no prior comment from us) from a missing-data
+            # `rereview=False` (login lookup failed, bar-raise silently dropped).
+            # Without this seam the user can't tell the two apart, and the
+            # `_current_gh_login` warning may have scrolled past during clone
+            # or checkout output.
             my_login = _current_gh_login()
-            author_login = (pr.get("author") or {}).get("login")
-            rereview = bool(my_login) and any(
-                (c.get("user") or {}).get("login") == my_login for c in existing
+            built = build_review_prompt(
+                post_inline=post_inline,
+                extra_prompt=extra_prompt,
+                existing=existing,
+                fetch_ok=fetch_ok,
+                my_login=my_login,
+                author_login=(pr.get("author") or {}).get("login"),
             )
-            rereview_can_approve = rereview and author_login != my_login
-
-            sections = [REVIEW_PROMPT]
-            if extra_prompt:
-                sections.append(f"Additional instructions from reviewer:\n{extra_prompt}")
-            if existing_block:
-                sections.append(existing_block)
-            if post_inline:
-                post = POST_INLINE_PROMPT
-                if existing_block:
-                    post += POST_INLINE_DEDUP_SUFFIX
-                elif not fetch_ok:
-                    post += POST_INLINE_FETCH_FAILED_SUFFIX
-                if rereview:
-                    post += POST_INLINE_REREVIEW_SUFFIX
-                    if rereview_can_approve:
-                        post += POST_INLINE_REREVIEW_APPROVE_SUFFIX
-                        post += POST_INLINE_REREVIEW_RESOLVE_SUFFIX
-                sections.append(post)
-            prompt = PROMPT_SECTION_SEP.join(sections)
 
             if not fetch_ok:
                 existing_desc = "existing comments: fetch failed"
             else:
-                existing_desc = f"existing comments: {shown} in prompt of {len(existing)} fetched"
+                existing_desc = (
+                    f"existing comments: {built.existing_shown} in prompt of "
+                    f"{built.existing_total} fetched"
+                )
 
-            cmd = ["claude", "--permission-mode", "acceptEdits", prompt]
+            cmd = ["claude", "--permission-mode", "acceptEdits", built.text]
             post_inline_desc = "on" if post_inline else "off"
-            if post_inline and rereview:
+            if post_inline and built.rereview:
                 post_inline_desc += ", rereview"
+            elif post_inline and my_login is None:
+                post_inline_desc += ", rereview-detection-unavailable"
             parts = [f"post-inline: {post_inline_desc}", existing_desc]
             if extra_prompt:
                 # `!r` keeps newlines/control chars visible so a misclick paste
