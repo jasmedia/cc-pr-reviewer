@@ -4,6 +4,53 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] — 2026-05-05
+
+### Added
+- **Auto-resolve own addressed threads before APPROVE.** When the
+  post-inline rereview path auto-submits an APPROVE on someone else's
+  PR (only NIT-level findings remain), the prompt now instructs Claude
+  to first resolve our own previously-posted review threads via the
+  GraphQL `resolveReviewThread` mutation, so the approval doesn't
+  visually contradict still-open threads. Scope is deliberately narrow:
+  only threads whose root comment author is the current `gh` user, and
+  only the ones the current PR code has actually addressed.
+
+### Fixed
+- Hardened the GraphQL plumbing the auto-resolve suffix drives:
+  `pullRequestReviewThreads` is paginated with `first: 100` plus
+  `pageInfo` (the default page would silently drop threads on
+  long-lived PRs); query failures fall through to "skip resolve, note
+  in summary, still APPROVE" rather than abort/retry or fall back to
+  the inline existing-comments list; `resolveReviewThread` mutations
+  count as success only when the response has no top-level `errors`
+  AND `thread.isResolved == true`; an audit-trail summary
+  (resolved / judged-not-addressed / failed) is required so partial
+  failures aren't silent.
+
+## [0.9.0] — 2026-05-04
+
+### Added
+- **Header version label**: the installed version is now shown on the
+  right side of the TUI header, next to the Release Notes link and
+  clock.
+- **Toast feedback for the upgrade key**: pressing `u` now surfaces
+  "Checking…", "Already up to date (vX.Y.Z).", or an error pointing at
+  the releases URL — matching the toast pattern used by `g`/`s` —
+  instead of conflating those states under "No update available (or
+  check is still in progress)."
+
+### Fixed
+- Source installs (running from a checkout) get a dedicated
+  "unavailable" state, so pressing `u` no longer shows a misleading
+  "check failed" toast; the PyPI worker is also skipped on mount in
+  that case.
+- Header version label and update-available badge are wrapped in
+  `Text(...)` so a PEP 440 local segment or untrusted PyPI version
+  string can't break Rich markup parsing during compose/render.
+- A late PyPI worker callback firing after teardown can no longer raise
+  `NoMatches` on `#version-badge`.
+
 ## [0.8.0] — 2026-04-29
 
 ### Added
@@ -202,6 +249,8 @@ Initial release.
 - Prereq checks for `gh`, `claude`, `git`, and the **PR Review Toolkit**
   Claude Code plugin.
 
+[0.10.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.10.0
+[0.9.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.9.0
 [0.8.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.8.0
 [0.7.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.7.0
 [0.6.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.6.0
