@@ -117,6 +117,26 @@ POST_INLINE_REREVIEW_APPROVE_SUFFIX = (
     "and omit the `comments` array) instead of `event: COMMENT`."
 )
 
+# Appended after POST_INLINE_REREVIEW_APPROVE_SUFFIX (so it inherits the same
+# gate: rereview AND not self-authored). When we auto-approve, our own prior
+# review threads on GitHub are still open — leaving them that way next to an
+# APPROVE looks contradictory. This tells Claude to resolve the threads it
+# considers addressed before submitting the APPROVE. Scoped deliberately to
+# threads whose latest comment author is the current `gh` user; we don't
+# presume to close out other reviewers' threads.
+POST_INLINE_REREVIEW_RESOLVE_SUFFIX = (
+    " If you do submit that APPROVE, first resolve any of your own "
+    "previously-posted review threads that the current PR code has addressed. "
+    "Identify candidates from the existing-comments list above — entries whose "
+    "author matches the current `gh` user (confirm the login via "
+    "`gh api user --jq .login`). For each one you judge addressed, look up "
+    "the thread node ID via the GraphQL `pullRequestReviewThreads` field on "
+    "the pull request, then call the `resolveReviewThread` mutation via "
+    "`gh api graphql`. Only resolve threads whose latest comment author "
+    "matches the current `gh` user; leave other reviewers' threads untouched. "
+    "Submit the APPROVE only after the resolutions land."
+)
+
 # Appended to POST_INLINE_PROMPT when the existing-comments fetch failed. The
 # alternative (empty `existing_block`) is indistinguishable from a PR that
 # genuinely has no prior comments, so without this hint Claude would happily
@@ -1693,6 +1713,7 @@ class PRReviewer(App):
                     post += POST_INLINE_REREVIEW_SUFFIX
                     if rereview_can_approve:
                         post += POST_INLINE_REREVIEW_APPROVE_SUFFIX
+                        post += POST_INLINE_REREVIEW_RESOLVE_SUFFIX
                 sections.append(post)
             prompt = PROMPT_SECTION_SEP.join(sections)
 
