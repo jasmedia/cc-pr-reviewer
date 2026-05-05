@@ -134,7 +134,10 @@ inside a Claude session.
 If the modal's **post-inline** checkbox (`p`) is on, the prompt is
 extended to ask Claude to publish each finding as an inline review
 comment via a single `POST /repos/{owner}/{repo}/pulls/{n}/reviews` call
-through `gh api`, so they land grouped under one review.
+through `gh api`, so they land grouped under one review. On a re-review
+of someone else's PR where only NIT-level findings remain, Claude is
+also asked to resolve any of its own previously-posted threads that the
+new code has addressed before submitting the APPROVE.
 
 When you `/exit` Claude, press Enter and the TUI returns.
 

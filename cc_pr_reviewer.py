@@ -117,6 +117,50 @@ POST_INLINE_REREVIEW_APPROVE_SUFFIX = (
     "and omit the `comments` array) instead of `event: COMMENT`."
 )
 
+# Appended after POST_INLINE_REREVIEW_APPROVE_SUFFIX (so it inherits the same
+# gate: rereview AND the PR is NOT authored by the `gh` user). When we
+# auto-approve, our own prior review threads on GitHub are still open —
+# leaving them that way next to an APPROVE looks contradictory. This tells
+# Claude to resolve the threads it considers addressed before submitting the
+# APPROVE. Scoped to threads the `gh` user originally opened (first/root
+# comment author == `gh` user); a "latest comment author" check would skip
+# the common case where the PR author replied "fixed" or pushed a fix
+# without replying. The fetched existing-comments list is capped/filtered
+# (so not authoritative), so the prompt directs Claude to query
+# `pullRequestReviewThreads` as the source of truth.
+POST_INLINE_REREVIEW_RESOLVE_SUFFIX = (
+    " If you do submit that APPROVE, first resolve any of your own "
+    "previously-posted review threads that the current PR code has addressed. "
+    "Get the current `gh` user via `gh api user --jq .login`; if that fails "
+    "or returns empty, skip the resolve step entirely (note it in your final "
+    "summary) and proceed to submit the APPROVE — do not guess the login. "
+    "Otherwise, fetch the authoritative thread list via `gh api graphql` "
+    "using `pullRequestReviewThreads(first: 100)` on the pull request, "
+    "selecting `id`, `isResolved`, the first comment's author login, and "
+    "`pageInfo { hasNextPage endCursor }`; page through with "
+    "`after: <endCursor>` until `hasNextPage` is false. If the query or any "
+    "subsequent page errors out (top-level `errors`, non-zero exit, or no "
+    "`nodes`), skip the resolve step entirely (note the failure in your "
+    "final summary) and proceed to submit the APPROVE — do not fall back "
+    "to the inline existing-comments list, which is capped/filtered and "
+    "lacks `id`/`isResolved`. In-scope threads are those whose first (root) "
+    "comment author matches the current `gh` user and that are not already "
+    "resolved; skip every other thread (don't touch other reviewers' "
+    "threads). For each in-scope thread you judge addressed by the current "
+    "code, call the `resolveReviewThread` mutation via `gh api graphql`, "
+    "selecting `thread { isResolved }` in the response. Treat the mutation "
+    "as successful only if the response has no top-level `errors` field "
+    "AND `data.resolveReviewThread.thread.isResolved == true`; anything "
+    "else (HTTP-200 with `errors`, `isResolved` still false, network blip) "
+    "is a failure — record the GraphQL error verbatim and continue with "
+    "the remaining candidates. Do not stall the APPROVE on a single "
+    "mutation error. Zero resolutions is a valid outcome; the gate is "
+    "finishing the candidate walk, not landing any specific number of "
+    "resolutions. In your final terminal summary, list the threads you "
+    "resolved, the ones you judged not-yet-addressed (one-line reason), "
+    "and any that failed to resolve (with the GraphQL error)."
+)
+
 # Appended to POST_INLINE_PROMPT when the existing-comments fetch failed. The
 # alternative (empty `existing_block`) is indistinguishable from a PR that
 # genuinely has no prior comments, so without this hint Claude would happily
@@ -1693,6 +1737,7 @@ class PRReviewer(App):
                     post += POST_INLINE_REREVIEW_SUFFIX
                     if rereview_can_approve:
                         post += POST_INLINE_REREVIEW_APPROVE_SUFFIX
+                        post += POST_INLINE_REREVIEW_RESOLVE_SUFFIX
                 sections.append(post)
             prompt = PROMPT_SECTION_SEP.join(sections)
 
