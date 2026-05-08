@@ -656,7 +656,15 @@ def _open_review_db() -> sqlite3.Connection:
     # `suppress(OperationalError)` so a read-only mount surfaces as
     # degraded behaviour rather than a startup crash; the `CREATE TABLE`s
     # below stay load-bearing.
-    conn = sqlite3.connect(REVIEW_DB_PATH, timeout=5.0)
+    # `check_same_thread=False` lets the periodic `_poll_in_progress`
+    # worker (`@work(thread=True)`) read from this connection without
+    # tripping Python's per-connection thread guard. Safe here because
+    # WAL + `busy_timeout` serialise writers at the SQLite layer, and
+    # Python's sqlite3 module already takes a per-connection mutex
+    # around each `execute`/`commit` call. We never hold an open
+    # transaction across thread boundaries — every helper here issues
+    # its own commit.
+    conn = sqlite3.connect(REVIEW_DB_PATH, timeout=5.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     # Two separate suppress blocks: WAL writes to disk (read-only mount
     # would raise), `busy_timeout` is a session-only hint that succeeds
