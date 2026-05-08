@@ -46,6 +46,7 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
+from textual.content import Content
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import (
@@ -1534,28 +1535,9 @@ class _HeaderLink(Link):
 
 
 class HeaderWithChangelog(Header):
-    # `margin-right` on each non-rightmost docked widget reserves space for
-    # the widgets to its right (the clock and, for the version label, also
-    # the changelog link). Without it the dock:right widgets pile up and
-    # overlap.
+    # `margin-right` on the changelog link reserves space for the clock to
+    # its right. Without it the dock:right widgets pile up and overlap.
     DEFAULT_CSS = """
-    HeaderWithChangelog #header-pr-count {
-        dock: right;
-        width: auto;
-        padding: 0 1;
-        margin-right: 40;
-        content-align: center middle;
-        color: $accent;
-        text-style: bold;
-    }
-    HeaderWithChangelog #header-version {
-        dock: right;
-        width: auto;
-        padding: 0 1;
-        margin-right: 28;
-        content-align: center middle;
-        color: $text-muted;
-    }
     HeaderWithChangelog #changelog-link {
         dock: right;
         width: auto;
@@ -1579,19 +1561,13 @@ class HeaderWithChangelog(Header):
     def compose(self) -> ComposeResult:
         yield HeaderIcon().data_bind(Header.icon)
         yield HeaderTitle()
-        # `on_mount` calls `action_refresh` immediately, which overwrites
-        # this with "…" before the first paint. Don't seed "0 to review"
-        # here: it would be a lie for the brief window before `_populate`
-        # lands the real count.
-        yield Static("", id="header-pr-count", markup=False)
-        # Pull from the App so the header tracks the same value the lifecycle
-        # state machine sees, and wrap in Text() since Static parses Rich
-        # markup by default — a PEP 440 local segment like "1.0+local[x]"
-        # would otherwise raise MarkupError and kill header mount.
+        # Pull the version from the App so the link tracks the same value the
+        # lifecycle state machine sees. Escape it because Link parses Rich
+        # markup — a PEP 440 local segment like "1.0+local[x]" would
+        # otherwise raise MarkupError and kill header mount.
         version = self.app.installed_version  # type: ignore[attr-defined]
-        if version:
-            yield Static(Text(f"v{version}"), id="header-version")
-        yield _HeaderLink("📝 Release Notes", url=CHANGELOG_URL, id="changelog-link")
+        link_text = f"📝 Release Notes (v{escape(version)})" if version else "📝 Release Notes"
+        yield _HeaderLink(link_text, url=CHANGELOG_URL, id="changelog-link")
         yield (
             HeaderClock().data_bind(Header.time_format) if self._show_clock else HeaderClockSpace()
         )
@@ -1688,8 +1664,8 @@ class PRReviewer(App):
     }
     """
 
-    TITLE = "GitHub PR Reviewer"
-    SUB_TITLE = "Review PRs with Claude Code"
+    TITLE = "CC PR Reviewer"
+    SUB_TITLE = "Review Github PRs with Claude Code"
 
     BINDINGS = [
         Binding("r,f5", "refresh", "Refresh"),
@@ -2460,7 +2436,37 @@ class PRReviewer(App):
         w.set_class(error, "-error")
 
     def _set_pr_count(self, msg: str) -> None:
-        self.query_one("#header-pr-count", Static).update(Text(msg))
+        # Reactive on the App; HeaderTitle re-renders automatically. The
+        # bracketed `[msg]` segment is colored by `format_title`.
+        self.title = f"{type(self).TITLE} [{msg}]"
+
+    def format_title(self, title: str, sub_title: str) -> Content:
+        # Two-tone styling on the title:
+        #   • leading "CC PR Reviewer" → bold $primary (matches the theme
+        #     primary palette color)
+        #   • bracketed "[count]" suffix → bold $accent (same emphasis the
+        #     standalone Static used to have)
+        # Anything outside that pattern falls back to default header styling.
+        bracket_start = title.find("[")
+        bracket_end = title.rfind("]")
+        if bracket_start != -1 and bracket_end > bracket_start:
+            prefix = title[:bracket_start].rstrip()
+            gap = title[len(prefix) : bracket_start]
+            title_content = Content.assemble(
+                (prefix, "bold $primary"),
+                gap,
+                (title[bracket_start : bracket_end + 1], "bold $accent"),
+                title[bracket_end + 1 :],
+            )
+        else:
+            title_content = Content.assemble((title, "bold $primary"))
+        if sub_title:
+            return Content.assemble(
+                title_content,
+                (" — ", "dim"),
+                Content(sub_title).stylize("dim"),
+            )
+        return title_content
 
     @work(thread=True, exclusive=True)
     def _poll_in_progress(self) -> None:
