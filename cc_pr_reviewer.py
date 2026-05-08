@@ -1087,6 +1087,15 @@ class HeaderWithChangelog(Header):
     # the changelog link). Without it the dock:right widgets pile up and
     # overlap.
     DEFAULT_CSS = """
+    HeaderWithChangelog #header-pr-count {
+        dock: right;
+        width: auto;
+        padding: 0 1;
+        margin-right: 40;
+        content-align: center middle;
+        color: $accent;
+        text-style: bold;
+    }
     HeaderWithChangelog #header-version {
         dock: right;
         width: auto;
@@ -1118,6 +1127,11 @@ class HeaderWithChangelog(Header):
     def compose(self) -> ComposeResult:
         yield HeaderIcon().data_bind(Header.icon)
         yield HeaderTitle()
+        # `on_mount` calls `action_refresh` immediately, which overwrites
+        # this with "…" before the first paint. Don't seed "0 to review"
+        # here: it would be a lie for the brief window before `_populate`
+        # lands the real count.
+        yield Static("", id="header-pr-count", markup=False)
         # Pull from the App so the header tracks the same value the lifecycle
         # state machine sees, and wrap in Text() since Static parses Rich
         # markup by default — a PEP 440 local segment like "1.0+local[x]"
@@ -1327,6 +1341,7 @@ class PRReviewer(App):
 
     def action_refresh(self) -> None:
         self._set_status("Refreshing…")
+        self._set_pr_count("…")
         self._load_prs()
 
     @work(thread=True, exclusive=True)
@@ -1336,6 +1351,11 @@ class PRReviewer(App):
             data = fetch_review_prs(repo)
         except Exception as e:  # noqa: BLE001
             self.call_from_thread(self._set_status, f"Error fetching review PRs: {e}", True)
+            # Without this, the "…" placeholder set by `action_refresh` /
+            # `action_toggle_mine` would linger forever — the user can't
+            # distinguish in-flight from failed without scanning the status
+            # bar.
+            self.call_from_thread(self._set_pr_count, "?")
             return
 
         # Fetch my-PRs separately so a failure here doesn't drop the
@@ -1375,6 +1395,17 @@ class PRReviewer(App):
         quiet: bool = False,
     ) -> None:
         self.prs = data
+        # Count review-requested PRs separately from `_mine=True` rows so the
+        # primary number reflects what the user actually has to act on. Append
+        # `(+N mine)` whenever the `m` toggle pulled extras in, mirroring the
+        # status-bar's `(+mine: N)` style — without that suffix a `No PRs to
+        # review` label looks wrong when mine-rows are visibly in the table.
+        to_review = sum(1 for p in data if not p.get("_mine"))
+        mine = sum(1 for p in data if p.get("_mine"))
+        label = f"{to_review} to review" if to_review else "No PRs to review"
+        if mine:
+            label += f" (+{mine} mine)"
+        self._set_pr_count(label)
         # Sticky so pure render-toggles (e.g. `action_toggle_group` →
         # `_populate(self.prs, mine_error=self._last_mine_error, quiet=True)`)
         # can preserve the ERROR badge a previous fetch produced.
@@ -1630,6 +1661,7 @@ class PRReviewer(App):
             self.notify(f"Couldn't persist mine toggle: {e}", severity="warning")
         self.notify(f"My PRs: {state}", timeout=3)
         self._set_status(f"Refreshing… (mine {state})")
+        self._set_pr_count("…")
         self._refresh_footer_indicators()
         self._load_prs()
 
@@ -1863,6 +1895,9 @@ class PRReviewer(App):
         w = self.query_one("#status", Static)
         w.update(msg)
         w.set_class(error, "-error")
+
+    def _set_pr_count(self, msg: str) -> None:
+        self.query_one("#header-pr-count", Static).update(Text(msg))
 
     @work(thread=True, exclusive=True)
     def _check_for_update(self) -> None:
