@@ -4,6 +4,74 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] — 2026-05-08
+
+### Added
+- **Cross-instance "in-progress" indicator.** PRs currently being
+  reviewed by another `cc-pr-reviewer` tab or host show a bold-yellow
+  `⟳` glyph in the Reviews cell. Each instance reserves a row in a
+  new `reviews_in_progress` SQLite table for the duration of its
+  `claude` subprocess; peers poll the table every 3 s. Pressing Enter
+  on a held PR opens a warn modal naming the holding PID/host with an
+  explicit "review anyway" override; on confirm the override is gated
+  on the holder identity captured at modal-open, so a peer that
+  reserved between modal-open and confirm re-prompts instead of being
+  silently evicted. Stale rows from crashed peers self-heal via a PID
+  liveness check on read.
+- **Header "N to review" count** next to the version label, so the
+  current workload is visible at a glance without scanning the status
+  bar. Counts only review-requested PRs (excludes `_mine=True` rows
+  when the `m` toggle is on); renders "…" during fetch and "?" on
+  fetch error so a stale value never lingers. When `m` is on and
+  authored PRs are visible, a `(+N mine)` suffix is appended so the
+  header matches the visible row count.
+
+### Changed
+- New `InProgressHolder(pr_key, pid, hostname, started_at)` dataclass
+  replaces the `dict[str, Any]` cast-on-every-read pattern at all the
+  in-progress call sites; `ReviewInProgressError` and
+  `InProgressWarnScreen` carry the holder directly.
+
+### Fixed
+- Reserve scope now wraps the entire `App.suspend()` block (was only
+  around `subprocess.call`), so two tabs can't race past `gh pr
+  checkout --force` before either reserves — the very race this
+  feature exists to prevent.
+- Stale-row sweep `DELETE` adds `pid` to the `WHERE` clause so a
+  same-host crash-and-restart race can't wipe a fresh holder's row.
+- `_pid_alive` returns `True` on Windows (POSIX `os.kill(_, 0)` raises
+  there for every PID); without this the feature silently degraded to
+  per-instance.
+- Hostname is captured once at module import (`_APP_HOSTNAME`) so a
+  DHCP/`hostnamectl`/`scutil` rename mid-session can't leak a
+  permanent orphan reservation.
+- `_poll_in_progress` runs on a worker thread to avoid up to 5 s UI
+  freeze on contended or NFS-hosted DBs; the worker connection opens
+  with `check_same_thread=False` (safe — WAL + `busy_timeout` serialise
+  writers, Python's sqlite3 takes a per-connection mutex around
+  execute/commit, and no helper holds an open transaction across
+  threads). Poll errors surface via `self.notify` with a dedupe latch
+  instead of clobbering the keybinding cheatsheet.
+- On a poll error the cached `self._in_progress` snapshot is preserved
+  rather than cleared, so the `⟳` cell glyph and `action_review` gate
+  stay in sync; a stale toast still tells the user the snapshot is
+  stale.
+- `action_review` consults the cached snapshot instead of issuing a
+  synchronous `_load_in_progress` on Enter, which had reintroduced the
+  same up-to-5 s freeze the worker thread was meant to remove. The
+  `_launch_claude` reserve is the actual safety boundary; the cache is
+  a UX optimisation to show the warn modal early.
+- Dropped `contextlib.suppress(sqlite3.Error)` from the
+  `_load_in_progress` sweep `DELETE`; both callers already wrap the
+  call in `try/except sqlite3.Error` and route the failure (abort +
+  toast in `action_review`, deduped warning in `_poll_in_progress`),
+  so the suppress was hiding signals rather than handling them.
+- `_release_in_progress` now logs to stderr on failure rather than
+  silently swallowing — matches the no-silent-fallback policy.
+- `_load_prs`'s exception path resets the header count to "?" so the
+  "…" placeholder set by `action_refresh` and `action_toggle_mine`
+  doesn't linger forever after a network failure.
+
 ## [0.10.1] — 2026-05-05
 
 ### Changed
@@ -284,6 +352,7 @@ Initial release.
 - Prereq checks for `gh`, `claude`, `git`, and the **PR Review Toolkit**
   Claude Code plugin.
 
+[0.11.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.11.0
 [0.10.1]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.10.1
 [0.10.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.10.0
 [0.9.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.9.0
