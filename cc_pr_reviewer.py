@@ -873,12 +873,17 @@ def _load_in_progress(conn: sqlite3.Connection) -> dict[str, InProgressHolder]:
         # re-inserted with its own PID before our DELETE) doesn't wipe
         # the fresh row. Without the pid guard, our DELETE would match
         # `(pr_key, hostname)` and remove the *new* holder.
-        with contextlib.suppress(sqlite3.Error):
-            conn.executemany(
-                "DELETE FROM reviews_in_progress WHERE pr_key = ? AND hostname = ? AND pid = ?",
-                [(h.pr_key, h.hostname, h.pid) for h in stale],
-            )
-            conn.commit()
+        # Errors propagate: both callers already wrap this in
+        # `try/except sqlite3.Error` and route the failure (abort + toast
+        # in `action_review`, deduped warning in `_poll_in_progress`).
+        # Suppressing here would hide read-only-mount, "database is
+        # locked past busy_timeout", disk-full, and transient corruption
+        # — the very signals those handlers exist to surface.
+        conn.executemany(
+            "DELETE FROM reviews_in_progress WHERE pr_key = ? AND hostname = ? AND pid = ?",
+            [(h.pr_key, h.hostname, h.pid) for h in stale],
+        )
+        conn.commit()
     return live
 
 
@@ -2107,21 +2112,20 @@ class PRReviewer(App):
 
             self.push_screen(ConfirmScreen(prompt), _proceed)
 
-        # Synchronous re-poll closes the gap between the 3 s tick and a
-        # sibling tab that just started a review (otherwise we'd send the
-        # user to the launch flow only for `_reserve_in_progress` to raise).
-        # Use the synchronous variant — the worker-thread poller is for
-        # the periodic tick, this runs in response to a keystroke and we
-        # need the result before pushing the next modal.
-        try:
-            current = _load_in_progress(self.review_db)
-        except sqlite3.Error as e:
-            # Surface and abort the launch — without a fresh snapshot we
-            # can't tell whether a peer holds the row.
-            self.notify(f"In-progress check failed: {e}", severity="warning")
-            return
-        self._in_progress = current
-        holder = current.get(_pr_key(pr))
+        # Use the cached snapshot from the periodic worker-thread poll
+        # rather than a synchronous re-poll. Two reasons:
+        #   1. A synchronous `_load_in_progress` on the keystroke path
+        #      can stall the UI for up to `busy_timeout=5000` ms when
+        #      the DB is contended (peer mid-`_atomic_replace`,
+        #      NFS-hosted workspace) — exactly the freeze the worker
+        #      poll was introduced to avoid.
+        #   2. The hard safety boundary is `_reserve_in_progress` inside
+        #      `_launch_claude`. If the cache misses a peer that just
+        #      started 200 ms ago, the reserve still raises
+        #      `ReviewInProgressError` and the launch path prints a
+        #      message + waits for Enter. The cache is a UX optimisation
+        #      to show the warn modal early, not the actual gate.
+        holder = self._in_progress.get(_pr_key(pr))
         if holder is None:
             _confirm(expected_holder=None)
             return
@@ -2443,18 +2447,23 @@ class PRReviewer(App):
         try:
             new = _load_in_progress(self.review_db)
         except sqlite3.Error as e:
-            # Polling failure shouldn't tear down the TUI. Clear the
-            # snapshot so the `⟳` indicator doesn't lie about peers we
-            # can no longer see, and surface a toast (not a status-bar
-            # write — that would clobber the keybinding cheatsheet for
-            # the rest of the session). Dedupe so a persistent failure
-            # doesn't fire every 3 s.
+            # Polling failure shouldn't tear down the TUI. Leave
+            # `self._in_progress` alone so the `⟳` glyph and
+            # `action_review`'s gate remain *consistent* — both reflect
+            # the last-known truth — even though we can't refresh them.
+            # Clearing the dict here would create a worse lie: cells
+            # would still show `⟳` (we can't repaint without the DB)
+            # while the gate would silently say "no holder", letting
+            # the user launch a duplicate review without warning.
+            # The reserve in `_launch_claude` is still the hard
+            # boundary, and the toast tells the user the snapshot is
+            # stale. Dedupe so a persistent failure doesn't fire every
+            # 3 s.
             self.call_from_thread(self._handle_poll_error, str(e))
             return
         self.call_from_thread(self._apply_in_progress_snapshot, new)
 
     def _handle_poll_error(self, message: str) -> None:
-        self._in_progress = {}
         if not self._poll_error_shown:
             self.notify(
                 f"In-progress poll failed: {message}",

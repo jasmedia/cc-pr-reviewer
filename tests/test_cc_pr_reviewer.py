@@ -692,3 +692,43 @@ def test_in_progress_age_str_clamps_future_timestamps_to_zero() -> None:
 
 def test_in_progress_age_str_falls_back_on_unparseable_input() -> None:
     assert _in_progress_age_str("not-an-iso-string") == "not-an-iso-string"
+
+
+def test_handle_poll_error_preserves_snapshot_and_dedupes_toast() -> None:
+    """A failed poll must NOT clear the in-memory snapshot. Clearing it
+    would leave the `⟳` glyph painted on cells (the worker can't repaint
+    without a working DB) while `action_review`'s gate read empty,
+    silently letting the user launch a duplicate review against a peer
+    we still believe holds the row. Keeping the snapshot intact means
+    cell + gate stay consistent — both stale, but consistent — and the
+    toast tells the user the snapshot is stale.
+
+    Dedupe latch: a persistent failure must fire the toast at most once
+    until the next successful poll clears the latch.
+    """
+    from cc_pr_reviewer import PRReviewer
+
+    holder = InProgressHolder(
+        pr_key="o/r#1", pid=100, hostname="peer-host", started_at="2025-01-01T00:00:00Z"
+    )
+    snapshot = {"o/r#1": holder}
+
+    class Dummy:
+        def __init__(self) -> None:
+            self._in_progress = snapshot
+            self._poll_error_shown = False
+            self.notifies: list[str] = []
+
+        def notify(self, message: str, **_kw: Any) -> None:
+            self.notifies.append(message)
+
+    d = Dummy()
+    PRReviewer._handle_poll_error(d, "boom")  # type: ignore[arg-type]
+    PRReviewer._handle_poll_error(d, "boom")  # type: ignore[arg-type]
+    PRReviewer._handle_poll_error(d, "boom")  # type: ignore[arg-type]
+    # Snapshot survived all three error ticks (same object identity).
+    assert d._in_progress is snapshot
+    assert d._in_progress == {"o/r#1": holder}
+    # Toast fired exactly once thanks to the dedupe latch.
+    assert d.notifies == ["In-progress poll failed: boom"]
+    assert d._poll_error_shown is True
