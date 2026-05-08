@@ -1087,6 +1087,15 @@ class HeaderWithChangelog(Header):
     # the changelog link). Without it the dock:right widgets pile up and
     # overlap.
     DEFAULT_CSS = """
+    HeaderWithChangelog #header-pr-count {
+        dock: right;
+        width: auto;
+        padding: 0 1;
+        margin-right: 40;
+        content-align: center middle;
+        color: $accent;
+        text-style: bold;
+    }
     HeaderWithChangelog #header-version {
         dock: right;
         width: auto;
@@ -1118,6 +1127,10 @@ class HeaderWithChangelog(Header):
     def compose(self) -> ComposeResult:
         yield HeaderIcon().data_bind(Header.icon)
         yield HeaderTitle()
+        # Empty initial text — populated by `_set_pr_count` after the first
+        # fetch so the user never sees a misleading "0 to review" flash before
+        # data arrives.
+        yield Static("", id="header-pr-count", markup=False)
         # Pull from the App so the header tracks the same value the lifecycle
         # state machine sees, and wrap in Text() since Static parses Rich
         # markup by default — a PEP 440 local segment like "1.0+local[x]"
@@ -1327,6 +1340,7 @@ class PRReviewer(App):
 
     def action_refresh(self) -> None:
         self._set_status("Refreshing…")
+        self._set_pr_count("…")
         self._load_prs()
 
     @work(thread=True, exclusive=True)
@@ -1375,6 +1389,12 @@ class PRReviewer(App):
         quiet: bool = False,
     ) -> None:
         self.prs = data
+        # Count only PRs awaiting the user's review — `_mine=True` rows are
+        # the user's own authored PRs (surfaced via the `m` toggle) and aren't
+        # part of the review-queue total. The status bar still shows
+        # `(+mine: N)` separately.
+        to_review = sum(1 for p in data if not p.get("_mine"))
+        self._set_pr_count(f"{to_review} to review" if to_review else "No PRs to review")
         # Sticky so pure render-toggles (e.g. `action_toggle_group` →
         # `_populate(self.prs, mine_error=self._last_mine_error, quiet=True)`)
         # can preserve the ERROR badge a previous fetch produced.
@@ -1630,6 +1650,7 @@ class PRReviewer(App):
             self.notify(f"Couldn't persist mine toggle: {e}", severity="warning")
         self.notify(f"My PRs: {state}", timeout=3)
         self._set_status(f"Refreshing… (mine {state})")
+        self._set_pr_count("…")
         self._refresh_footer_indicators()
         self._load_prs()
 
@@ -1863,6 +1884,12 @@ class PRReviewer(App):
         w = self.query_one("#status", Static)
         w.update(msg)
         w.set_class(error, "-error")
+
+    def _set_pr_count(self, msg: str) -> None:
+        # Wrap in Text() — same precaution as the version label, since the
+        # widget is styled with Rich markup parsing on by default and a stray
+        # `[` in a future format string would otherwise crash header render.
+        self.query_one("#header-pr-count", Static).update(Text(msg))
 
     @work(thread=True, exclusive=True)
     def _check_for_update(self) -> None:
