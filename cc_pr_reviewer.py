@@ -1389,12 +1389,17 @@ class PRReviewer(App):
         quiet: bool = False,
     ) -> None:
         self.prs = data
-        # Count only PRs awaiting the user's review — `_mine=True` rows are
-        # the user's own authored PRs (surfaced via the `m` toggle) and aren't
-        # part of the review-queue total. The status bar still shows
-        # `(+mine: N)` separately.
+        # Count review-requested PRs separately from `_mine=True` rows so the
+        # primary number reflects what the user actually has to act on. Append
+        # `(+N mine)` whenever the `m` toggle pulled extras in, mirroring the
+        # status-bar's `(+mine: N)` style — without that suffix a `No PRs to
+        # review` label looks wrong when mine-rows are visibly in the table.
         to_review = sum(1 for p in data if not p.get("_mine"))
-        self._set_pr_count(f"{to_review} to review" if to_review else "No PRs to review")
+        mine = sum(1 for p in data if p.get("_mine"))
+        label = f"{to_review} to review" if to_review else "No PRs to review"
+        if mine:
+            label += f" (+{mine} mine)"
+        self._set_pr_count(label)
         # Sticky so pure render-toggles (e.g. `action_toggle_group` →
         # `_populate(self.prs, mine_error=self._last_mine_error, quiet=True)`)
         # can preserve the ERROR badge a previous fetch produced.
