@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.1] — 2026-05-08
+
+### Changed
+- **Header style refresh.** Folded the standalone PR-count and version
+  `Static` widgets into existing header pieces — the count now rides on
+  `app.title` as a bold-accent `[N to review]` suffix, and the version
+  joins the Release Notes link as `(vX.Y.Z)`. A new `App.format_title`
+  override two-tones the title prefix (`bold $primary`) and the bracketed
+  count (`bold $accent`), preserving the previous Static's emphasis
+  without the docked-widget overlap workarounds. The title is renamed
+  from "GitHub PR Reviewer" to "CC PR Reviewer" and the subtitle now
+  prepends "Github", so the header reads "CC PR Reviewer [N to review] —
+  Review Github PRs with Claude Code  📝 Release Notes (vX.Y.Z)".
+
 ## [0.11.0] — 2026-05-08
 
 ### Added
@@ -352,6 +366,7 @@ Initial release.
 - Prereq checks for `gh`, `claude`, `git`, and the **PR Review Toolkit**
   Claude Code plugin.
 
+[0.11.1]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.11.1
 [0.11.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.11.0
 [0.10.1]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.10.1
 [0.10.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.10.0
