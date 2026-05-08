@@ -1127,9 +1127,10 @@ class HeaderWithChangelog(Header):
     def compose(self) -> ComposeResult:
         yield HeaderIcon().data_bind(Header.icon)
         yield HeaderTitle()
-        # Empty initial text — populated by `_set_pr_count` after the first
-        # fetch so the user never sees a misleading "0 to review" flash before
-        # data arrives.
+        # `on_mount` calls `action_refresh` immediately, which overwrites
+        # this with "…" before the first paint. Don't seed "0 to review"
+        # here: it would be a lie for the brief window before `_populate`
+        # lands the real count.
         yield Static("", id="header-pr-count", markup=False)
         # Pull from the App so the header tracks the same value the lifecycle
         # state machine sees, and wrap in Text() since Static parses Rich
@@ -1350,6 +1351,11 @@ class PRReviewer(App):
             data = fetch_review_prs(repo)
         except Exception as e:  # noqa: BLE001
             self.call_from_thread(self._set_status, f"Error fetching review PRs: {e}", True)
+            # Without this, the "…" placeholder set by `action_refresh` /
+            # `action_toggle_mine` would linger forever — the user can't
+            # distinguish in-flight from failed without scanning the status
+            # bar.
+            self.call_from_thread(self._set_pr_count, "?")
             return
 
         # Fetch my-PRs separately so a failure here doesn't drop the
@@ -1891,9 +1897,6 @@ class PRReviewer(App):
         w.set_class(error, "-error")
 
     def _set_pr_count(self, msg: str) -> None:
-        # Wrap in Text() — same precaution as the version label, since the
-        # widget is styled with Rich markup parsing on by default and a stray
-        # `[` in a future format string would otherwise crash header render.
         self.query_one("#header-pr-count", Static).update(Text(msg))
 
     @work(thread=True, exclusive=True)
