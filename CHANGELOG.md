@@ -4,6 +4,41 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.1] — 2026-05-05
+
+### Changed
+- **Prompt assembly extracted from `_launch_claude`.** The conditional
+  layering of POST_INLINE suffixes had grown to five suffixes gated on
+  three binary inputs (`post_inline`, `fetch_ok`, rereview, rereview-can-
+  approve), making it the most regression-prone block in the file. It
+  now lives in a pure `build_review_prompt(...)` helper returning a
+  `BuiltPrompt` dataclass, shrinking the call site from ~37 lines to ~8.
+  No user-visible change to the assembled prompt.
+
+### Added
+- Pytest suite under `tests/` covering the four pure helpers:
+  `build_review_prompt` (9 cases over the full suffix matrix, including
+  the rereview-from-raw-list path and the GitHub-422 self-approval
+  gate), `_is_newer`/`_parse_semver` (regression guard against lexical
+  compare on `0.10.0` vs `0.9.0`), `_review_cell`, and
+  `format_existing_comments`. `pytest>=8.0` is wired into dev deps and
+  `testpaths = ["tests"]` is set in `pyproject.toml`.
+
+### Fixed
+- When `gh api user` fails (network glitch, auth blip), the launch
+  banner now explicitly says rereview detection is unavailable instead
+  of reading identically to a clean first-review launch — the prior
+  path silently dropped bar-raising on someone else's PR with the
+  warning easily lost in clone/checkout output.
+- Whitespace-only `extra_prompt` can no longer render an empty
+  "Additional instructions from reviewer:" header followed by nothing;
+  `build_review_prompt` strips defensively in addition to the existing
+  `ConfirmResult.__post_init__` strip.
+- A contradictory `(fetch_ok=False, existing=non-empty)` input to
+  `build_review_prompt` now asserts at the boundary, so a future caller
+  or test stub can't silently swap DEDUP_SUFFIX for the FETCH_FAILED
+  warning.
+
 ## [0.10.0] — 2026-05-05
 
 ### Added
@@ -249,6 +284,7 @@ Initial release.
 - Prereq checks for `gh`, `claude`, `git`, and the **PR Review Toolkit**
   Claude Code plugin.
 
+[0.10.1]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.10.1
 [0.10.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.10.0
 [0.9.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.9.0
 [0.8.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.8.0
