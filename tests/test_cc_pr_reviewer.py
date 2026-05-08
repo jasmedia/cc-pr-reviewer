@@ -8,10 +8,17 @@ tests.
 
 from __future__ import annotations
 
+import os
 import re
+import socket
+import sqlite3
+import sys
 from typing import Any
 
+import pytest
+
 from cc_pr_reviewer import (
+    _APP_HOSTNAME,
     EXISTING_COMMENT_BODY_CAP,
     EXISTING_COMMENT_LIST_CAP,
     POST_INLINE_DEDUP_SUFFIX,
@@ -22,8 +29,16 @@ from cc_pr_reviewer import (
     POST_INLINE_REREVIEW_SUFFIX,
     PROMPT_SECTION_SEP,
     REVIEW_PROMPT,
+    InProgressHolder,
+    ReviewInProgressError,
+    _in_progress_age_str,
     _is_newer,
+    _load_in_progress,
+    _open_review_db,
     _parse_semver,
+    _pid_alive,
+    _release_in_progress,
+    _reserve_in_progress,
     _review_cell,
     build_review_prompt,
     format_existing_comments,
@@ -276,7 +291,8 @@ def _pr(repo: str, number: int, updated: str) -> dict[str, Any]:
 
 
 def test_review_cell_unreviewed_pr_renders_dash() -> None:
-    assert _review_cell(_pr("o/r", 1, "2025-01-01T00:00:00Z"), {}) == "-"
+    cell = _review_cell(_pr("o/r", 1, "2025-01-01T00:00:00Z"), {})
+    assert cell.plain == "-"
 
 
 def test_review_cell_matching_updated_at_renders_count() -> None:
@@ -286,7 +302,8 @@ def test_review_cell_matching_updated_at_renders_count() -> None:
             "last_pr_updated_at": "2025-01-01T00:00:00Z",
         }
     }
-    assert _review_cell(_pr("o/r", 1, "2025-01-01T00:00:00Z"), state) == "3"
+    cell = _review_cell(_pr("o/r", 1, "2025-01-01T00:00:00Z"), state)
+    assert cell.plain == "3"
 
 
 def test_review_cell_drifted_updated_at_marks_stale() -> None:
@@ -298,14 +315,52 @@ def test_review_cell_drifted_updated_at_marks_stale() -> None:
             "last_pr_updated_at": "2025-01-01T00:00:00Z",
         }
     }
-    assert _review_cell(_pr("o/r", 1, "2025-01-02T00:00:00Z"), state) == "3 stale"
+    cell = _review_cell(_pr("o/r", 1, "2025-01-02T00:00:00Z"), state)
+    assert cell.plain == "3 stale"
+    assert "yellow" in str(cell.style)
 
 
 def test_review_cell_missing_stored_updated_at_is_not_stale() -> None:
     """Defensive: if the row is missing the timestamp (legacy DB row, or
     empty string from a failed fetch), don't falsely flag stale."""
     state = {"o/r#1": {"count": 1, "last_pr_updated_at": ""}}
-    assert _review_cell(_pr("o/r", 1, "2025-01-02T00:00:00Z"), state) == "1"
+    cell = _review_cell(_pr("o/r", 1, "2025-01-02T00:00:00Z"), state)
+    assert cell.plain == "1"
+
+
+def test_review_cell_in_progress_overrides_count_with_glyph_and_style() -> None:
+    """`in_progress=True` prepends the spinner glyph and styles the cell
+    in bold yellow, while preserving the underlying count for context."""
+    state = {
+        "o/r#1": {
+            "count": 3,
+            "last_pr_updated_at": "2025-01-01T00:00:00Z",
+        }
+    }
+    cell = _review_cell(_pr("o/r", 1, "2025-01-01T00:00:00Z"), state, in_progress=True)
+    assert cell.plain.startswith("⟳ ")
+    assert cell.plain.endswith("3")
+    style = str(cell.style)
+    assert "bold" in style
+    assert "yellow" in style
+
+
+def test_review_cell_in_progress_on_unreviewed_pr_keeps_dash() -> None:
+    cell = _review_cell(_pr("o/r", 1, "2025-01-01T00:00:00Z"), {}, in_progress=True)
+    assert cell.plain == "⟳ -"
+
+
+def test_review_cell_returns_text_for_all_branches() -> None:
+    """Regression guard for the str→Text return-type change."""
+    from rich.text import Text
+
+    pr = _pr("o/r", 1, "2025-01-01T00:00:00Z")
+    state_match = {"o/r#1": {"count": 1, "last_pr_updated_at": "2025-01-01T00:00:00Z"}}
+    state_stale = {"o/r#1": {"count": 1, "last_pr_updated_at": "2024-01-01T00:00:00Z"}}
+    assert isinstance(_review_cell(pr, {}), Text)
+    assert isinstance(_review_cell(pr, state_match), Text)
+    assert isinstance(_review_cell(pr, state_stale), Text)
+    assert isinstance(_review_cell(pr, {}, in_progress=True), Text)
 
 
 # --- format_existing_comments ---------------------------------------------
@@ -372,3 +427,308 @@ def test_format_existing_comments_caps_list_at_recent_n() -> None:
     block, shown = format_existing_comments(comments)
     assert shown == EXISTING_COMMENT_LIST_CAP
     assert f"showing {EXISTING_COMMENT_LIST_CAP} most recent of {overflow} total" in block
+
+
+# --- In-progress reservations ---------------------------------------------
+
+
+@pytest.fixture
+def review_db(tmp_path, monkeypatch):
+    """Open a fresh review DB rooted at a tmp path. Patches
+    `REVIEW_DB_PATH` so `_open_review_db` writes into the tmp dir, then
+    closes the connection on teardown."""
+    db_path = tmp_path / ".review_state.db"
+    monkeypatch.setattr("cc_pr_reviewer.REVIEW_DB_PATH", db_path)
+    conn = _open_review_db()
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def _insert_holder(
+    conn: sqlite3.Connection,
+    pr_key: str,
+    pid: int,
+    hostname: str,
+    started_at: str = "2025-01-01T00:00:00Z",
+) -> None:
+    conn.execute(
+        "INSERT INTO reviews_in_progress (pr_key, pid, hostname, started_at) VALUES (?, ?, ?, ?)",
+        (pr_key, pid, hostname, started_at),
+    )
+    conn.commit()
+
+
+def test_pid_alive_for_self_returns_true() -> None:
+    assert _pid_alive(os.getpid()) is True
+
+
+def test_pid_alive_for_unlikely_pid_returns_false() -> None:
+    # 99999999 is well beyond Linux's default `/proc/sys/kernel/pid_max`
+    # (typically 32768 or 4194304). Vanishingly unlikely to be live.
+    # Skipped on Windows where _pid_alive is conservatively True for any
+    # non-zero PID (no signal-0-style probe available there).
+    if sys.platform == "win32":
+        pytest.skip("Windows _pid_alive returns True for all positive PIDs by design")
+    assert _pid_alive(99999999) is False
+
+
+def test_pid_alive_for_invalid_pid_returns_false() -> None:
+    assert _pid_alive(0) is False
+    assert _pid_alive(-1) is False
+
+
+def test_reserve_in_progress_inserts_row_when_empty(review_db) -> None:
+    holder = _reserve_in_progress(review_db, "o/r#1")
+    assert isinstance(holder, InProgressHolder)
+    assert holder.pr_key == "o/r#1"
+    assert holder.pid == os.getpid()
+    assert holder.hostname == _APP_HOSTNAME
+    assert _load_in_progress(review_db).keys() == {"o/r#1"}
+
+
+def test_reserve_in_progress_raises_on_live_local_holder(review_db) -> None:
+    _insert_holder(review_db, "o/r#1", os.getpid(), socket.gethostname())
+    with pytest.raises(ReviewInProgressError) as exc_info:
+        _reserve_in_progress(review_db, "o/r#1")
+    err = exc_info.value
+    assert err.holder.pid == os.getpid()
+    assert err.holder.hostname == socket.gethostname()
+
+
+def test_reserve_in_progress_raises_on_foreign_host(review_db) -> None:
+    """Foreign-host rows are opaque (we can't probe a remote PID over
+    NFS), so we must NOT treat them as stale even with an unlikely PID."""
+    _insert_holder(review_db, "o/r#1", 99999999, "some-other-host")
+    with pytest.raises(ReviewInProgressError) as exc_info:
+        _reserve_in_progress(review_db, "o/r#1")
+    assert exc_info.value.holder.hostname == "some-other-host"
+
+
+def test_reserve_in_progress_recovers_stale_own_host_row(review_db) -> None:
+    if sys.platform == "win32":
+        pytest.skip("Windows _pid_alive can't detect dead PIDs (always True)")
+    _insert_holder(review_db, "o/r#1", 99999999, _APP_HOSTNAME)
+    holder = _reserve_in_progress(review_db, "o/r#1")
+    assert holder.pid == os.getpid()
+    live = _load_in_progress(review_db)
+    assert live["o/r#1"].pid == os.getpid()
+
+
+def test_reserve_in_progress_expected_holder_replaces_matching_holder(review_db) -> None:
+    """The override path: user saw holder H in the warn modal and chose
+    to review anyway. Reserve must replace H's row only if the row's
+    identity still matches H — protecting against the modal-open →
+    modal-confirm race."""
+    _insert_holder(review_db, "o/r#1", 4242, "some-other-host", "2025-01-01T00:00:00Z")
+    expected = InProgressHolder(
+        pr_key="o/r#1", pid=4242, hostname="some-other-host", started_at="2025-01-01T00:00:00Z"
+    )
+    holder = _reserve_in_progress(review_db, "o/r#1", expected_holder=expected)
+    assert holder.pid == os.getpid()
+    assert holder.hostname == _APP_HOSTNAME
+
+
+def test_reserve_in_progress_expected_holder_refuses_when_holder_changed(
+    review_db,
+) -> None:
+    """If H finished and a different peer B reserved between modal-open
+    and modal-confirm, the override must NOT silently evict B. It must
+    raise so the caller can re-prompt against the new holder."""
+    _insert_holder(review_db, "o/r#1", 5555, "another-host", "2025-01-02T00:00:00Z")
+    stale_expected = InProgressHolder(
+        pr_key="o/r#1", pid=4242, hostname="some-other-host", started_at="2025-01-01T00:00:00Z"
+    )
+    with pytest.raises(ReviewInProgressError) as exc_info:
+        _reserve_in_progress(review_db, "o/r#1", expected_holder=stale_expected)
+    # Surfaces the *current* (B's) identity, not the expected (H's).
+    assert exc_info.value.holder.pid == 5555
+    assert exc_info.value.holder.hostname == "another-host"
+
+
+def test_release_in_progress_only_deletes_own_row(review_db) -> None:
+    """A peer's row (different PID) must survive our release — the
+    `(pid, hostname)` guards prevent ever deleting another tab's marker."""
+    _insert_holder(review_db, "o/r#1", 99999999, "some-other-host")
+    _release_in_progress(review_db, "o/r#1")
+    live = _load_in_progress(review_db)
+    assert "o/r#1" in live
+    assert live["o/r#1"].pid == 99999999
+
+
+def test_release_in_progress_is_idempotent(review_db) -> None:
+    """Releasing a row that doesn't exist (already-released, never-reserved)
+    must not raise — release must never tank the post-review path."""
+    _release_in_progress(review_db, "o/r#1")  # no-op, no row yet
+    _reserve_in_progress(review_db, "o/r#1")
+    _release_in_progress(review_db, "o/r#1")
+    _release_in_progress(review_db, "o/r#1")  # second release is no-op
+
+
+def test_release_in_progress_swallows_db_errors(tmp_path, monkeypatch, capsys) -> None:
+    """Pin the `release-must-not-raise` contract against a closed
+    connection. A failure logs to stderr (so orphaned reservations are
+    diagnosable) but never propagates."""
+    monkeypatch.setattr("cc_pr_reviewer.REVIEW_DB_PATH", tmp_path / ".review_state.db")
+    conn = _open_review_db()
+    conn.close()
+    _release_in_progress(conn, "o/r#1")  # must not raise
+    captured = capsys.readouterr()
+    assert "failed to release in-progress reservation" in captured.err
+
+
+def test_load_in_progress_sweeps_stale_own_host_rows(review_db) -> None:
+    if sys.platform == "win32":
+        pytest.skip("Windows _pid_alive can't detect dead PIDs (always True)")
+    _insert_holder(review_db, "o/r#1", 99999999, _APP_HOSTNAME)
+    live = _load_in_progress(review_db)
+    assert live == {}
+    # Sweep is persistent: row should be gone from the table.
+    rows = review_db.execute("SELECT * FROM reviews_in_progress").fetchall()
+    assert rows == []
+
+
+def test_load_in_progress_sweep_includes_pid_in_where(review_db) -> None:
+    """Same-host crash-and-restart race: peer A (pid 99999999) crashes,
+    then peer B has already swept-and-replaced with its own row (pid
+    66666666). A subsequent sweep that built its DELETE list from the
+    older snapshot must NOT match B's fresh row — `pid` is the
+    discriminator that prevents the wipe."""
+    if sys.platform == "win32":
+        pytest.skip("Windows _pid_alive can't detect dead PIDs (always True)")
+    fresh_pid = os.getpid()  # guaranteed live: ourselves
+    _insert_holder(review_db, "o/r#1", fresh_pid, _APP_HOSTNAME)
+    # The sweep would only consider the row stale if its pid is dead;
+    # since it isn't, it must survive. We assert the SELECT contract,
+    # not the executemany internals — but a regression that drops pid
+    # from the DELETE WHERE would still make the sweep delete the live
+    # row whenever any stale row coexists. Force that scenario:
+    _insert_holder(review_db, "o/r#2", 99999999, _APP_HOSTNAME)
+    live = _load_in_progress(review_db)
+    assert "o/r#1" in live
+    assert "o/r#2" not in live
+    rows = {r["pr_key"] for r in review_db.execute("SELECT pr_key FROM reviews_in_progress")}
+    assert rows == {"o/r#1"}
+
+
+def test_load_in_progress_keeps_foreign_host_rows(review_db) -> None:
+    _insert_holder(review_db, "o/r#1", 99999999, "some-other-host")
+    live = _load_in_progress(review_db)
+    assert live.keys() == {"o/r#1"}
+
+
+def test_concurrent_reserve_one_winner_one_raises(tmp_path, monkeypatch) -> None:
+    """The central cross-instance invariant: two independent connections
+    racing to reserve the same `pr_key` must produce exactly one winner
+    and one `ReviewInProgressError`. Same-process; same-DB-file; two
+    distinct connections — exactly the multi-tab topology in production.
+    Without this test, a regression to `INSERT OR REPLACE` (which would
+    silently let the second writer win) would pass every other test."""
+    monkeypatch.setattr("cc_pr_reviewer.REVIEW_DB_PATH", tmp_path / ".review_state.db")
+    a = _open_review_db()
+    b = _open_review_db()
+    try:
+        _reserve_in_progress(a, "o/r#1")
+        with pytest.raises(ReviewInProgressError):
+            _reserve_in_progress(b, "o/r#1")
+        # Second connection still sees A's row.
+        assert _load_in_progress(b).keys() == {"o/r#1"}
+    finally:
+        a.close()
+        b.close()
+
+
+def test_open_review_db_creates_in_progress_table_on_legacy_db(tmp_path, monkeypatch) -> None:
+    """0.10.x users have a DB with only `reviews` + `settings`. Opening
+    it on this branch must create `reviews_in_progress` lazily — that's
+    the only "migration" mechanism users see."""
+    db_path = tmp_path / ".review_state.db"
+    monkeypatch.setattr("cc_pr_reviewer.REVIEW_DB_PATH", db_path)
+    legacy = sqlite3.connect(db_path)
+    legacy.execute(
+        "CREATE TABLE reviews ("
+        "pr_key TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0,"
+        "last_reviewed_at TEXT NOT NULL, last_pr_updated_at TEXT NOT NULL,"
+        "last_head_sha TEXT)"
+    )
+    legacy.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    legacy.commit()
+    legacy.close()
+
+    conn = _open_review_db()
+    try:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        assert "reviews_in_progress" in tables
+        # Functional smoke: the new table is usable end-to-end.
+        _reserve_in_progress(conn, "o/r#1")
+        assert _load_in_progress(conn).keys() == {"o/r#1"}
+    finally:
+        conn.close()
+
+
+def test_in_progress_age_str_formats_short_ages() -> None:
+    """Coarse age formatting; covers the four magnitude buckets without
+    being flaky on tiny clock jitter."""
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    iso = lambda d: (now - d).isoformat().replace("+00:00", "Z")  # noqa: E731
+    assert _in_progress_age_str(iso(timedelta(seconds=10))).endswith("s ago")
+    assert _in_progress_age_str(iso(timedelta(minutes=5))).endswith("m ago")
+    assert _in_progress_age_str(iso(timedelta(hours=2))).endswith("h ago")
+    assert _in_progress_age_str(iso(timedelta(days=3))).endswith("d ago")
+
+
+def test_in_progress_age_str_clamps_future_timestamps_to_zero() -> None:
+    """Foreign-host clock skew can produce a `started_at` in our future.
+    The `max(secs, 0)` clamp keeps the renderer from emitting "-43s ago"
+    (which would be both nonsensical and a UX bug)."""
+    from datetime import datetime, timedelta, timezone
+
+    future = (datetime.now(timezone.utc) + timedelta(seconds=42)).isoformat().replace("+00:00", "Z")
+    assert _in_progress_age_str(future) == "0s ago"
+
+
+def test_in_progress_age_str_falls_back_on_unparseable_input() -> None:
+    assert _in_progress_age_str("not-an-iso-string") == "not-an-iso-string"
+
+
+def test_handle_poll_error_preserves_snapshot_and_dedupes_toast() -> None:
+    """A failed poll must NOT clear the in-memory snapshot. Clearing it
+    would leave the `⟳` glyph painted on cells (the worker can't repaint
+    without a working DB) while `action_review`'s gate read empty,
+    silently letting the user launch a duplicate review against a peer
+    we still believe holds the row. Keeping the snapshot intact means
+    cell + gate stay consistent — both stale, but consistent — and the
+    toast tells the user the snapshot is stale.
+
+    Dedupe latch: a persistent failure must fire the toast at most once
+    until the next successful poll clears the latch.
+    """
+    from cc_pr_reviewer import PRReviewer
+
+    holder = InProgressHolder(
+        pr_key="o/r#1", pid=100, hostname="peer-host", started_at="2025-01-01T00:00:00Z"
+    )
+    snapshot = {"o/r#1": holder}
+
+    class Dummy:
+        def __init__(self) -> None:
+            self._in_progress = snapshot
+            self._poll_error_shown = False
+            self.notifies: list[str] = []
+
+        def notify(self, message: str, **_kw: Any) -> None:
+            self.notifies.append(message)
+
+    d = Dummy()
+    PRReviewer._handle_poll_error(d, "boom")  # type: ignore[arg-type]
+    PRReviewer._handle_poll_error(d, "boom")  # type: ignore[arg-type]
+    PRReviewer._handle_poll_error(d, "boom")  # type: ignore[arg-type]
+    # Snapshot survived all three error ticks (same object identity).
+    assert d._in_progress is snapshot
+    assert d._in_progress == {"o/r#1": holder}
+    # Toast fired exactly once thanks to the dedupe latch.
+    assert d.notifies == ["In-progress poll failed: boom"]
+    assert d._poll_error_shown is True
