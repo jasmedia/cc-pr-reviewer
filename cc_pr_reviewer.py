@@ -26,6 +26,7 @@ import contextlib
 import json
 import os
 import shutil
+import socket
 import sqlite3
 import subprocess
 import urllib.request
@@ -636,8 +637,19 @@ def _pr_key(pr: dict[str, Any]) -> str:
 
 def _open_review_db() -> sqlite3.Connection:
     REVIEW_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(REVIEW_DB_PATH)
+    # `timeout` covers Python-side waits; `busy_timeout` covers SQLite-side
+    # waits on writes. Both matter now that multiple TUI instances can
+    # contend on the in-progress table. WAL switches the DB file to a
+    # multi-reader / single-writer mode so a tab's INSERT doesn't lock out
+    # peers' SELECTs while it commits. The PRAGMAs are wrapped in
+    # `suppress(OperationalError)` so a read-only mount surfaces as
+    # degraded behaviour rather than a startup crash; the `CREATE TABLE`s
+    # below stay load-bearing.
+    conn = sqlite3.connect(REVIEW_DB_PATH, timeout=5.0)
     conn.row_factory = sqlite3.Row
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS reviews (
@@ -654,6 +666,22 @@ def _open_review_db() -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
+        )
+        """
+    )
+    # `reviews_in_progress` is intentionally separate from `reviews` because
+    # the lifetimes are orthogonal: rows here churn on a sub-minute scale
+    # (one row per active `claude` subprocess), while `reviews` rows are
+    # durable per-PR audit records. Keeping them apart leaves
+    # `_record_review`'s UPSERT untouched and lets crash-recovery
+    # `DELETE`s here never risk the audit table.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reviews_in_progress (
+            pr_key TEXT PRIMARY KEY,
+            pid INTEGER NOT NULL,
+            hostname TEXT NOT NULL,
+            started_at TEXT NOT NULL
         )
         """
     )
@@ -706,15 +734,215 @@ def _record_review(
     return dict(row)
 
 
-def _review_cell(pr: dict[str, Any], state: dict[str, dict[str, Any]]) -> str:
+# --- In-progress reservations (cross-instance lock) ------------------------
+#
+# Every active `claude` review subprocess writes one row to the
+# `reviews_in_progress` table while it runs and deletes it on exit. Any
+# other cc-pr-reviewer instance polls the table to render an "in review"
+# indicator and to gate `action_review` so the user can't accidentally
+# launch a second `claude` against the same PR (which would have both tabs
+# fighting over the same `gh pr checkout --force` working tree).
+#
+# Identity is `(pid, hostname)`. `started_at` is display-only (so cross-host
+# clock skew is harmless). Stale rows from crashed peers are recovered
+# lazily: when we see a row whose hostname matches ours but whose PID is
+# dead, we delete it and proceed. Foreign-host rows are treated as opaque
+# (we cannot probe a remote PID over NFS) — the override path in the UX
+# layer is the escape hatch for genuinely orphaned remote rows.
+
+
+class ReviewInProgressError(Exception):
+    """Raised when a reservation is blocked by a live (or unprobeable) holder.
+
+    Carries the holder's identity so the caller can render a useful
+    warning. We don't subclass `sqlite3.IntegrityError` because the cause
+    isn't a schema problem — it's a normal cross-instance contention
+    signal that the UX layer translates into a confirm-or-cancel modal.
+    """
+
+    def __init__(self, pid: int, hostname: str, started_at: str) -> None:
+        super().__init__(f"PR is being reviewed by pid {pid} on {hostname} (since {started_at})")
+        self.pid = pid
+        self.hostname = hostname
+        self.started_at = started_at
+
+
+def _pid_alive(pid: int) -> bool:
+    """True iff `pid` exists on the local host. POSIX-only (matches the
+    rest of this codebase). `os.kill(pid, 0)` is the canonical liveness
+    probe — `PermissionError` means the process exists but we can't signal
+    it (treat as alive); `ProcessLookupError`/`OSError` means it's gone.
+    """
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _load_in_progress(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+    """Return all live in-progress rows, sweeping stale own-host rows in
+    place. "Stale" = our hostname AND a dead PID; foreign-host rows are
+    opaque and always returned. Sweeping here means the polling loop can
+    `_load_in_progress(...)` and trust the result without a second pass.
+    """
+    rows = conn.execute("SELECT * FROM reviews_in_progress").fetchall()
+    if not rows:
+        return {}
+    me = socket.gethostname()
+    live: dict[str, dict[str, Any]] = {}
+    stale_keys: list[str] = []
+    for r in rows:
+        host = r["hostname"]
+        pid = int(r["pid"])
+        if host == me and not _pid_alive(pid):
+            stale_keys.append(r["pr_key"])
+            continue
+        live[r["pr_key"]] = dict(r)
+    if stale_keys:
+        with contextlib.suppress(sqlite3.Error):
+            conn.executemany(
+                "DELETE FROM reviews_in_progress WHERE pr_key = ? AND hostname = ?",
+                [(k, me) for k in stale_keys],
+            )
+            conn.commit()
+    return live
+
+
+def _reserve_in_progress(
+    conn: sqlite3.Connection,
+    pr_key: str,
+    *,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Insert our marker row for `pr_key`. Returns the row we wrote.
+
+    `force=True` deletes any existing row first (used when the user
+    explicitly chose "review anyway" on a held PR — the conflicting row
+    might be a stale foreign-host marker we can't probe).
+
+    On `IntegrityError`, attempt one stale-recovery pass: if the holder
+    is on our host with a dead PID, delete its row and retry the insert.
+    Otherwise raise `ReviewInProgressError`. This is normally unreachable
+    (the UX layer checks `_load_in_progress` first) — it's a defensive
+    guard against the TOCTOU race where two tabs both pass the UX check
+    before either inserts.
+    """
+    me = socket.gethostname()
+    pid = os.getpid()
+    started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    if force:
+        conn.execute("DELETE FROM reviews_in_progress WHERE pr_key = ?", (pr_key,))
+        conn.commit()
+    try:
+        conn.execute(
+            "INSERT INTO reviews_in_progress (pr_key, pid, hostname, started_at) "
+            "VALUES (?, ?, ?, ?)",
+            (pr_key, pid, me, started_at),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        row = conn.execute(
+            "SELECT * FROM reviews_in_progress WHERE pr_key = ?", (pr_key,)
+        ).fetchone()
+        if row is None:
+            # Conflict vanished between INSERT and re-SELECT — extremely
+            # unlikely, but retry once cleanly rather than raising.
+            conn.execute(
+                "INSERT INTO reviews_in_progress (pr_key, pid, hostname, started_at) "
+                "VALUES (?, ?, ?, ?)",
+                (pr_key, pid, me, started_at),
+            )
+            conn.commit()
+            return {"pr_key": pr_key, "pid": pid, "hostname": me, "started_at": started_at}
+        holder_host = row["hostname"]
+        holder_pid = int(row["pid"])
+        if holder_host == me and not _pid_alive(holder_pid):
+            conn.execute(
+                "DELETE FROM reviews_in_progress WHERE pr_key = ? AND pid = ? AND hostname = ?",
+                (pr_key, holder_pid, holder_host),
+            )
+            conn.execute(
+                "INSERT INTO reviews_in_progress (pr_key, pid, hostname, started_at) "
+                "VALUES (?, ?, ?, ?)",
+                (pr_key, pid, me, started_at),
+            )
+            conn.commit()
+        else:
+            raise ReviewInProgressError(holder_pid, holder_host, row["started_at"]) from None
+    return {"pr_key": pr_key, "pid": pid, "hostname": me, "started_at": started_at}
+
+
+def _release_in_progress(conn: sqlite3.Connection, pr_key: str) -> None:
+    """Delete our marker row. Idempotent and never raises — releasing
+    must not tank the post-review path that records the review on rc==0.
+    The `pid`/`hostname` guards prevent ever deleting a peer's row by
+    mistake (e.g. if the user forced an override and our reserve replaced
+    a peer row that itself later releases).
+    """
+    me = socket.gethostname()
+    pid = os.getpid()
+    with contextlib.suppress(sqlite3.Error):
+        conn.execute(
+            "DELETE FROM reviews_in_progress WHERE pr_key = ? AND pid = ? AND hostname = ?",
+            (pr_key, pid, me),
+        )
+        conn.commit()
+
+
+def _in_progress_age_str(started_at: str) -> str:
+    """Format an in-progress row's `started_at` as a coarse age string for
+    the warn-modal ("started 4m ago"). Falls back to the raw ISO string
+    if parsing fails (foreign-host clock skew, malformed value, etc.).
+    """
+    try:
+        dt = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+    except ValueError:
+        return started_at
+    delta = datetime.now(timezone.utc) - dt
+    secs = int(delta.total_seconds())
+    if secs < 60:
+        return f"{max(secs, 0)}s ago"
+    if secs < 3600:
+        return f"{secs // 60}m ago"
+    if secs < 86400:
+        return f"{secs // 3600}h ago"
+    return f"{secs // 86400}d ago"
+
+
+def _review_cell(
+    pr: dict[str, Any],
+    state: dict[str, dict[str, Any]],
+    in_progress: bool = False,
+) -> Text:
+    """Render the "Reviews" column cell.
+
+    Returns a Rich `Text` so styles (in-progress yellow, stale yellow)
+    ride along into the DataTable. The `in_progress` flag is set by the
+    polling loop when another `cc-pr-reviewer` instance has reserved this
+    PR for review; we prepend a `⟳` glyph and bold-yellow the cell so it
+    stands out without losing the count/stale info underneath.
+    """
     entry = state.get(_pr_key(pr))
     if not entry:
-        return "-"
-    count = entry.get("count", 0)
-    stored_updated = entry.get("last_pr_updated_at", "")
-    current_updated = pr.get("updatedAt", "")
-    stale = stored_updated and current_updated and current_updated != stored_updated
-    return f"{count} stale" if stale else str(count)
+        body = "-"
+        style = ""
+    else:
+        count = entry.get("count", 0)
+        stored_updated = entry.get("last_pr_updated_at", "")
+        current_updated = pr.get("updatedAt", "")
+        stale = stored_updated and current_updated and current_updated != stored_updated
+        body = f"{count} stale" if stale else str(count)
+        style = "yellow" if stale else ""
+    if in_progress:
+        return Text(f"⟳ {body}", style="bold yellow")
+    return Text(body, style=style)
 
 
 def _last_reviewed_cell(pr: dict[str, Any], state: dict[str, dict[str, Any]]) -> str:
@@ -942,6 +1170,61 @@ class ConfirmScreen(ModalScreen[ConfirmResult | None]):
     def action_toggle_post_inline(self) -> None:
         self.post_inline = not self.post_inline
         self.query_one("#confirm-checkbox", Label).update(self._checkbox_text())
+
+
+# --- In-progress warning modal ---------------------------------------------
+
+
+class InProgressWarnScreen(ModalScreen[bool]):
+    """Warn that another `cc-pr-reviewer` instance is already reviewing
+    this PR, and ask whether to proceed anyway.
+
+    Dismisses with `True` to override (caller should pass
+    `force_in_progress=True` into `_launch_claude`), `False` to cancel.
+    Kept distinct from `ConfirmScreen` because the intents don't overlap:
+    `ConfirmScreen` tweaks launch options after the user decided to
+    review; this screen asks whether the user wants to review at all.
+    """
+
+    BINDINGS = [
+        Binding("o", "override", "Review anyway", priority=True),
+        Binding("enter", "cancel", "Cancel", priority=True),
+        Binding("escape", "cancel", "Cancel", priority=True),
+        Binding("c", "cancel", "Cancel", priority=True, show=False),
+    ]
+
+    def __init__(self, pr_label: str, holder_pid: int, holder_host: str, age: str) -> None:
+        super().__init__()
+        self.pr_label = pr_label
+        self.holder_pid = holder_pid
+        self.holder_host = holder_host
+        self.age = age
+
+    def compose(self) -> ComposeResult:
+        title = f"⟳ {self.pr_label} is already being reviewed"
+        # Hostnames can contain `[` (rare but legal in some setups), and
+        # PID/host/age are user-facing identity strings — keep markup off
+        # for the title/body to avoid Rich parsing surprises. The hint
+        # uses markup for emphasis on the keys.
+        body = (
+            f"Another cc-pr-reviewer instance reserved this PR\n"
+            f"  pid {self.holder_pid} on {self.holder_host}, started {self.age}\n\n"
+            "Launching a second review would have both tabs fight over\n"
+            "the same `gh pr checkout --force` working tree."
+        )
+        hint = "[b]O[/] review anyway  •  [b]Enter[/] / [b]Esc[/] cancel"
+        yield Vertical(
+            Label(title, id="inprogress-title", markup=False),
+            Label(body, id="inprogress-body", markup=False),
+            Label(hint, id="inprogress-hint"),
+            id="inprogress-container",
+        )
+
+    def action_override(self) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
 
 
 # --- Filter modal ----------------------------------------------------------
@@ -1172,18 +1455,27 @@ class PRReviewer(App):
     #diff-body {
         height: auto;
     }
-    #confirm-container, #filter-container {
+    #confirm-container, #filter-container, #inprogress-container {
         border: round $primary;
         padding: 1 2;
         margin: 4 8;
         background: $panel;
         height: auto;
     }
-    #confirm-title, #filter-title {
+    #inprogress-container {
+        border: round $warning;
+    }
+    #confirm-title, #filter-title, #inprogress-title {
         text-style: bold;
         margin-bottom: 1;
     }
-    #confirm-hint, #filter-hint {
+    #inprogress-title {
+        color: $warning;
+    }
+    #inprogress-body {
+        margin-bottom: 1;
+    }
+    #confirm-hint, #filter-hint, #inprogress-hint {
         color: $text-muted;
     }
     #confirm-extra-label {
@@ -1253,6 +1545,11 @@ class PRReviewer(App):
         stored_sort = _get_setting(self.review_db, "sort_by", "")
         self.sort_by: SortBy = stored_sort if stored_sort in _SORT_CYCLE else ""
         self._row_to_pr_idx: list[int | None] = []
+        # Snapshot of `reviews_in_progress` rows from the most recent poll,
+        # keyed by `pr_key`. `_poll_in_progress` diffs against this to
+        # decide which cells need an update; `action_review` consults it
+        # to gate launches against PRs another tab is currently reviewing.
+        self._in_progress: dict[str, dict[str, Any]] = {}
         # Last mine-fetch error from `_load_prs`. Forwarded into pure
         # render-toggle calls of `_populate` so a previously-shown ERROR
         # badge isn't silently dropped when the user presses `g`.
@@ -1267,9 +1564,18 @@ class PRReviewer(App):
 
     def on_mount(self) -> None:
         table = self.query_one("#pr-table", DataTable)
-        table.add_columns(
-            "Repository", "#", "Title", "Author", "Updated", "Reviews", "Last Review", ""
-        )
+        # Explicit column keys so `_poll_in_progress` can target the
+        # "Reviews" cell via `table.update_cell(row_key, "reviews", …)`
+        # without a full _populate rebuild. Other keys stay symmetrical
+        # for free; today only "reviews" is referenced by name.
+        table.add_column("Repository", key="repo")
+        table.add_column("#", key="number")
+        table.add_column("Title", key="title")
+        table.add_column("Author", key="author")
+        table.add_column("Updated", key="updated")
+        table.add_column("Reviews", key="reviews")
+        table.add_column("Last Review", key="last_review")
+        table.add_column("", key="tags")
         # The Footer recomposes whenever the screen's active bindings change
         # (e.g. on modal push/pop), which wipes any per-FooterKey class we
         # set. Subscribing here re-applies our `-state-active` tags *after*
@@ -1288,6 +1594,11 @@ class PRReviewer(App):
         )
         self._refresh_footer_indicators()
         self.action_refresh()
+        # Cross-instance "in review" indicator. 3 s is fast enough to feel
+        # live (another tab finishing/starting a review is reflected
+        # within one tick) and cheap enough to be invisible — one small
+        # SELECT plus a bounded scan over `_row_to_pr_idx` per tick.
+        self.set_interval(3.0, self._poll_in_progress)
         if self.installed_version is None:
             # Source/editable install: nothing to compare against on PyPI, so
             # skip the worker and surface a tailored message via `u`.
@@ -1444,7 +1755,11 @@ class PRReviewer(App):
                 title,
                 author,
                 updated,
-                _review_cell(pr, self.review_state),
+                _review_cell(
+                    pr,
+                    self.review_state,
+                    in_progress=_pr_key(pr) in self._in_progress,
+                ),
                 _last_reviewed_cell(pr, self.review_state),
                 " ".join(tags),
                 key=str(i),
@@ -1611,12 +1926,42 @@ class PRReviewer(App):
         repo = pr["repository"]["nameWithOwner"]
         title = pr.get("title", "")
         prompt = f"Launch Claude Code review for {repo}#{pr['number']}?\n{title}"
+        pr_label = f"{repo}#{pr['number']}"
 
-        def _proceed(result: ConfirmResult | None) -> None:
-            if result is not None:
-                self._launch_claude(pr, result.post_inline, result.extra_prompt)
+        def _confirm(force: bool) -> None:
+            def _proceed(result: ConfirmResult | None) -> None:
+                if result is not None:
+                    self._launch_claude(
+                        pr,
+                        result.post_inline,
+                        result.extra_prompt,
+                        force_in_progress=force,
+                    )
 
-        self.push_screen(ConfirmScreen(prompt), _proceed)
+            self.push_screen(ConfirmScreen(prompt), _proceed)
+
+        # Synchronous re-poll closes the gap between the 3 s tick and a
+        # sibling tab that just started a review (otherwise we'd send the
+        # user to the launch flow only for `_reserve_in_progress` to raise).
+        self._poll_in_progress()
+        holder = self._in_progress.get(_pr_key(pr))
+        if holder is None:
+            _confirm(force=False)
+            return
+
+        def _on_warn(override: bool | None) -> None:
+            if override:
+                _confirm(force=True)
+
+        self.push_screen(
+            InProgressWarnScreen(
+                pr_label=pr_label,
+                holder_pid=int(holder["pid"]),
+                holder_host=str(holder["hostname"]),
+                age=_in_progress_age_str(str(holder["started_at"])),
+            ),
+            _on_warn,
+        )
 
     def action_toggle_mine(self) -> None:
         self.include_mine = not self.include_mine
@@ -1749,7 +2094,13 @@ class PRReviewer(App):
 
     # --- launching claude ---
 
-    def _launch_claude(self, pr: dict[str, Any], post_inline: bool, extra_prompt: str) -> None:
+    def _launch_claude(
+        self,
+        pr: dict[str, Any],
+        post_inline: bool,
+        extra_prompt: str,
+        force_in_progress: bool = False,
+    ) -> None:
         repo_full = pr["repository"]["nameWithOwner"]
         owner, name = repo_full.split("/", 1)
         number = pr["number"]
@@ -1833,26 +2184,49 @@ class PRReviewer(App):
                 hidden = len(extra_prompt) - len(shown)
                 suffix = f" (+{hidden} more chars)" if hidden else ""
                 parts.append(f"extra prompt: {shown!r}{suffix}")
-            print(f"\nLaunching Claude Code ({', '.join(parts)}) — type /exit when you're done.\n")
-            rc = subprocess.call(cmd, cwd=local_path)
-
-            # Only count this as a review if Claude exited cleanly. Ctrl-C,
-            # crashes, or a failed launch leave rc != 0; recording those
-            # would inflate the "Reviews" count and reset staleness for a
-            # PR that wasn't actually reviewed, hiding genuine drift from
-            # the next real session.
-            if rc == 0:
-                key = _pr_key(pr)
-                self.review_state[key] = _record_review(
-                    self.review_db,
-                    key,
-                    pr.get("updatedAt", ""),
-                    head_sha,
+            # Reserve before subprocess.call so peer instances can detect
+            # this review is in flight; release in `finally` so Ctrl-C,
+            # crashes, and clean exits all clean up. The reserve scope is
+            # intentionally tight (just the `claude` invocation, not the
+            # earlier clone/checkout) — those steps are fast and aren't
+            # the user-visible "in review" state we want to mark.
+            key = _pr_key(pr)
+            try:
+                _reserve_in_progress(self.review_db, key, force=force_in_progress)
+            except ReviewInProgressError as e:
+                # TOCTOU: someone else reserved between the action_review
+                # check and here. Bail out without launching `claude`.
+                print(
+                    f"\nAnother review of {repo_full}#{number} just started "
+                    f"(pid {e.pid} on {e.hostname}). Aborting — try again or "
+                    "use the override path from the warn modal.\n"
                 )
-            else:
-                print(f"\nClaude exited with status {rc}; not recording this as a review.")
+                input("Press Enter to return to the TUI…")
+                return
+            try:
+                print(
+                    f"\nLaunching Claude Code ({', '.join(parts)}) — type /exit when you're done.\n"
+                )
+                rc = subprocess.call(cmd, cwd=local_path)
 
-            input("\n── Claude session ended. Press Enter to return to the TUI ──")
+                # Only count this as a review if Claude exited cleanly.
+                # Ctrl-C, crashes, or a failed launch leave rc != 0;
+                # recording those would inflate the "Reviews" count and
+                # reset staleness for a PR that wasn't actually reviewed,
+                # hiding genuine drift from the next real session.
+                if rc == 0:
+                    self.review_state[key] = _record_review(
+                        self.review_db,
+                        key,
+                        pr.get("updatedAt", ""),
+                        head_sha,
+                    )
+                else:
+                    print(f"\nClaude exited with status {rc}; not recording this as a review.")
+
+                input("\n── Claude session ended. Press Enter to return to the TUI ──")
+            finally:
+                _release_in_progress(self.review_db, key)
 
         # Refresh in case review state changed (e.g. you approved the PR).
         self.action_refresh()
@@ -1863,6 +2237,57 @@ class PRReviewer(App):
         w = self.query_one("#status", Static)
         w.update(msg)
         w.set_class(error, "-error")
+
+    def _poll_in_progress(self) -> None:
+        """Refresh the cross-instance in-progress snapshot and repaint
+        only the cells whose state changed.
+
+        Runs on the main thread (one tiny SELECT plus a bounded scan); a
+        worker would add latency and complicate cell-update marshalling.
+        Uses `_load_in_progress` which sweeps stale own-host rows in
+        place, so a peer that crashed mid-review is cleaned up here too.
+        """
+        try:
+            new = _load_in_progress(self.review_db)
+        except sqlite3.Error as e:
+            # Polling failure shouldn't tear down the TUI — surface once
+            # via status and try again on the next tick. Don't keep
+            # `self._in_progress` stale on persistent errors: clear it so
+            # the indicator doesn't lie about a peer that may have ended.
+            self._set_status(f"In-progress poll failed: {e}", error=True)
+            return
+        prev = self._in_progress
+        if new == prev:
+            return
+        affected = set(new) ^ set(prev)
+        self._in_progress = new
+        if not affected:
+            return
+        try:
+            table = self.query_one("#pr-table", DataTable)
+        except Exception:  # noqa: BLE001 — table not yet mounted, nothing to repaint.
+            return
+        # Map pr_key → index in self.prs once, so we can update cells
+        # without an O(N*M) scan when many PRs change state at once.
+        key_to_idx: dict[str, int] = {}
+        for i, pr in enumerate(self.prs):
+            key_to_idx[_pr_key(pr)] = i
+        for key in affected:
+            idx = key_to_idx.get(key)
+            if idx is None:
+                # PR isn't currently rendered (filtered out, scrolled to
+                # a different view, etc.). Nothing to repaint; the
+                # snapshot still tracks it for `action_review`'s gate.
+                continue
+            pr = self.prs[idx]
+            try:
+                table.update_cell(
+                    str(idx),
+                    "reviews",
+                    _review_cell(pr, self.review_state, in_progress=key in new),
+                )
+            except Exception:  # noqa: BLE001 — row gone (filter race); skip.
+                continue
 
     @work(thread=True, exclusive=True)
     def _check_for_update(self) -> None:
