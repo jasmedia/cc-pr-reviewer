@@ -9,29 +9,38 @@ prompts as files).
 the plugin version as `unknown`, so the only way to detect upstream
 drift is by content diff. This script normalises each upstream file
 (strips the YAML frontmatter and any `## When to invoke` section — the
-two structural strips we always apply when bundling), then diffs the
-normalised upstream against the bundled version.
+two structural strips we always apply when bundling), then compares
+against two reference points:
 
-What's left in the diff is a mix of:
+  1. The **baseline snapshot** (`scripts/upstream_baseline/*.md`) — a
+     committed copy of the normalised upstream as of the last sync.
+     Diffing current upstream against this catches **upstream changes**
+     in isolation (no adaptation noise).
+  2. The **bundled file** (`cc_pr_reviewer/pr_review_agents/*.md`) —
+     diffing current upstream against this shows the full gap
+     (upstream changes + our prose adaptations).
 
-  * our prose adaptations (CLAUDE.md → CLAUDE.md/AGENTS.md, PR-focused
-    scope phrasing, project-specific logging refs softened, etc.) —
-    present every run, and
-  * any genuine upstream changes — what you actually want to triage and
-    bring across.
+The baseline is the load-bearing piece: it converts a per-run "did the
+line counts grow?" eyeball check into a zero-effort "UPSTREAM CHANGED"
+signal that's reliable across machines and contributors.
 
-The persistent-adaptation diff acts as a baseline; when its line-count
-goes up between runs, that's the signal upstream changed.
+Typical workflows:
 
-Usage:
+    # Daily / weekly drift check (auto-runs the plugin updater first).
+    uv run python scripts/sync_pr_review_agents.py --update-plugin
 
-    uv run python scripts/sync_pr_review_agents.py           # one-line per file
-    uv run python scripts/sync_pr_review_agents.py --diff    # full unified diff
-    uv run python scripts/sync_pr_review_agents.py --write   # overwrite bundled
-                                                             # with normalised
-                                                             # upstream (destructive
-                                                             # — review via git diff)
-    uv run python scripts/sync_pr_review_agents.py --upstream <dir>
+    # If upstream changed, inspect what's new.
+    uv run python scripts/sync_pr_review_agents.py --diff
+
+    # Triage upstream changes into the bundled files, then lock in the
+    # new upstream state as the new baseline.
+    uv run python scripts/sync_pr_review_agents.py --save-baseline
+
+Reset-and-re-adapt escape hatch (rare):
+
+    # Overwrite bundled with normalised upstream, discarding our
+    # adaptations. Review via `git diff` and re-apply manually.
+    uv run python scripts/sync_pr_review_agents.py --write
 """
 
 from __future__ import annotations
@@ -39,6 +48,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -49,6 +59,18 @@ DEFAULT_UPSTREAM = (
     / ".claude/plugins/marketplaces/claude-plugins-official"
     / "plugins/pr-review-toolkit/agents"
 )
+
+# Baseline lives next to this script (outside the wheel package — see
+# `pyproject.toml`'s `packages = ["cc_pr_reviewer"]`, which scopes
+# distribution to that dir). Committing the baseline means a fresh
+# clone already has a reference point — contributors don't need to
+# bootstrap one per machine.
+BASELINE_DIR = Path(__file__).resolve().parent / "upstream_baseline"
+
+# Plugin ID format the marketplace uses for `claude plugin update`.
+# Surfaces as a single constant so the docstring, the error message,
+# and the actual subprocess call can't drift apart.
+PLUGIN_ID = "pr-review-toolkit@claude-plugins-official"
 
 # YAML frontmatter at the very top: `---` line, body (non-greedy), `---`
 # line, trailing newlines. Anchored to the file start so a stray `---`
@@ -83,6 +105,64 @@ def normalise_upstream(text: str) -> str:
     return text
 
 
+def _run_plugin_update() -> None:
+    """Invoke `claude plugin update` so the local upstream files are fresh.
+
+    Failures are warned but non-fatal: the plugin may already be at the
+    latest version (claude reports rc=0), the user may be offline, or
+    `claude` may not be on PATH. In every case we still want the rest
+    of the script to run against whatever upstream content is present —
+    so a missing-binary or network error becomes a stderr warning, not
+    a hard exit.
+    """
+    # `flush=True` so the heading appears above claude's own stdout when
+    # both share a TTY; without it Python's buffered stdout flushes only
+    # at exit and the heading prints out-of-order under the subprocess.
+    print(f"running `claude plugin update {PLUGIN_ID}`…", flush=True)
+    try:
+        rc = subprocess.call(["claude", "plugin", "update", PLUGIN_ID])
+    except FileNotFoundError:
+        print(
+            "warning: `claude` not on PATH; skipping plugin update "
+            "and continuing with the current upstream content",
+            file=sys.stderr,
+        )
+        return
+    if rc != 0:
+        print(
+            f"warning: `claude plugin update {PLUGIN_ID}` exited with status "
+            f"{rc}; continuing with the current upstream content",
+            file=sys.stderr,
+        )
+
+
+def _save_baseline(args: argparse.Namespace) -> int:
+    """Write current normalised upstream into the baseline snapshot dir.
+
+    Used both for first-time setup and post-triage refresh — the two
+    are functionally identical (overwrite whatever's there with the
+    current upstream), only the intent differs. One flag covers both.
+    """
+    BASELINE_DIR.mkdir(parents=True, exist_ok=True)
+    wrote = skipped = 0
+    for name in REVIEW_AGENT_FILES:
+        upstream_path = args.upstream / name
+        if not upstream_path.is_file():
+            print(f"  SKIP (no upstream)  {name}", file=sys.stderr)
+            skipped += 1
+            continue
+        normalised = normalise_upstream(upstream_path.read_text())
+        (BASELINE_DIR / name).write_text(normalised)
+        print(f"  captured            {name}")
+        wrote += 1
+    print()
+    print(f"wrote {wrote} baseline snapshots to {BASELINE_DIR}")
+    if skipped:
+        print(f"{skipped} skipped due to missing upstream — re-run after fixing the upstream dir")
+    print("commit them so future runs can detect upstream drift")
+    return 1 if skipped else 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__.split("\n\n")[0],
@@ -110,19 +190,56 @@ def main() -> int:
             "adaptations manually before committing."
         ),
     )
+    parser.add_argument(
+        "--save-baseline",
+        action="store_true",
+        help=(
+            "capture the current normalised upstream as the baseline "
+            "snapshot in scripts/upstream_baseline/. Run once after first "
+            "sync, then again whenever you've triaged upstream changes "
+            "and want to lock in the new upstream state as the new "
+            "reference point."
+        ),
+    )
+    parser.add_argument(
+        "--update-plugin",
+        action="store_true",
+        help=(
+            f"run `claude plugin update {PLUGIN_ID}` before the comparison. "
+            "One-stop command for the daily drift check."
+        ),
+    )
     args = parser.parse_args()
+
+    # `--save-baseline` and `--write` both mutate filesystem state but
+    # touch different trees; running them together is almost always a
+    # mistake (you'd snapshot upstream AND blow away the bundled
+    # adaptations in the same breath). Refuse the combo loudly.
+    if args.save_baseline and args.write:
+        parser.error("--save-baseline and --write can't be combined")
+
+    if args.update_plugin:
+        _run_plugin_update()
+        print()
 
     if not args.upstream.is_dir():
         print(f"error: upstream agents dir not found: {args.upstream}", file=sys.stderr)
         print(
-            "       run `claude plugin update "
-            "pr-review-toolkit@claude-plugins-official` or pass --upstream <dir>",
+            f"       run `claude plugin update {PLUGIN_ID}` or pass --upstream <dir>",
             file=sys.stderr,
         )
         return 2
 
+    if args.save_baseline:
+        return _save_baseline(args)
+
     local_dir = _review_agents_dir()
+    baseline_exists = BASELINE_DIR.is_dir() and all(
+        (BASELINE_DIR / name).is_file() for name in REVIEW_AGENT_FILES
+    )
+
     in_sync = drifted = rewrote = missing = 0
+    upstream_changed: list[tuple[str, str, str]] = []  # (name, baseline_text, normalised)
 
     for name in REVIEW_AGENT_FILES:
         upstream_path = args.upstream / name
@@ -139,6 +256,15 @@ def main() -> int:
 
         normalised = normalise_upstream(upstream_path.read_text())
         local = local_path.read_text()
+
+        # Upstream-vs-baseline check — the load-bearing automation: when
+        # this trips, the maintainer has actual work to do. The
+        # upstream-vs-bundled "drift" reading below is informational
+        # (mostly the persistent adaptation noise).
+        if baseline_exists:
+            baseline_text = (BASELINE_DIR / name).read_text()
+            if normalised != baseline_text:
+                upstream_changed.append((name, baseline_text, normalised))
 
         if normalised == local:
             print(f"  in sync           {name}")
@@ -184,25 +310,82 @@ def main() -> int:
     # worth a human deciding whether to bundle.
     bundled_names = set(REVIEW_AGENT_FILES)
     extras = sorted(p.name for p in args.upstream.glob("*.md") if p.name not in bundled_names)
-    if extras:
-        print()
-        print("upstream has agents not in our manifest (new since fork?):")
-        for name in extras:
-            print(f"  + {name}")
+
+    # ---- final report ----
 
     print()
     parts = [f"{in_sync} in sync", f"{drifted} drifted", f"{missing} missing"]
     if args.write:
         parts.insert(2, f"{rewrote} rewrote")
     print(f"summary: {', '.join(parts)}")
-    if drifted and not args.diff:
-        print("re-run with --diff to see the changes")
+
+    if extras:
+        print()
+        print("upstream has agents not in our manifest (new since fork?):")
+        for name in extras:
+            print(f"  + {name}")
+
+    if not baseline_exists:
+        print()
+        print(f"!  no upstream baseline at {BASELINE_DIR}")
+        print("   run `--save-baseline` once to capture the current upstream as the reference")
+    elif upstream_changed:
+        print()
+        print(f"!! UPSTREAM CHANGED since baseline ({len(upstream_changed)} file(s)):")
+        for name, baseline_text, normalised in upstream_changed:
+            baseline_lines = baseline_text.splitlines(keepends=True)
+            current_lines = normalised.splitlines(keepends=True)
+            upstream_diff = list(
+                difflib.unified_diff(
+                    baseline_lines,
+                    current_lines,
+                    fromfile=f"baseline/{name}",
+                    tofile=f"upstream(normalised)/{name}",
+                    n=3,
+                )
+            )
+            delta = sum(
+                1
+                for ln in upstream_diff
+                if ln.startswith(("+", "-")) and not ln.startswith(("+++", "---"))
+            )
+            print(f"   ! {name} ({delta} lines changed upstream)")
+        print()
+        print("   triage the upstream changes into the bundled files, then run")
+        print("   `--save-baseline` to lock in the new upstream state as the new reference.")
+        if not args.diff:
+            print("   re-run with --diff to inspect the upstream changes inline.")
+        else:
+            print()
+            for _name, baseline_text, normalised in upstream_changed:
+                baseline_lines = baseline_text.splitlines(keepends=True)
+                current_lines = normalised.splitlines(keepends=True)
+                sys.stdout.writelines(
+                    difflib.unified_diff(
+                        baseline_lines,
+                        current_lines,
+                        fromfile=f"baseline/{_name}",
+                        tofile=f"upstream(normalised)/{_name}",
+                        n=3,
+                    )
+                )
+                print()
+    else:
+        print("upstream unchanged since baseline")
+
+    if drifted and not args.diff and not upstream_changed:
+        # Only nudge about --diff for the bundled-vs-upstream view when
+        # there's no louder upstream-changed message above; otherwise
+        # we'd double-suggest --diff and confuse what it should show.
+        print("re-run with --diff to see how bundled differs from upstream (mostly adaptations)")
     if rewrote:
         print(
             "review the overwrites with `git diff cc_pr_reviewer/pr_review_agents/` "
             "and re-apply adaptations before committing"
         )
-    return 1 if (drifted or missing or extras) else 0
+
+    needs_action = upstream_changed or missing or extras or not baseline_exists
+    return 1 if needs_action else 0
 
 
 if __name__ == "__main__":
