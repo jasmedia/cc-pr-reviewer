@@ -9,20 +9,20 @@ This project uses [uv](https://docs.astral.sh/uv/) for dependency/venv managemen
 ```sh
 uv sync                       # install deps (only runtime dep: textual>=0.60)
 uv run cc-pr-reviewer         # run the TUI
-uv run python cc_pr_reviewer.py   # equivalent direct invocation
 uv add <pkg>                  # add a new dependency
 uv run ruff check .           # lint
 uv run ruff format .          # format
 uv run pytest                 # run unit tests (pytest -k <name> for one)
 uv run pre-commit install     # install git hook
 uv run pre-commit run --all-files  # run hooks ad-hoc
+uv run python scripts/sync_pr_review_agents.py    # diff bundled review agents vs upstream Claude plugin
 ```
 
-Ruff is the sole linter/formatter (configured in `pyproject.toml`); pre-commit runs it via `astral-sh/ruff-pre-commit`. Tests in `tests/` cover only the I/O-free helpers — prompt-suffix gating, semver compare, staleness rendering, comment formatting; TUI/subprocess/`gh` flows need integration testing. Build backend is `hatchling`, packaging `cc_pr_reviewer.py` as a single-module wheel.
+Ruff is the sole linter/formatter (configured in `pyproject.toml`); pre-commit runs it via `astral-sh/ruff-pre-commit`. Tests in `tests/` cover only the I/O-free helpers — prompt-suffix gating, semver compare, staleness rendering, comment formatting; TUI/subprocess/`gh` flows need integration testing. Build backend is `hatchling`, packaging the `cc_pr_reviewer/` directory (single module `__init__.py` plus the bundled `pr_review_agents/*.md` files).
 
 ## Architecture
 
-Single-file Textual TUI (`cc_pr_reviewer.py`) that orchestrates external CLIs rather than talking to any API directly. Three layers matter:
+Single-module Textual TUI (`cc_pr_reviewer/__init__.py`) that orchestrates external CLIs rather than talking to any API directly. Three layers matter:
 
 1. **Data source — `gh` CLI.** `fetch_review_prs()` shells out to `gh search prs --review-requested=@me --state=open --json …`. With the `m` toggle on, `fetch_my_prs()` runs as a *second, independent* fetch merged into the same list (rows tagged `_mine=True`); a failure there surfaces as a separate warning rather than dropping the primary list. Auth/pagination/rate-limiting all piggyback on `gh api`/`gh api graphql` — the app never hits the GitHub API directly.
 

@@ -65,8 +65,6 @@ cc-pr-reviewer
 ```sh
 uv sync
 uv run cc-pr-reviewer
-# or
-uv run python cc_pr_reviewer.py
 ```
 
 ## Configuration
