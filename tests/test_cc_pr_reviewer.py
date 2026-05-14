@@ -28,9 +28,12 @@ from cc_pr_reviewer import (
     POST_INLINE_REREVIEW_RESOLVE_SUFFIX,
     POST_INLINE_REREVIEW_SUFFIX,
     PROMPT_SECTION_SEP,
-    REVIEW_PROMPT,
+    REVIEW_AGENT_FILES,
+    REVIEW_PROMPT_CLAUDE,
+    REVIEW_PROMPT_FILE_BASED,
     InProgressHolder,
     ReviewInProgressError,
+    _build_cli_command,
     _in_progress_age_str,
     _is_newer,
     _load_in_progress,
@@ -39,6 +42,7 @@ from cc_pr_reviewer import (
     _pid_alive,
     _release_in_progress,
     _reserve_in_progress,
+    _review_agents_dir,
     _review_cell,
     build_review_prompt,
     format_existing_comments,
@@ -60,8 +64,21 @@ def _comment(login: str, **overrides: Any) -> dict[str, Any]:
     return base
 
 
-def test_plain_review_equals_base_prompt() -> None:
-    """post_inline=False with no extras returns REVIEW_PROMPT verbatim."""
+@pytest.mark.parametrize(
+    ("cli", "expected_base"),
+    [
+        ("claude", REVIEW_PROMPT_CLAUDE),
+        ("codex", REVIEW_PROMPT_FILE_BASED),
+        ("gemini", REVIEW_PROMPT_FILE_BASED),
+    ],
+)
+def test_plain_review_equals_base_prompt(cli: str, expected_base: str) -> None:
+    """post_inline=False with no extras returns the CLI's base prompt verbatim.
+
+    Claude uses the plugin-driven REVIEW_PROMPT_CLAUDE; codex and gemini
+    share REVIEW_PROMPT_FILE_BASED (they have no plugin marketplace, so
+    they reference the bundled agent .md files instead).
+    """
     built = build_review_prompt(
         post_inline=False,
         extra_prompt="",
@@ -69,8 +86,9 @@ def test_plain_review_equals_base_prompt() -> None:
         fetch_ok=True,
         my_login="alice",
         author_login="bob",
+        cli=cli,
     )
-    assert built.text == REVIEW_PROMPT
+    assert built.text == expected_base
     assert not built.rereview
     assert built.existing_shown == 0
     assert built.existing_total == 0
@@ -156,12 +174,23 @@ def test_my_comment_on_others_pr_triggers_full_rereview_chain() -> None:
     assert POST_INLINE_REREVIEW_RESOLVE_SUFFIX in built.text
 
 
-def test_full_chain_assembles_in_canonical_order() -> None:
+@pytest.mark.parametrize(
+    ("cli", "expected_base"),
+    [
+        ("claude", REVIEW_PROMPT_CLAUDE),
+        ("codex", REVIEW_PROMPT_FILE_BASED),
+        ("gemini", REVIEW_PROMPT_FILE_BASED),
+    ],
+)
+def test_full_chain_assembles_in_canonical_order(cli: str, expected_base: str) -> None:
     """Lock the canonical assembly for a representative non-trivial
     composition. The other tests use `in`/`not in` against `built.text`
     and would let through regressions that swap `PROMPT_SECTION_SEP`
     for `\\n`, duplicate a section, or reorder sections — exactly the
-    kind of bug suffix-matrix changes are most likely to introduce."""
+    kind of bug suffix-matrix changes are most likely to introduce.
+    Parameterised over CLI so a future refactor can't accidentally
+    branch the suffix matrix on CLI choice (the suffixes are gh-CLI
+    instructions, not coding-agent-specific)."""
     existing = [_comment("alice")]
     built = build_review_prompt(
         post_inline=True,
@@ -170,10 +199,11 @@ def test_full_chain_assembles_in_canonical_order() -> None:
         fetch_ok=True,
         my_login="alice",
         author_login="bob",
+        cli=cli,
     )
     expected = PROMPT_SECTION_SEP.join(
         [
-            REVIEW_PROMPT,
+            expected_base,
             "Additional instructions from reviewer:\nx",
             format_existing_comments(existing)[0],
             POST_INLINE_PROMPT
@@ -253,6 +283,105 @@ def test_my_login_none_never_triggers_rereview() -> None:
     assert POST_INLINE_REREVIEW_SUFFIX not in built.text
     assert POST_INLINE_REREVIEW_APPROVE_SUFFIX not in built.text
     assert POST_INLINE_REREVIEW_RESOLVE_SUFFIX not in built.text
+
+
+# --- File-based prompt (codex / gemini share this) -------------------------
+
+
+def test_file_based_prompt_references_all_bundled_agent_paths() -> None:
+    """The codex/gemini prompt instructs the CLI to read every bundled
+    agent file. If a file is added to REVIEW_AGENT_FILES but
+    `_build_file_based_prompt` doesn't pick it up, codex/gemini would
+    silently skip that review dimension — catch the drift here."""
+    agents_dir = _review_agents_dir()
+    for name in REVIEW_AGENT_FILES:
+        assert str(agents_dir / name) in REVIEW_PROMPT_FILE_BASED
+
+
+def test_file_based_prompt_does_not_name_pr_review_toolkit() -> None:
+    """The PR Review Toolkit is a Claude-plugin concept. Codex and gemini
+    have no plugin marketplace, so the file-based prompt must NOT mention
+    it — doing so would invite the CLI to fail-search for a plugin that
+    doesn't exist in its environment."""
+    assert "PR Review Toolkit" not in REVIEW_PROMPT_FILE_BASED
+
+
+def test_codex_and_gemini_share_byte_identical_base_prompt() -> None:
+    """Codex and gemini both consume REVIEW_PROMPT_FILE_BASED unchanged.
+    If they ever need to diverge, splitting them is a deliberate change
+    — this test makes that intent explicit."""
+    codex = build_review_prompt(
+        post_inline=False,
+        extra_prompt="",
+        existing=[],
+        fetch_ok=True,
+        my_login=None,
+        author_login=None,
+        cli="codex",
+    )
+    gemini = build_review_prompt(
+        post_inline=False,
+        extra_prompt="",
+        existing=[],
+        fetch_ok=True,
+        my_login=None,
+        author_login=None,
+        cli="gemini",
+    )
+    assert codex.text == gemini.text
+
+
+def test_bundled_agent_files_exist_on_disk() -> None:
+    """REVIEW_AGENT_FILES is the manifest used by the codex/gemini prompt;
+    any name listed there must actually exist in the package data dir, or
+    codex/gemini will be told to read a path that 404s. This guards both
+    against typo drift in the manifest and packaging regressions that
+    drop the codex_agents/ directory from the wheel."""
+    agents_dir = _review_agents_dir()
+    for name in REVIEW_AGENT_FILES:
+        assert (agents_dir / name).is_file(), f"missing bundled agent file: {name}"
+
+
+# --- _build_cli_command ----------------------------------------------------
+
+
+def test_build_cli_command_claude_uses_accept_edits() -> None:
+    """The Claude flag set is unchanged from the original launcher — keep
+    the test explicit so a future flag rename doesn't slip through."""
+    cmd = _build_cli_command("claude", "prompt body")
+    assert cmd == ["claude", "--permission-mode", "acceptEdits", "prompt body"]
+
+
+def test_build_cli_command_codex_uses_sandbox_workspace_write() -> None:
+    """Codex picks `--ask-for-approval never --sandbox workspace-write` —
+    auto-approve edits inside the workspace, no broader host access. The
+    more permissive `--yolo` is deliberately not used (would shift
+    sandbox posture vs Claude)."""
+    cmd = _build_cli_command("codex", "prompt body")
+    assert cmd == [
+        "codex",
+        "--ask-for-approval",
+        "never",
+        "--sandbox",
+        "workspace-write",
+        "prompt body",
+    ]
+
+
+def test_build_cli_command_gemini_uses_auto_edit_approval_mode() -> None:
+    """Gemini's `--approval-mode auto_edit` is the documented analogue of
+    Claude's `acceptEdits`. The deprecated `--yolo` / `-y` flag is
+    intentionally avoided in favour of the modern equivalent."""
+    cmd = _build_cli_command("gemini", "prompt body")
+    assert cmd == ["gemini", "--approval-mode", "auto_edit", "prompt body"]
+
+
+def test_build_cli_command_rejects_unknown_cli() -> None:
+    """Defensive: CliChoice is a Literal, so this branch should never run
+    in well-typed code. If someone widens the type without updating the
+    switch, fail loud rather than emit a mystery argv."""
+    with pytest.raises(ValueError, match="unknown CLI choice"):
+        _build_cli_command("nonsense", "prompt body")  # type: ignore[arg-type]
 
 
 # --- _parse_semver / _is_newer ---------------------------------------------
