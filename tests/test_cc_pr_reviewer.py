@@ -336,7 +336,7 @@ def test_bundled_agent_files_exist_on_disk() -> None:
     any name listed there must actually exist in the package data dir, or
     codex/gemini will be told to read a path that 404s. This guards both
     against typo drift in the manifest and packaging regressions that
-    drop the codex_agents/ directory from the wheel."""
+    drop the pr_review_agents/ directory from the wheel."""
     agents_dir = _review_agents_dir()
     for name in REVIEW_AGENT_FILES:
         assert (agents_dir / name).is_file(), f"missing bundled agent file: {name}"

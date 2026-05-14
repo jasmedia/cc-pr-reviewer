@@ -89,7 +89,7 @@ REVIEW_PROMPT_CLAUDE = (
 )
 
 # Codex and Gemini don't have a plugin marketplace, so the six toolkit
-# agents ship as bundled Markdown files (see `cc_pr_reviewer/codex_agents/`).
+# agents ship as bundled Markdown files (see `cc_pr_reviewer/pr_review_agents/`).
 # The order here is the order Codex/Gemini will be asked to apply them —
 # code-reviewer first sets project-guideline context, then the targeted
 # checks (silent failures, type design, tests), then the cleanup-oriented
@@ -116,7 +116,7 @@ def _review_agents_dir() -> Path:
     `gemini`), not by Python — so we always need a filesystem path, not
     a `Traversable`.
     """
-    return Path(__file__).parent / "codex_agents"
+    return Path(__file__).parent / "pr_review_agents"
 
 
 def _build_file_based_prompt() -> str:
