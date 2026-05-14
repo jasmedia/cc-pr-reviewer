@@ -27,6 +27,10 @@ Usage:
 
     uv run python scripts/sync_pr_review_agents.py           # one-line per file
     uv run python scripts/sync_pr_review_agents.py --diff    # full unified diff
+    uv run python scripts/sync_pr_review_agents.py --write   # overwrite bundled
+                                                             # with normalised
+                                                             # upstream (destructive
+                                                             # — review via git diff)
     uv run python scripts/sync_pr_review_agents.py --upstream <dir>
 """
 
@@ -95,6 +99,17 @@ def main() -> int:
         action="store_true",
         help="print the full unified diff for each drifted file",
     )
+    parser.add_argument(
+        "--write",
+        action="store_true",
+        help=(
+            "DESTRUCTIVE: overwrite each drifted bundled file with the "
+            "normalised upstream content, discarding our prose adaptations. "
+            "Intended as a 'reset and re-adapt' escape hatch for big "
+            "upstream rewrites — review with `git diff` and re-apply "
+            "adaptations manually before committing."
+        ),
+    )
     args = parser.parse_args()
 
     if not args.upstream.is_dir():
@@ -107,7 +122,7 @@ def main() -> int:
         return 2
 
     local_dir = _review_agents_dir()
-    in_sync = drifted = missing = 0
+    in_sync = drifted = rewrote = missing = 0
 
     for name in REVIEW_AGENT_FILES:
         upstream_path = args.upstream / name
@@ -128,6 +143,17 @@ def main() -> int:
         if normalised == local:
             print(f"  in sync           {name}")
             in_sync += 1
+            continue
+
+        # `--write` mode overwrites with the normalised upstream and skips
+        # the inline diff (the user reviews via `git diff`, which gives
+        # better tooling — coloured output, per-hunk staging, undo via
+        # `git checkout --`). Counts as "rewrote", not "drift", so the
+        # final summary reflects post-write state.
+        if args.write:
+            local_path.write_text(normalised)
+            print(f"  rewrote           {name}")
+            rewrote += 1
             continue
 
         diff_lines = list(
@@ -165,9 +191,17 @@ def main() -> int:
             print(f"  + {name}")
 
     print()
-    print(f"summary: {in_sync} in sync, {drifted} drifted, {missing} missing")
+    parts = [f"{in_sync} in sync", f"{drifted} drifted", f"{missing} missing"]
+    if args.write:
+        parts.insert(2, f"{rewrote} rewrote")
+    print(f"summary: {', '.join(parts)}")
     if drifted and not args.diff:
         print("re-run with --diff to see the changes")
+    if rewrote:
+        print(
+            "review the overwrites with `git diff cc_pr_reviewer/pr_review_agents/` "
+            "and re-apply adaptations before committing"
+        )
     return 1 if (drifted or missing or extras) else 0
 
 
