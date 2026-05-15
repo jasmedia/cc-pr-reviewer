@@ -13,6 +13,7 @@ import re
 import socket
 import sqlite3
 import sys
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -462,6 +463,52 @@ def test_cleanup_preserves_preexisting_agents_dir(tmp_path: Any) -> None:
     for name in REVIEW_SKILLS:
         assert not (tmp_path / ".agents" / "skills" / name).exists()
     assert user_skill.is_file()
+
+
+def test_materialise_raises_clear_error_when_copy_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A partial-materialise failure (disk full, perms, read-only FS)
+    must surface with the offending skill name in the message —
+    a bare `shutil` traceback at line N gives the user no idea which
+    of the six writes failed."""
+
+    def fail_copy(*_a: Any, **_kw: Any) -> None:
+        raise OSError("simulated disk full")
+
+    monkeypatch.setattr(_mod.shutil, "copy2", fail_copy)
+    with pytest.raises(RuntimeError, match=r"failed to materialise skill '.*'"):
+        _materialise_skills(tmp_path)
+
+
+# --- check_prereqs malformed-skill detection -------------------------------
+
+
+def test_check_prereqs_flags_malformed_skill_md(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A SKILL.md present-but-malformed (empty file, missing frontmatter,
+    half-extracted wheel) would pass an `is_file()` check and only fail
+    later as a 'skill not found' from codex/gemini mid-review. The
+    head-bytes shape check in `check_prereqs` keeps that failure in the
+    same `problems` flow as missing files."""
+    _stub_prereq_deps(monkeypatch, installed=("codex",), persisted="codex")
+    for name in REVIEW_SKILLS:
+        (tmp_path / name).mkdir()
+        if name == REVIEW_SKILLS[0]:
+            # First skill: empty file — passes is_file() but has no frontmatter.
+            (tmp_path / name / SKILL_FILE_NAME).write_text("", encoding="utf-8")
+        else:
+            (tmp_path / name / SKILL_FILE_NAME).write_text(
+                f"---\nname: {name}\ndescription: x\n---\n\nbody\n",
+                encoding="utf-8",
+            )
+    monkeypatch.setattr(_mod, "_skills_dir", lambda: tmp_path)
+
+    problems = check_prereqs()
+    assert any("malformed" in p and REVIEW_SKILLS[0] in p for p in problems), (
+        f"expected malformed-skill problem mentioning {REVIEW_SKILLS[0]!r}, got {problems!r}"
+    )
 
 
 # --- _build_cli_command ----------------------------------------------------

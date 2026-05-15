@@ -132,8 +132,44 @@ def strip_bundled_frontmatter(text: str) -> str:
     comparison we strip the Skills frontmatter off the bundled side
     too — same regex as the upstream stripper, since the syntax
     (`---\\n...\\n---\\n`) is identical.
+
+    Raises `ValueError` if the bundled file is missing the required
+    frontmatter. The script is a maintainer-only check and a missing
+    block almost always means a defective bundled SKILL.md (bad merge,
+    accidental overwrite, or a `--write` reset that lost the block) —
+    silently returning the body unchanged would let that defect pass
+    the upstream-drift check as "in sync" and ship a SKILL.md that
+    Codex/Gemini can't discover at runtime.
     """
+    if not _FRONTMATTER_RE.match(text):
+        raise ValueError(
+            "bundled SKILL.md is missing the required Codex/Gemini "
+            "Skills frontmatter (`---\\nname: …\\ndescription: …\\n---`)"
+        )
     return _FRONTMATTER_RE.sub("", text)
+
+
+def compose_with_existing_frontmatter(local_full: str, normalised_body: str) -> str:
+    """Build a SKILL.md that keeps the local frontmatter and uses a fresh body.
+
+    Used by `--write` to reset the prose to current normalised upstream
+    while preserving our hand-written `name:` / `description:` block.
+    Extracted so the composition can be unit-tested in isolation —
+    the previous inline implementation silently emitted a SKILL.md
+    with NO frontmatter on the `else` path, with no test coverage.
+
+    Caller is responsible for raising on a missing frontmatter (which
+    indicates a defective bundled file — same condition that makes
+    `strip_bundled_frontmatter` raise).
+    """
+    frontmatter_match = _FRONTMATTER_RE.match(local_full)
+    if not frontmatter_match:
+        raise ValueError(
+            "bundled SKILL.md is missing the required Codex/Gemini "
+            "Skills frontmatter — `--write` cannot preserve a block "
+            "that isn't there"
+        )
+    return frontmatter_match.group(0) + normalised_body
 
 
 def _run_plugin_update() -> None:
@@ -317,9 +353,10 @@ def main() -> int:
         # "rewrote", not "drift", so the final summary reflects post-write
         # state.
         if args.write:
-            frontmatter_match = _FRONTMATTER_RE.match(local_full)
-            frontmatter = frontmatter_match.group(0) if frontmatter_match else ""
-            local_path.write_text(frontmatter + normalised, encoding="utf-8")
+            local_path.write_text(
+                compose_with_existing_frontmatter(local_full, normalised),
+                encoding="utf-8",
+            )
             print(f"  rewrote           {name}")
             rewrote += 1
             continue

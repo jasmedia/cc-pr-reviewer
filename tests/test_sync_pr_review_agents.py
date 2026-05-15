@@ -11,8 +11,13 @@ The script is imported via the `pythonpath = ["scripts"]` setting in
 
 from __future__ import annotations
 
+import pytest
 import sync_pr_review_agents as sync
-from sync_pr_review_agents import normalise_upstream, strip_bundled_frontmatter
+from sync_pr_review_agents import (
+    compose_with_existing_frontmatter,
+    normalise_upstream,
+    strip_bundled_frontmatter,
+)
 
 # --- normalise_upstream ----------------------------------------------------
 
@@ -182,10 +187,36 @@ def test_strip_bundled_frontmatter_removes_skills_frontmatter() -> None:
     assert out.startswith("# Code Reviewer")
 
 
-def test_strip_bundled_frontmatter_is_noop_when_absent() -> None:
-    """If a bundled SKILL.md somehow loses its frontmatter (broken
-    write, missed edit), the stripper must round-trip unchanged so the
-    sync diff surfaces it as drift rather than silently mangling the
-    file."""
+def test_strip_bundled_frontmatter_raises_when_absent() -> None:
+    """A bundled SKILL.md without our injected frontmatter is a defect
+    (bad merge, accidental overwrite, `--write` reset that lost the
+    block). Silently returning the body unchanged would let the
+    upstream-drift check report 'in sync' on a SKILL.md that Codex/
+    Gemini can't discover at runtime — fail loud instead."""
     text = "# Code Reviewer\n\nProse body.\n"
-    assert strip_bundled_frontmatter(text) == text
+    with pytest.raises(ValueError, match="missing the required Codex/Gemini"):
+        strip_bundled_frontmatter(text)
+
+
+# --- compose_with_existing_frontmatter -------------------------------------
+
+
+def test_compose_preserves_local_frontmatter_with_fresh_body() -> None:
+    """`--write` extracts the hand-written `name:`/`description:` block
+    from the existing SKILL.md and prepends it to the normalised
+    upstream body. Lock the composition so a refactor can't silently
+    emit a SKILL.md with no frontmatter."""
+    local = "---\nname: code-reviewer\ndescription: Reviews PR diffs.\n---\n\nOld body.\n"
+    new_body = "# Fresh\n\nNew body from normalised upstream.\n"
+    out = compose_with_existing_frontmatter(local, new_body)
+    assert out.startswith("---\nname: code-reviewer\ndescription: Reviews PR diffs.\n---\n")
+    assert "Old body." not in out
+    assert "New body from normalised upstream." in out
+
+
+def test_compose_raises_when_local_has_no_frontmatter() -> None:
+    """If the existing SKILL.md is already defective (no frontmatter),
+    `--write` has nothing to preserve. Refuse rather than silently
+    emit a frontmatter-less SKILL.md."""
+    with pytest.raises(ValueError, match="cannot preserve a block that isn't there"):
+        compose_with_existing_frontmatter("# No frontmatter\n", "body\n")

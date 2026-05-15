@@ -147,15 +147,18 @@ gh pr checkout <N> --force
 
 The exact CLI invocation depends on which backend is active:
 
-| CLI    | Command                                                                 |
-| ------ | ----------------------------------------------------------------------- |
-| Claude | `claude --permission-mode acceptEdits "<prompt>"`                       |
-| Codex  | `codex --ask-for-approval never --sandbox workspace-write "<prompt>"`   |
-| Gemini | `gemini --approval-mode auto_edit "<prompt>"`                           |
+| CLI    | Command                                                                                                                |
+| ------ | ---------------------------------------------------------------------------------------------------------------------- |
+| Claude | `claude --permission-mode acceptEdits "<prompt>"`                                                                      |
+| Codex  | `codex --ask-for-approval never --sandbox workspace-write -c sandbox_workspace_write.network_access=true "<prompt>"`   |
+| Gemini | `gemini --approval-mode auto_edit "<prompt>"`                                                                          |
 
 All three are launched in modes that auto-accept file edits inside the
-cloned PR workspace but still block broader host access, mirroring
-Claude's `acceptEdits` posture as closely as each CLI permits.
+cloned PR workspace, mirroring Claude's `acceptEdits` posture as
+closely as each CLI permits. For Codex, `sandbox_workspace_write` blocks
+network by default; the `-c sandbox_workspace_write.network_access=true`
+override restores it so the post-inline review path can reach GitHub
+via `gh api`.
 
 The review prompt drives the same six review dimensions across all three
 CLIs:
@@ -163,15 +166,17 @@ CLIs:
 - **Claude Code** delegates to the PR Review Toolkit plugin's six
   sub-agents (Comment Analyzer, PR Test Analyzer, Silent Failure Hunter,
   Type Design Analyzer, Code Reviewer, Code Simplifier).
-- **Codex** and **Gemini** auto-discover the same six review criteria as
-  native Skills. The bundled `SKILL.md` files
+- **Codex** and **Gemini** load the same six review criteria as native
+  Skills. The bundled `SKILL.md` files
   (`cc_pr_reviewer/skills/<name>/SKILL.md`) are an adapted fork of the
   upstream toolkit's agent prompts with Codex/Gemini Skills frontmatter
   prepended. At launch they're copied into
   `<workspace>/.agents/skills/<name>/SKILL.md` (the cross-tool interop
-  path Codex and Gemini both scan at session start) and removed on exit,
-  so only metadata is loaded eagerly — full instructions are pulled in
-  on activation.
+  path both CLIs are *documented* to scan at session start — refs:
+  [Codex Skills](https://developers.openai.com/codex/skills),
+  [Gemini Skills](https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/skills.md))
+  and removed on exit. Per those docs, only metadata is loaded
+  eagerly — full instructions are pulled in on activation.
 
 If the modal's **post-inline** toggle (`Ctrl+T`) is on, the prompt is
 extended to ask the CLI to publish each finding as an inline review

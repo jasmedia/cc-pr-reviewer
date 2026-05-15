@@ -30,6 +30,7 @@ Run:
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import os
 import shutil
@@ -137,12 +138,20 @@ def _skills_dir() -> Path:
 def _build_skill_based_prompt() -> str:
     """Compose the review prompt for the skill-based CLIs (codex, gemini).
 
-    Codex and Gemini auto-discover skills at session start by scanning
-    `.agents/skills/<name>/SKILL.md` and inject only the metadata
-    (name + description) into context. The full SKILL.md body is loaded
-    only when the model activates the skill. `$<name>` mentions force
-    explicit activation — we want every review dimension to run, not
-    have the model implicitly pick a subset.
+    Codex and Gemini are *documented* to auto-discover skills at
+    session start by scanning `.agents/skills/<name>/SKILL.md` and to
+    inject only the metadata (name + description) into context — the
+    full SKILL.md body loads on activation. Refs:
+    https://developers.openai.com/codex/skills and
+    https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/skills.md.
+    If either CLI changes its loading semantics, the launch still runs
+    and the `$<name>` mentions still appear in the prompt — but the
+    skills wouldn't activate. The frontmatter-shape check in
+    `check_prereqs` catches a corrupted *install*, but not an upstream
+    CLI behaviour change.
+
+    `$<name>` mentions force explicit activation — we want every review
+    dimension to run, not have the model implicitly pick a subset.
 
     Identical for codex and gemini — they share both the prompt and the
     `.agents/skills/` interop convention, and differ only in how they're
@@ -227,7 +236,15 @@ def _materialise_skills(workspace: Path) -> _MaterialisedSkills:
         )
 
         skill_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src_dir / name / SKILL_FILE_NAME, skill_md)
+        try:
+            shutil.copy2(src_dir / name / SKILL_FILE_NAME, skill_md)
+        except OSError as e:
+            # Disk full, permission denied, read-only FS — surface which
+            # skill failed so the user has a clear diagnostic instead of
+            # a bare `shutil` traceback. The partial manifest still has
+            # snapshots for every skill we DID write to, so `finally`
+            # cleanup can restore those before propagating this error.
+            raise RuntimeError(f"failed to materialise skill {name!r}: {e}") from e
 
     return _MaterialisedSkills(
         workspace=workspace,
@@ -237,19 +254,35 @@ def _materialise_skills(workspace: Path) -> _MaterialisedSkills:
     )
 
 
+def _rmdir_if_empty(path: Path) -> None:
+    """`rmdir` only if the dir is empty; warn on any other OSError.
+
+    Replaces the previous `contextlib.suppress(OSError)`, which would
+    have hidden a perms regression or a stale lock the same as the
+    expected ENOTEMPTY case — leaving orphan files with no signal.
+    """
+    try:
+        path.rmdir()
+    except OSError as e:
+        if e.errno not in (errno.ENOTEMPTY, errno.EEXIST):
+            print(f"warning: could not rmdir {path}: {e}")
+
+
 def _cleanup_skills(manifest: _MaterialisedSkills) -> None:
     """Reverse of `_materialise_skills` using the manifest it returned.
 
     For each skill: if a SKILL.md existed before materialise, restore
-    those exact bytes; otherwise `unlink` the one we wrote. Then
-    `rmdir` any parent dir we created (`rmdir` only succeeds on empty
-    dirs, so sibling content the user owns is preserved automatically).
+    those exact bytes; otherwise unlink the one we wrote. Then `rmdir`
+    any parent dir we created (`rmdir` only succeeds on empty dirs, so
+    sibling content the user owns is preserved automatically).
 
     The byte restore uses `write_bytes` rather than swallowing errors —
     if we can't put the user's tracked file back, that's a data-loss
-    bug we want loud, not silent. Best-effort `contextlib.suppress(OSError)`
-    is reserved for the empty-dir cleanup, where the cost of a leftover
-    empty dir is purely cosmetic.
+    bug we want loud, not silent. The unlink branch uses an explicit
+    `suppress(FileNotFoundError)` rather than `missing_ok=True` so that
+    other `OSError` subtypes (perms, replaced-by-dir) still surface
+    instead of masking the originating launch exception when this
+    runs inside `finally`.
     """
     skills_root = manifest.workspace / ".agents" / "skills"
     for name, snap in manifest.skills.items():
@@ -257,17 +290,15 @@ def _cleanup_skills(manifest: _MaterialisedSkills) -> None:
         if snap.original_skill_md is not None:
             skill_md.write_bytes(snap.original_skill_md)
         else:
-            skill_md.unlink(missing_ok=True)
+            with contextlib.suppress(FileNotFoundError):
+                skill_md.unlink()
         if not snap.skill_dir_existed:
-            with contextlib.suppress(OSError):
-                (skills_root / name).rmdir()
+            _rmdir_if_empty(skills_root / name)
 
     if not manifest.skills_root_existed:
-        with contextlib.suppress(OSError):
-            skills_root.rmdir()
+        _rmdir_if_empty(skills_root)
     if not manifest.agents_dir_existed:
-        with contextlib.suppress(OSError):
-            (manifest.workspace / ".agents").rmdir()
+        _rmdir_if_empty(manifest.workspace / ".agents")
 
 
 def _build_cli_command(cli: CliChoice, prompt_text: str) -> list[str]:
@@ -460,6 +491,16 @@ _CLI_CYCLE: dict[CliChoice, CliChoice] = {
 }
 DEFAULT_CLI: CliChoice = "claude"
 
+# CLIs that consume bundled `.agents/skills/` material (i.e. ones that
+# need `_materialise_skills` / `_cleanup_skills` around the launch).
+# Names the concept once so the materialise-site and finally-block
+# gates can't drift apart — without it, adding a fourth skill-using
+# CLI later means updating two literal tuples and forgetting one would
+# leak files (materialise without cleanup) or skip skills entirely
+# (cleanup-gate hit, materialise-gate missed). Claude has its own
+# plugin marketplace and doesn't use this path.
+_SKILL_BASED_CLIS: frozenset[CliChoice] = frozenset({"codex", "gemini"})
+
 # Human-facing display names for banners, modal labels, and toast messages.
 _CLI_DISPLAY: dict[CliChoice, str] = {
     "claude": "Claude Code",
@@ -633,7 +674,26 @@ def check_prereqs() -> list[str]:
         )
     else:
         skills_dir = _skills_dir()
-        missing = [n for n in REVIEW_SKILLS if not (skills_dir / n / SKILL_FILE_NAME).is_file()]
+        missing: list[str] = []
+        malformed: list[str] = []
+        for name in REVIEW_SKILLS:
+            skill_md = skills_dir / name / SKILL_FILE_NAME
+            if not skill_md.is_file():
+                missing.append(name)
+                continue
+            # A present-but-malformed SKILL.md (empty file from a
+            # half-extracted wheel, frontmatter stripped by a bad merge)
+            # would pass an `is_file()` check and only surface as a
+            # "skill not found" error from codex/gemini mid-review.
+            # Cheap shape check (~200 bytes per skill at startup) keeps
+            # the failure in the same `problems` flow as missing files.
+            try:
+                head = skill_md.read_bytes()[:512].decode("utf-8", errors="replace")
+            except OSError:
+                malformed.append(name)
+                continue
+            if not head.startswith("---\n") or f"name: {name}" not in head:
+                malformed.append(name)
         if missing:
             # The bundled skills are mandatory for codex/gemini and harmless
             # for claude. Verify every expected SKILL.md is on disk (not just
@@ -642,6 +702,12 @@ def check_prereqs() -> list[str]:
             problems.append(
                 f"bundled review skills missing at {skills_dir} "
                 f"(missing: {', '.join(missing)}) — reinstall cc-pr-reviewer"
+            )
+        if malformed:
+            problems.append(
+                f"bundled review skills present but malformed at {skills_dir} "
+                f"(missing/incorrect frontmatter: {', '.join(malformed)}) — "
+                "reinstall cc-pr-reviewer"
             )
 
     if shutil.which("git") is None:
@@ -2857,17 +2923,16 @@ class PRReviewer(App):
                     head_sha = sha_r.stdout.strip()
 
                 # Materialise the bundled review skills into the PR
-                # workspace so codex/gemini auto-discover them at session
-                # start. Done AFTER `gh pr checkout --force` (which would
-                # otherwise reset our writes) and only for the skill-based
-                # CLIs — claude uses its own plugin marketplace. The
-                # returned manifest snapshots any pre-existing SKILL.md
-                # bytes so `_cleanup_skills` can restore them exactly even
-                # if the reviewed PR ships its own colliding skill of the
-                # same name. Cleanup runs in `finally` so Ctrl-C, crashes,
-                # and clean exits all leave the workspace byte-identical
-                # to its pre-launch state.
-                if cli in ("codex", "gemini"):
+                # workspace so the skill-based CLIs (see _SKILL_BASED_CLIS)
+                # discover them at session start. Done AFTER `gh pr
+                # checkout --force` (which would otherwise reset our
+                # writes). The returned manifest snapshots any pre-existing
+                # SKILL.md bytes so `_cleanup_skills` can restore them
+                # exactly even if the reviewed PR ships its own colliding
+                # skill of the same name. Cleanup runs in `finally` so
+                # Ctrl-C, crashes, and clean exits all leave the workspace
+                # byte-identical to its pre-launch state.
+                if cli in _SKILL_BASED_CLIS:
                     print(f"Materialising review skills under {local_path}/.agents/skills/…")
                     skills_manifest = _materialise_skills(local_path)
 
@@ -2945,12 +3010,15 @@ class PRReviewer(App):
                     f"\n── {_CLI_DISPLAY[cli]} session ended. Press Enter to return to the TUI ──"
                 )
             finally:
-                # Order matters: restore the materialised skills BEFORE
-                # releasing the in-progress reservation so a peer that
-                # grabs the slot next can't race against our half-restored
-                # `.agents/skills/` tree. The `None` guard handles
-                # early-return paths above where materialisation never
-                # ran — there's nothing to restore.
+                # Restore the materialised skills before releasing the
+                # reservation so the workspace is in its pre-launch state
+                # by the time the slot is yielded. (The reservation is
+                # per-PR, so it doesn't serialise peers reviewing
+                # *different* PRs of the same repo — and `gh pr checkout
+                # --force` already races on the shared worktree for those,
+                # which is a pre-existing limitation orthogonal to skills.)
+                # The `None` guard handles early-return paths above where
+                # materialisation never ran — there's nothing to restore.
                 if skills_manifest is not None:
                     _cleanup_skills(skills_manifest)
                 _release_in_progress(self.review_db, key)
