@@ -4,6 +4,120 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] — 2026-05-15
+
+### Added
+- **Multi-CLI support: Codex and Gemini alongside Claude Code.** The TUI
+  now drives three coding-agent CLIs interchangeably. A new `c`
+  keybinding cycles `claude → codex → gemini → claude` globally
+  (persisted via the `settings` table), and `Ctrl+L` inside the
+  confirm modal lets you override the launcher for a single review
+  without mutating the persisted default. Each CLI gets its own argv
+  surface localised in `_build_cli_command`:
+  `claude --permission-mode acceptEdits`,
+  `codex --ask-for-approval never --sandbox workspace-write -c sandbox_workspace_write.network_access=true`,
+  `gemini --approval-mode auto_edit`. The `CliChoice` Literal +
+  `_CLI_CYCLE` / `_CLI_DISPLAY` dicts are the single source of truth
+  consulted by every selector.
+- **Native Skills format for Codex/Gemini review agents.** The six
+  bundled review-agent prompts moved from a single ~500-line
+  file-based prompt under `cc_pr_reviewer/pr_review_agents/*.md` to
+  native Codex/Gemini Skills under
+  `cc_pr_reviewer/skills/<name>/SKILL.md` with hand-written YAML
+  frontmatter for auto-discovery. Each launch materialises them into
+  `<workspace>/.agents/skills/<name>/SKILL.md`; the model now loads
+  only ~100 words of skill metadata up front and pulls in the full
+  body only when it activates a skill via `$<name>` mention.
+- **Upstream-sync workflow** (`scripts/sync_pr_review_agents.py`). The
+  upstream `pr-review-toolkit` plugin reports its version as
+  `unknown`, so drift is detected by content diff. Committed baseline
+  snapshots under `scripts/upstream_baseline/<name>.md` capture
+  normalised upstream at the last sync; the script flags
+  `UPSTREAM CHANGED` and exits non-zero when upstream diverges from
+  the baseline. New flags: `--save-baseline` to lock in a new
+  reference, `--update-plugin` to run the upstream plugin update
+  first, and `--write` to overwrite bundled SKILL.md bodies with
+  normalised upstream (preserving our hand-written frontmatter via
+  `compose_with_existing_frontmatter`). The `scripts/` directory is
+  outside the wheel, so baselines stay a maintainer-only artifact.
+
+### Changed
+- **Prereq checks no longer gate on the specific persisted CLI.**
+  `check_prereqs` now requires `gh` (authenticated), `git`, and AT
+  LEAST ONE of `claude`/`codex`/`gemini` on PATH — so a Codex-only or
+  Gemini-only user on a fresh install can start the TUI without
+  installing Claude Code first. The toolkit-plugin check moved out of
+  startup into `_launch_claude`'s pre-flight (only fires when
+  `cli=claude` is the chosen launcher). `PRReviewer.__init__` falls
+  back via `_first_available_cli(preferred)` in memory when the
+  persisted CLI isn't on PATH; the fallback is surfaced as a warning
+  toast during `on_mount`.
+- **Prompt construction takes a `cli` kwarg.** `build_review_prompt`
+  selects `REVIEW_PROMPT_CLAUDE` (plugin-driven) for `claude` and the
+  shared `REVIEW_PROMPT_SKILL_BASED` (mentions the six bundled skills
+  via `$<name>` for explicit activation) for `codex` and `gemini`.
+  All `POST_INLINE_*` suffix logic stays shared and is verified
+  across all three CLIs via parameterised tests.
+- Renamed `codex_agents/` to `pr_review_agents/` (and then on to
+  `skills/`) — the directory is shared by every file-based CLI, so
+  the codex-specific name was misleading. The single-module
+  `cc_pr_reviewer.py` is now a package (`cc_pr_reviewer/__init__.py`)
+  so the bundled agent files ship with the wheel.
+
+### Fixed
+- **Snapshot/restore the worktree before materialising skills.**
+  `_materialise_skills` previously overwrote any pre-existing
+  `.agents/skills/<our-name>/SKILL.md` in the PR's worktree, and
+  `_cleanup_skills` then unlinked it — so a PR that ships its own
+  competing skill of the same name would end the review with that
+  tracked file deleted or modified. Now we snapshot existing bytes
+  and parent-dir presence into a `_MaterialisedSkills` manifest and
+  restore byte-for-byte in `finally`. Parent dirs are only `rmdir`'d
+  if we created them, so sibling user content and pre-existing
+  `.agents/` trees stay intact.
+- **Codex network access restored for post-inline reviews.** Codex's
+  `--sandbox workspace-write` blocks network by default, so the
+  post-inline review path's `gh api …` calls were silently failing
+  to publish inline comments. The `-c sandbox_workspace_write.network_access=true`
+  override keeps the filesystem sandbox but restores network.
+  `--yolo` is rejected because it removes the filesystem sandbox too.
+- **Bundled SKILL.md frontmatter validated at startup.**
+  `check_prereqs` reads the first 512 bytes of each bundled SKILL.md
+  and validates frontmatter shape — a half-extracted wheel or bad
+  merge produces a clear startup blocker instead of a mid-review
+  "skill not found" from codex/gemini.
+- `_materialise_skills` wraps `shutil.copy2` with a `RuntimeError`
+  naming the offending skill; bare shutil tracebacks gave no clue
+  which of six writes failed.
+- `_cleanup_skills` uses explicit `suppress(FileNotFoundError)`
+  instead of `missing_ok=True`, and a new `_rmdir_if_empty` helper
+  narrows the previous broad `suppress(OSError)` to ENOTEMPTY-only
+  so other OSError subtypes propagate from `finally` instead of
+  masking the originating launch exception.
+- `strip_bundled_frontmatter` raises when a bundled SKILL.md is
+  missing our frontmatter (was a silent no-op that would let a
+  defective file pass the upstream-drift check as "in sync").
+- **Explicit `encoding="utf-8"` on all `read_text` / `write_text`
+  calls** in `scripts/sync_pr_review_agents.py` — the bundled agent
+  files contain em-dashes and Unicode bullets that Windows would
+  otherwise mis-decode under the locale codepage.
+- **`_pr_review_toolkit_enabled()` no longer freezes the TUI.** Added
+  `timeout=5` plus `FileNotFoundError`/`TimeoutExpired` handling
+  returning `None`, and the call site in `_launch_claude` now
+  surfaces `None` distinctly from `False` (warning toast: "couldn't
+  determine plugin status — proceeding") instead of silently
+  bypassing the toolkit-prompt check.
+- **`_persisted_cli` exception coverage matches its docstring.** The
+  whole DB sequence (including `mkdir(parents=True)` inside
+  `_open_review_db` and `_get_setting()`) is now wrapped to catch
+  both `sqlite3.Error` and `OSError` — previously a read-only
+  workspace crashed startup before the TUI mounted.
+- **No-CLI-available TOCTOU race.** If every supported CLI is
+  uninstalled between `check_prereqs` and `PRReviewer.__init__`,
+  `on_mount` now surfaces a high-severity persistent toast instead
+  of silently waiting for the user to discover the problem at first
+  Enter-to-review.
+
 ## [0.11.1] — 2026-05-08
 
 ### Changed
@@ -366,6 +480,7 @@ Initial release.
 - Prereq checks for `gh`, `claude`, `git`, and the **PR Review Toolkit**
   Claude Code plugin.
 
+[0.12.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.12.0
 [0.11.1]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.11.1
 [0.11.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.11.0
 [0.10.1]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.10.1
