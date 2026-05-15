@@ -381,8 +381,24 @@ PR_REVIEW_TOOLKIT_URL = "https://claude.com/plugins/pr-review-toolkit"
 
 
 def _pr_review_toolkit_enabled() -> bool | None:
-    """True if the plugin is installed & enabled, False if not, None if undetectable."""
-    r = run(["claude", "plugin", "list", "--json"])
+    """True if the plugin is installed & enabled, False if not, None if undetectable.
+
+    Callers must treat `None` distinctly from `False` — `None` means we
+    couldn't determine plugin status (binary missing, subprocess hung
+    past the timeout, malformed JSON), not "no". Silently treating
+    `None` as `True` (or as `False`) is exactly the silent-fallback
+    anti-pattern called out in CLAUDE.md.
+
+    The 5 s timeout guards the TUI thread: this runs synchronously
+    before `self.suspend()` inside `_launch_claude`, so a stalled
+    `claude` (slow disk, hung child, network-mounted plugin dir, an
+    unresponsive marketplace probe) would otherwise freeze the entire
+    TUI indefinitely with no frame updates and no Ctrl-C handling.
+    """
+    try:
+        r = run(["claude", "plugin", "list", "--json"], timeout=5)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
     if r.returncode != 0:
         return None
     try:
@@ -402,18 +418,27 @@ def _persisted_cli() -> CliChoice:
 
     `check_prereqs` runs before `PRReviewer.__init__`, so it can't reach
     through `self.review_db`. Returns `DEFAULT_CLI` on any failure
-    (missing DB, corrupt row, unrecognised value) so a transient DB
-    issue can't fail the startup gate — the launcher's pre-flight
-    check surfaces a missing binary at review time.
+    (missing DB, corrupt row, unrecognised value, unwritable workspace)
+    so a transient I/O issue can't crash startup before the TUI mounts
+    — the launcher's pre-flight check surfaces a missing binary at
+    review time anyway.
+
+    Both exception classes are needed: `_open_review_db()` calls
+    `Path.mkdir(parents=True, exist_ok=True)` which raises `OSError`
+    on a read-only or permission-denied workspace dir; and
+    `_get_setting()` raises `sqlite3.Error` on a corrupt settings table
+    or an `OperationalError: database is locked past busy_timeout`. The
+    original implementation caught only the connect-time `sqlite3.Error`
+    and left both of these uncovered.
     """
     try:
         conn = _open_review_db()
-    except sqlite3.Error:
+        try:
+            v = _get_setting(conn, "cli", DEFAULT_CLI)
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError):
         return DEFAULT_CLI
-    try:
-        v = _get_setting(conn, "cli", DEFAULT_CLI)
-    finally:
-        conn.close()
     return v if v in _CLI_CYCLE else DEFAULT_CLI
 
 
@@ -1919,18 +1944,28 @@ class PRReviewer(App):
         # Codex-only user on a fresh install doesn't get stuck with the
         # `claude` default. The fallback is session-only — pressing `c`
         # is what persists a new choice. `check_prereqs` already
-        # guaranteed at least one CLI is available, so the None branch
-        # below is defensive (e.g. race where someone uninstalled the
-        # CLI between prereq check and __init__).
+        # guaranteed at least one CLI is available, but a TOCTOU race
+        # (every CLI uninstalled between prereq check and __init__) is
+        # surfaced as `_no_cli_available=True` so `on_mount` can warn
+        # rather than silently leaving the user with a broken `self.cli`
+        # whose failure only appears at first Enter-to-review.
+        self._cli_fallback_from: CliChoice | None = None
+        self._no_cli_available: bool = False
         if shutil.which(persisted) is None:
             fallback = _first_available_cli(persisted)
-            self.cli: CliChoice = fallback if fallback is not None else persisted
-            self._cli_fallback_from: CliChoice | None = (
-                persisted if fallback is not None and fallback != persisted else None
-            )
+            if fallback is None:
+                # No supported CLI on PATH at all. Keep `self.cli` as
+                # the persisted preference so the footer/status reflect
+                # what the user *wanted*; on_mount fires a high-severity
+                # toast and pre-flight in `_launch_claude` re-checks.
+                self.cli: CliChoice = persisted
+                self._no_cli_available = True
+            else:
+                self.cli = fallback
+                if fallback != persisted:
+                    self._cli_fallback_from = persisted
         else:
             self.cli = persisted
-            self._cli_fallback_from = None
         self._row_to_pr_idx: list[int | None] = []
         # Snapshot of `reviews_in_progress` rows from the most recent poll,
         # keyed by `pr_key`. `_poll_in_progress` diffs against this to
@@ -1983,11 +2018,25 @@ class PRReviewer(App):
             ),
         )
         self._refresh_footer_indicators()
-        # Surface the CLI fallback (set in `__init__` when the persisted
-        # CLI wasn't on PATH) as a warning toast — startup goes through
-        # without dying, but the user should know they're on a different
-        # CLI than they configured.
-        if self._cli_fallback_from is not None:
+        # Surface CLI-availability problems set in `__init__`. Two
+        # distinct cases:
+        #   * `_no_cli_available`: TOCTOU race — every supported CLI was
+        #     uninstalled between `check_prereqs` and now. Show a
+        #     persistent error toast so the user isn't blindsided by
+        #     the pre-flight failure when they hit Enter.
+        #   * `_cli_fallback_from`: persisted CLI is missing but
+        #     another one is on PATH. Warning toast — the TUI still
+        #     works, just not on the CLI they wanted.
+        if self._no_cli_available:
+            self.notify(
+                "no review CLI on PATH — install one of `claude`, "
+                "`codex`, or `gemini` before pressing Enter on a PR. "
+                "(`check_prereqs` accepted startup; the binary disappeared "
+                "between then and now.)",
+                severity="error",
+                timeout=15,
+            )
+        elif self._cli_fallback_from is not None:
             self.notify(
                 f"`{self._cli_fallback_from}` not on PATH — "
                 f"using {_CLI_DISPLAY[self.cli]} this session. "
@@ -2582,16 +2631,30 @@ class PRReviewer(App):
         # Gemini reference the bundled `.md` files instead, so no extra
         # check applies to them. The plugin check is the slow one — it
         # shells out to `claude plugin list --json` — so it stays gated
-        # behind the binary check above.
-        if cli == "claude" and _pr_review_toolkit_enabled() is False:
-            self.notify(
-                "PR Review Toolkit plugin not enabled — run "
-                f"`claude plugin install {PR_REVIEW_TOOLKIT_PLUGIN}` "
-                "or pick a different CLI",
-                severity="error",
-                timeout=10,
-            )
-            return
+        # behind the binary check above. `None` (undetectable) is
+        # surfaced separately so a hung/crashed `claude plugin list`
+        # doesn't silently pass-through into a review where the prompt
+        # refers to agents the plugin can't load.
+        if cli == "claude":
+            plugin_state = _pr_review_toolkit_enabled()
+            if plugin_state is False:
+                self.notify(
+                    "PR Review Toolkit plugin not enabled — run "
+                    f"`claude plugin install {PR_REVIEW_TOOLKIT_PLUGIN}` "
+                    "or pick a different CLI",
+                    severity="error",
+                    timeout=10,
+                )
+                return
+            if plugin_state is None:
+                self.notify(
+                    "couldn't determine PR Review Toolkit plugin status "
+                    "(`claude plugin list --json` failed or timed out) — "
+                    "proceeding; if the review can't reach the toolkit "
+                    "agents, run that command manually to diagnose",
+                    severity="warning",
+                    timeout=10,
+                )
 
         # Suspend the TUI so the coding-agent CLI can take over stdin/stdout.
         with self.suspend():

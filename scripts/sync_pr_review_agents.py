@@ -151,8 +151,12 @@ def _save_baseline(args: argparse.Namespace) -> int:
             print(f"  SKIP (no upstream)  {name}", file=sys.stderr)
             skipped += 1
             continue
-        normalised = normalise_upstream(upstream_path.read_text())
-        (BASELINE_DIR / name).write_text(normalised)
+        # Explicit utf-8: agent prompts contain em-dashes and Unicode
+        # bullets, and Windows defaults to the locale codepage which
+        # would mis-decode those silently. Same reasoning for every
+        # other read_text/write_text in this file.
+        normalised = normalise_upstream(upstream_path.read_text(encoding="utf-8"))
+        (BASELINE_DIR / name).write_text(normalised, encoding="utf-8")
         print(f"  captured            {name}")
         wrote += 1
     print()
@@ -254,15 +258,15 @@ def main() -> int:
             missing += 1
             continue
 
-        normalised = normalise_upstream(upstream_path.read_text())
-        local = local_path.read_text()
+        normalised = normalise_upstream(upstream_path.read_text(encoding="utf-8"))
+        local = local_path.read_text(encoding="utf-8")
 
         # Upstream-vs-baseline check — the load-bearing automation: when
         # this trips, the maintainer has actual work to do. The
         # upstream-vs-bundled "drift" reading below is informational
         # (mostly the persistent adaptation noise).
         if baseline_exists:
-            baseline_text = (BASELINE_DIR / name).read_text()
+            baseline_text = (BASELINE_DIR / name).read_text(encoding="utf-8")
             if normalised != baseline_text:
                 upstream_changed.append((name, baseline_text, normalised))
 
@@ -277,7 +281,7 @@ def main() -> int:
         # `git checkout --`). Counts as "rewrote", not "drift", so the
         # final summary reflects post-write state.
         if args.write:
-            local_path.write_text(normalised)
+            local_path.write_text(normalised, encoding="utf-8")
             print(f"  rewrote           {name}")
             rewrote += 1
             continue

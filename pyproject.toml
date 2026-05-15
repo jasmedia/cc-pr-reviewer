@@ -52,6 +52,9 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Make the maintainer scripts (which aren't installed as part of the
+# package) importable in tests via `import sync_pr_review_agents`.
+pythonpath = ["scripts"]
 
 [tool.ruff]
 target-version = "py310"
