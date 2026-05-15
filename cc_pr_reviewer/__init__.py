@@ -403,8 +403,8 @@ def _persisted_cli() -> CliChoice:
     `check_prereqs` runs before `PRReviewer.__init__`, so it can't reach
     through `self.review_db`. Returns `DEFAULT_CLI` on any failure
     (missing DB, corrupt row, unrecognised value) so a transient DB
-    issue can't fail the startup gate — the matching pre-flight check
-    inside the launcher will surface a missing binary at review time.
+    issue can't fail the startup gate — the launcher's pre-flight
+    check surfaces a missing binary at review time.
     """
     try:
         conn = _open_review_db()
@@ -417,14 +417,44 @@ def _persisted_cli() -> CliChoice:
     return v if v in _CLI_CYCLE else DEFAULT_CLI
 
 
+def _first_available_cli(preferred: CliChoice) -> CliChoice | None:
+    """Walk the CLI cycle starting at `preferred`; return the first on PATH.
+
+    Used at startup to pick a session-level fallback when the persisted
+    CLI isn't installed on this machine — a Codex-only user who sees
+    `claude` as the persisted default (because that's `DEFAULT_CLI`)
+    should still be able to launch the TUI. The cycle order (claude →
+    codex → gemini → claude) keeps the fallback predictable: the next
+    CLI you'd land on if you pressed `c` once.
+
+    Returns `None` if none of the three supported CLIs is installed —
+    in which case the app genuinely can't review anything and startup
+    should fail.
+    """
+    candidate = preferred
+    for _ in range(len(_CLI_CYCLE)):
+        if shutil.which(candidate) is not None:
+            return candidate
+        candidate = _CLI_CYCLE[candidate]
+    return None
+
+
 def check_prereqs() -> list[str]:
     """Return a list of human-readable problems (empty if everything is ready).
 
-    Gates startup on the **active** CLI's prerequisites only — the user
-    can swap CLIs from inside the TUI, so requiring all three to be
-    installed up-front would be unfriendly to anyone who only has one.
-    The launcher does a second pre-flight check at review time, which
-    catches "user toggled to a CLI they don't have installed".
+    Gates startup on the absolute minimum — `gh` (authenticated), `git`,
+    and **at least one** of the three supported review CLIs on PATH.
+    The specific CLI the user picked may be unavailable on this machine,
+    but as long as one CLI is installed the TUI can launch and the user
+    can fall back to / toggle to the installed one. The launcher does a
+    second pre-flight check at review time that surfaces the
+    CLI-specific problem (missing binary, missing toolkit plugin)
+    against whichever CLI is selected for that launch.
+
+    The toolkit-plugin check is intentionally NOT here: it only matters
+    when cli=claude, and a Codex/Gemini user shouldn't be blocked from
+    starting the TUI because the Claude plugin isn't installed. The
+    pre-flight check inside `_launch_claude` covers it.
     """
     problems: list[str] = []
     if shutil.which("gh") is None:
@@ -432,45 +462,23 @@ def check_prereqs() -> list[str]:
     elif run(["gh", "auth", "status"]).returncode != 0:
         problems.append("`gh` is not authenticated — run: gh auth login")
 
-    cli = _persisted_cli()
-    if cli == "claude":
-        if shutil.which("claude") is None:
-            problems.append(
-                "`claude` CLI not found on PATH — install Claude Code "
-                "(or set a different CLI via the `c` key in the TUI)"
-            )
-        else:
-            enabled = _pr_review_toolkit_enabled()
-            if enabled is False:
-                problems.append(
-                    "PR Review Toolkit plugin not enabled — "
-                    f"install & enable from {PR_REVIEW_TOOLKIT_URL} "
-                    f"(or run: claude plugin install {PR_REVIEW_TOOLKIT_PLUGIN})"
-                )
-    elif cli == "codex":
-        if shutil.which("codex") is None:
-            problems.append(
-                "`codex` CLI not found on PATH — install OpenAI Codex CLI "
-                "from https://github.com/openai/codex "
-                "(or set a different CLI via the `c` key in the TUI)"
-            )
-        elif not _review_agents_dir().is_dir():
-            problems.append(
-                f"bundled review-agent prompts missing at {_review_agents_dir()} "
-                "— reinstall cc-pr-reviewer"
-            )
-    elif cli == "gemini":
-        if shutil.which("gemini") is None:
-            problems.append(
-                "`gemini` CLI not found on PATH — install Google Gemini CLI "
-                "from https://github.com/google-gemini/gemini-cli "
-                "(or set a different CLI via the `c` key in the TUI)"
-            )
-        elif not _review_agents_dir().is_dir():
-            problems.append(
-                f"bundled review-agent prompts missing at {_review_agents_dir()} "
-                "— reinstall cc-pr-reviewer"
-            )
+    if _first_available_cli(_persisted_cli()) is None:
+        problems.append(
+            "no supported review CLI on PATH — install at least one of:\n"
+            "    • Claude Code: https://claude.com (and: claude plugin install "
+            f"{PR_REVIEW_TOOLKIT_PLUGIN})\n"
+            "    • OpenAI Codex CLI: https://github.com/openai/codex\n"
+            "    • Google Gemini CLI: https://github.com/google-gemini/gemini-cli"
+        )
+    elif not _review_agents_dir().is_dir():
+        # The bundled agent prompts are mandatory for codex/gemini and
+        # harmless for claude. If they're missing the install is broken
+        # regardless of which CLI the user ends up on, so this stays a
+        # hard startup failure.
+        problems.append(
+            f"bundled review-agent prompts missing at {_review_agents_dir()} "
+            "— reinstall cc-pr-reviewer"
+        )
 
     if shutil.which("git") is None:
         problems.append("`git` not found on PATH — install git")
@@ -1905,7 +1913,24 @@ class PRReviewer(App):
         stored_sort = _get_setting(self.review_db, "sort_by", "")
         self.sort_by: SortBy = stored_sort if stored_sort in _SORT_CYCLE else ""
         stored_cli = _get_setting(self.review_db, "cli", DEFAULT_CLI)
-        self.cli: CliChoice = stored_cli if stored_cli in _CLI_CYCLE else DEFAULT_CLI
+        persisted: CliChoice = stored_cli if stored_cli in _CLI_CYCLE else DEFAULT_CLI
+        # If the persisted CLI isn't on PATH, fall back to whatever IS
+        # installed (in cycle order from the persisted preference) so a
+        # Codex-only user on a fresh install doesn't get stuck with the
+        # `claude` default. The fallback is session-only — pressing `c`
+        # is what persists a new choice. `check_prereqs` already
+        # guaranteed at least one CLI is available, so the None branch
+        # below is defensive (e.g. race where someone uninstalled the
+        # CLI between prereq check and __init__).
+        if shutil.which(persisted) is None:
+            fallback = _first_available_cli(persisted)
+            self.cli: CliChoice = fallback if fallback is not None else persisted
+            self._cli_fallback_from: CliChoice | None = (
+                persisted if fallback is not None and fallback != persisted else None
+            )
+        else:
+            self.cli = persisted
+            self._cli_fallback_from = None
         self._row_to_pr_idx: list[int | None] = []
         # Snapshot of `reviews_in_progress` rows from the most recent poll,
         # keyed by `pr_key`. `_poll_in_progress` diffs against this to
@@ -1958,6 +1983,18 @@ class PRReviewer(App):
             ),
         )
         self._refresh_footer_indicators()
+        # Surface the CLI fallback (set in `__init__` when the persisted
+        # CLI wasn't on PATH) as a warning toast — startup goes through
+        # without dying, but the user should know they're on a different
+        # CLI than they configured.
+        if self._cli_fallback_from is not None:
+            self.notify(
+                f"`{self._cli_fallback_from}` not on PATH — "
+                f"using {_CLI_DISPLAY[self.cli]} this session. "
+                "Press `c` to switch, or install the missing CLI.",
+                severity="warning",
+                timeout=10,
+            )
         self.action_refresh()
         # Cross-instance "in review" indicator. 3 s is fast enough to feel
         # live (another tab finishing/starting a review is reflected
@@ -2528,13 +2565,31 @@ class PRReviewer(App):
         # Pre-flight: surface a missing CLI binary as a toast in the TUI
         # rather than suspending and immediately failing at exec. This
         # primarily catches the per-launch override case (user toggles
-        # CLI from the modal to one they don't have installed) — startup
-        # `check_prereqs` already covers the global-setting case.
+        # CLI from the modal to one they don't have installed). Startup
+        # `check_prereqs` only verifies that at least one CLI exists —
+        # not the specific one being launched — so this check is the
+        # one that catches "you toggled to claude but it's not here".
         if shutil.which(cli) is None:
             self.notify(
                 f"`{cli}` not found on PATH — install it or pick a different CLI",
                 severity="error",
                 timeout=8,
+            )
+            return
+
+        # Claude additionally needs the PR Review Toolkit plugin (the
+        # base prompt invokes the toolkit's agents by name). Codex and
+        # Gemini reference the bundled `.md` files instead, so no extra
+        # check applies to them. The plugin check is the slow one — it
+        # shells out to `claude plugin list --json` — so it stays gated
+        # behind the binary check above.
+        if cli == "claude" and _pr_review_toolkit_enabled() is False:
+            self.notify(
+                "PR Review Toolkit plugin not enabled — run "
+                f"`claude plugin install {PR_REVIEW_TOOLKIT_PLUGIN}` "
+                "or pick a different CLI",
+                severity="error",
+                timeout=10,
             )
             return
 

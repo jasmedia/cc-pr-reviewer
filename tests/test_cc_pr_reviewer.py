@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 
+import cc_pr_reviewer as _mod
 from cc_pr_reviewer import (
     _APP_HOSTNAME,
     EXISTING_COMMENT_BODY_CAP,
@@ -34,6 +35,7 @@ from cc_pr_reviewer import (
     InProgressHolder,
     ReviewInProgressError,
     _build_cli_command,
+    _first_available_cli,
     _in_progress_age_str,
     _is_newer,
     _load_in_progress,
@@ -45,6 +47,7 @@ from cc_pr_reviewer import (
     _review_agents_dir,
     _review_cell,
     build_review_prompt,
+    check_prereqs,
     format_existing_comments,
 )
 
@@ -382,6 +385,130 @@ def test_build_cli_command_rejects_unknown_cli() -> None:
     switch, fail loud rather than emit a mystery argv."""
     with pytest.raises(ValueError, match="unknown CLI choice"):
         _build_cli_command("nonsense", "prompt body")  # type: ignore[arg-type]
+
+
+# --- _first_available_cli --------------------------------------------------
+
+
+def _only_installed(*installed: str):
+    """Build a `shutil.which`-shaped stub that returns a path only for the
+    listed binaries. Centralised so the test intent is the binary list,
+    not the lambda shape, and so a future signature change (e.g. adding
+    `mode=` / `path=`) lands in one place."""
+
+    def fake_which(cmd: str, *_args, **_kwargs) -> str | None:
+        return f"/usr/bin/{cmd}" if cmd in installed else None
+
+    return fake_which
+
+
+def test_first_available_cli_returns_preferred_when_installed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_mod.shutil, "which", _only_installed("claude", "codex", "gemini"))
+    assert _first_available_cli("claude") == "claude"
+    assert _first_available_cli("codex") == "codex"
+    assert _first_available_cli("gemini") == "gemini"
+
+
+def test_first_available_cli_walks_cycle_when_preferred_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex-only user with `claude` persisted should land on codex —
+    the next CLI in the cycle from `claude`."""
+    monkeypatch.setattr(_mod.shutil, "which", _only_installed("codex"))
+    assert _first_available_cli("claude") == "codex"
+
+
+def test_first_available_cli_skips_through_multiple_misses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Persisted=claude, claude missing, codex missing, gemini installed
+    → fall all the way through to gemini."""
+    monkeypatch.setattr(_mod.shutil, "which", _only_installed("gemini"))
+    assert _first_available_cli("claude") == "gemini"
+
+
+def test_first_available_cli_returns_none_when_all_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Genuine 'no CLI installed' state — caller (`check_prereqs`) must
+    treat this as a startup blocker."""
+    monkeypatch.setattr(_mod.shutil, "which", _only_installed())
+    assert _first_available_cli("claude") is None
+    assert _first_available_cli("codex") is None
+    assert _first_available_cli("gemini") is None
+
+
+# --- check_prereqs ---------------------------------------------------------
+
+
+class _RunOk:
+    """Minimal stand-in for `subprocess.CompletedProcess` that satisfies
+    `check_prereqs` (it only inspects `.returncode`). Lets us stub
+    `cc_pr_reviewer.run` without dragging the full mock framework in."""
+
+    returncode = 0
+
+
+def _stub_prereq_deps(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    installed: tuple[str, ...],
+    persisted: str = "claude",
+) -> None:
+    """Stub all the external-world calls `check_prereqs` makes so the
+    test can pin the only inputs that matter (which binaries are on
+    PATH, and which CLI is persisted)."""
+    monkeypatch.setattr(
+        _mod.shutil,
+        "which",
+        _only_installed("gh", "git", *installed),
+    )
+    monkeypatch.setattr(_mod, "run", lambda _cmd, **_kw: _RunOk())
+    monkeypatch.setattr(_mod, "_persisted_cli", lambda: persisted)
+
+
+def test_check_prereqs_passes_with_only_codex_installed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bug fix: a Codex-only user on a fresh install (persisted=claude
+    by default) must be allowed to start the TUI. Previously the
+    persisted=claude branch hard-failed on missing `claude`, leaving the
+    user with no way to switch."""
+    _stub_prereq_deps(monkeypatch, installed=("codex",), persisted="claude")
+    assert check_prereqs() == []
+
+
+def test_check_prereqs_passes_with_only_gemini_installed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Symmetric to the codex-only case — gemini-only install must also
+    pass startup regardless of what's persisted."""
+    _stub_prereq_deps(monkeypatch, installed=("gemini",), persisted="claude")
+    assert check_prereqs() == []
+
+
+def test_check_prereqs_fails_when_no_supported_cli_installed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`gh` and `git` present but none of the three review CLIs — the
+    one case where startup genuinely can't proceed."""
+    _stub_prereq_deps(monkeypatch, installed=(), persisted="claude")
+    problems = check_prereqs()
+    assert problems, "expected a startup blocker when no review CLI is installed"
+    assert any("no supported review CLI" in p for p in problems)
+
+
+def test_check_prereqs_fails_when_gh_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`gh` is the data source — without it the TUI has nothing to show,
+    so this stays a hard blocker independent of which CLI is selected."""
+    # gh absent, codex present — CLI is fine, gh is the problem.
+    monkeypatch.setattr(_mod.shutil, "which", _only_installed("git", "codex"))
+    monkeypatch.setattr(_mod, "run", lambda _cmd, **_kw: _RunOk())
+    monkeypatch.setattr(_mod, "_persisted_cli", lambda: "codex")
+    problems = check_prereqs()
+    assert any("gh" in p and "not found" in p.lower() for p in problems)
 
 
 # --- _parse_semver / _is_newer ---------------------------------------------
