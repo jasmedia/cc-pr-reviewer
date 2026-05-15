@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
 """
 cc-pr-reviewer — a small Textual TUI that lists GitHub PRs where you are a
-requested reviewer and hands any selected PR off to Claude Code, with the
-PR Review Toolkit plugin driving the review.
+requested reviewer and hands any selected PR off to a coding-agent CLI
+(Claude Code, OpenAI Codex CLI, or Google Gemini CLI), with the PR Review
+Toolkit (Claude) or the bundled `.agents/skills/` (Codex/Gemini) driving
+the review.
 
 Flow when you pick a PR and press Enter:
     1. Clone the repo into $GH_PR_WORKSPACE (if not already there)
-    2. `gh pr checkout <N>` so Claude sees the PR's working tree
-    3. Launch `claude` with a prompt that invokes the PR Review Toolkit agents
-    4. When you /exit Claude, the TUI resumes
+    2. `gh pr checkout <N>` so the CLI sees the PR's working tree
+    3. For codex/gemini: materialise the six bundled review skills into
+       `<workspace>/.agents/skills/` for auto-discovery (cleaned up on exit)
+    4. Launch the chosen CLI with a prompt that drives the six review dimensions
+    5. When you /exit the CLI, the TUI resumes
 
 Prerequisites:
     • gh CLI, authenticated                     https://cli.github.com
-    • claude CLI (Claude Code)                  https://docs.claude.com/claude-code
-    • PR Review Toolkit plugin installed        https://claude.com/plugins/pr-review-toolkit
+    • at least one of:
+        - Claude Code                           https://docs.claude.com/claude-code
+          (+ PR Review Toolkit plugin           https://claude.com/plugins/pr-review-toolkit)
+        - OpenAI Codex CLI                      https://github.com/openai/codex
+        - Google Gemini CLI                     https://github.com/google-gemini/gemini-cli
 
 Run:
     uv sync
@@ -23,6 +30,7 @@ Run:
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import os
 import shutil
@@ -88,58 +96,209 @@ REVIEW_PROMPT_CLAUDE = (
     "with file:line references and suggested fixes."
 )
 
-# Codex and Gemini don't have a plugin marketplace, so the six toolkit
-# agents ship as bundled Markdown files (see `cc_pr_reviewer/pr_review_agents/`).
-# The order here is the order Codex/Gemini will be asked to apply them —
-# code-reviewer first sets project-guideline context, then the targeted
-# checks (silent failures, type design, tests), then the cleanup-oriented
-# passes (comments, simplification). Changing the order is a behaviour
-# change, so the tuple is the single source of truth consulted by both the
-# prompt builder and the prereq check.
-REVIEW_AGENT_FILES: tuple[str, ...] = (
-    "code-reviewer.md",
-    "silent-failure-hunter.md",
-    "type-design-analyzer.md",
-    "pr-test-analyzer.md",
-    "comment-analyzer.md",
-    "code-simplifier.md",
+# Codex and Gemini don't have a plugin marketplace, but both natively
+# auto-discover skills at `<workspace>/.agents/skills/<name>/SKILL.md`. The
+# six toolkit agents ship as bundled SKILL.md files (see
+# `cc_pr_reviewer/skills/`); at launch we materialise them into the
+# checked-out PR's workspace and clean up on exit. Names appear in the
+# review prompt prefixed with `$` to force explicit activation — we want
+# every dimension to run, not have the model implicitly pick a subset.
+#
+# The order here is the order the prompt asks for them — code-reviewer
+# first sets project-guideline context, then the targeted checks (silent
+# failures, type design, tests), then the cleanup-oriented passes
+# (comments, simplification). Changing the order is a behaviour change,
+# so the tuple is the single source of truth consulted by both the
+# prompt builder and the materialise/cleanup helpers.
+REVIEW_SKILLS: tuple[str, ...] = (
+    "code-reviewer",
+    "silent-failure-hunter",
+    "type-design-analyzer",
+    "pr-test-analyzer",
+    "comment-analyzer",
+    "code-simplifier",
 )
 
+SKILL_FILE_NAME = "SKILL.md"
 
-def _review_agents_dir() -> Path:
-    """Return the bundled directory holding the file-based agent prompts.
+
+def _skills_dir() -> Path:
+    """Return the bundled directory holding the Codex/Gemini SKILL.md files.
 
     Resolved against `__file__` so editable installs (`uv sync`) and wheel
     installs (`pip install`) both work — hatchling packages the directory
     next to `__init__.py` in both cases. `importlib.resources` is avoided
-    because the agents are read by an external subprocess (`codex` /
-    `gemini`), not by Python — so we always need a filesystem path, not
-    a `Traversable`.
+    because the SKILL.md files are read by an external subprocess
+    (`codex` / `gemini`) after we copy them into the PR workspace, not by
+    Python — so we always need a filesystem path, not a `Traversable`.
     """
-    return Path(__file__).parent / "pr_review_agents"
+    return Path(__file__).parent / "skills"
 
 
-def _build_file_based_prompt() -> str:
-    """Compose the review prompt for the file-based CLIs (codex, gemini).
+def _build_skill_based_prompt() -> str:
+    """Compose the review prompt for the skill-based CLIs (codex, gemini).
 
-    The agent files live in this repo (not in any Claude plugin), so the
-    prompt simply lists their absolute paths and asks the CLI to read each
-    one in turn. Identical for codex and gemini — they share the prompt and
-    differ only in how they're launched.
+    Codex and Gemini are *documented* to auto-discover skills at
+    session start by scanning `.agents/skills/<name>/SKILL.md` and to
+    inject only the metadata (name + description) into context — the
+    full SKILL.md body loads on activation. Refs:
+    https://developers.openai.com/codex/skills and
+    https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/skills.md.
+    If either CLI changes its loading semantics, the launch still runs
+    and the `$<name>` mentions still appear in the prompt — but the
+    skills wouldn't activate. The frontmatter-shape check in
+    `check_prereqs` catches a corrupted *install*, but not an upstream
+    CLI behaviour change.
+
+    `$<name>` mentions force explicit activation — we want every review
+    dimension to run, not have the model implicitly pick a subset.
+
+    Identical for codex and gemini — they share both the prompt and the
+    `.agents/skills/` interop convention, and differ only in how they're
+    launched.
     """
-    agents_dir = _review_agents_dir()
-    bullets = "\n".join(f"  • {agents_dir / name}" for name in REVIEW_AGENT_FILES)
+    mentions = ", ".join(f"${name}" for name in REVIEW_SKILLS)
     return (
-        "Please perform a comprehensive review of the current PR by applying "
-        "the six review criteria documented in these files (read each before "
-        "reviewing):\n\n"
-        f"{bullets}\n\n"
-        "Then give me a prioritised summary of findings with file:line "
-        "references and suggested fixes."
+        "Please perform a comprehensive review of the current PR using the "
+        f"six review skills available in this workspace: {mentions}. "
+        "Activate each skill in turn — they cover project-guideline "
+        "compliance, silent failures, type design, test coverage, comments, "
+        "and code simplification — then give me a prioritised summary of "
+        "findings with file:line references and suggested fixes."
     )
 
 
-REVIEW_PROMPT_FILE_BASED = _build_file_based_prompt()
+REVIEW_PROMPT_SKILL_BASED = _build_skill_based_prompt()
+
+
+@dataclass(frozen=True)
+class _SkillSnapshot:
+    """Pre-materialise state of one `.agents/skills/<name>/` dir.
+
+    `original_skill_md` is the byte content of any pre-existing
+    `SKILL.md` at the target (or `None` if the file didn't exist).
+    `skill_dir_existed` records whether the parent skill dir was
+    already there — so cleanup only `rmdir`s the dirs we created.
+    """
+
+    original_skill_md: bytes | None
+    skill_dir_existed: bool
+
+
+@dataclass(frozen=True)
+class _MaterialisedSkills:
+    """Restoration manifest produced by `_materialise_skills`.
+
+    Captures pre-launch workspace state so `_cleanup_skills` can restore
+    the worktree byte-for-byte even when the PR happens to ship its own
+    `.agents/skills/<our-name>/SKILL.md`. Without this, materialise
+    would overwrite a tracked file and cleanup would `unlink` it,
+    leaving the working tree dirty after every review.
+    """
+
+    workspace: Path
+    skills: dict[str, _SkillSnapshot]
+    skills_root_existed: bool
+    agents_dir_existed: bool
+
+
+def _materialise_skills(workspace: Path) -> _MaterialisedSkills:
+    """Copy each bundled SKILL.md into `<workspace>/.agents/skills/<name>/SKILL.md`.
+
+    Codex and Gemini auto-discover skills under `.agents/skills/`. We
+    write the six bundled skills there so they're picked up by the CLI
+    at session start. Pre-existing content at every target path
+    (SKILL.md bytes, parent-dir presence) is snapshotted into the
+    returned `_MaterialisedSkills` manifest BEFORE the write, so
+    `_cleanup_skills` can restore the worktree exactly — including the
+    rare case where a reviewed repo ships its own competing skill of
+    the same name.
+    """
+    skills_root = workspace / ".agents" / "skills"
+    agents_dir = workspace / ".agents"
+
+    agents_dir_existed = agents_dir.is_dir()
+    skills_root_existed = skills_root.is_dir()
+
+    snapshots: dict[str, _SkillSnapshot] = {}
+    src_dir = _skills_dir()
+
+    for name in REVIEW_SKILLS:
+        skill_dir = skills_root / name
+        skill_md = skill_dir / SKILL_FILE_NAME
+
+        skill_dir_existed = skill_dir.is_dir()
+        original_bytes = skill_md.read_bytes() if skill_md.is_file() else None
+
+        snapshots[name] = _SkillSnapshot(
+            original_skill_md=original_bytes,
+            skill_dir_existed=skill_dir_existed,
+        )
+
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copy2(src_dir / name / SKILL_FILE_NAME, skill_md)
+        except OSError as e:
+            # Disk full, permission denied, read-only FS — surface which
+            # skill failed so the user has a clear diagnostic instead of
+            # a bare `shutil` traceback. The partial manifest still has
+            # snapshots for every skill we DID write to, so `finally`
+            # cleanup can restore those before propagating this error.
+            raise RuntimeError(f"failed to materialise skill {name!r}: {e}") from e
+
+    return _MaterialisedSkills(
+        workspace=workspace,
+        skills=snapshots,
+        skills_root_existed=skills_root_existed,
+        agents_dir_existed=agents_dir_existed,
+    )
+
+
+def _rmdir_if_empty(path: Path) -> None:
+    """`rmdir` only if the dir is empty; warn on any other OSError.
+
+    Replaces the previous `contextlib.suppress(OSError)`, which would
+    have hidden a perms regression or a stale lock the same as the
+    expected ENOTEMPTY case — leaving orphan files with no signal.
+    """
+    try:
+        path.rmdir()
+    except OSError as e:
+        if e.errno not in (errno.ENOTEMPTY, errno.EEXIST):
+            print(f"warning: could not rmdir {path}: {e}")
+
+
+def _cleanup_skills(manifest: _MaterialisedSkills) -> None:
+    """Reverse of `_materialise_skills` using the manifest it returned.
+
+    For each skill: if a SKILL.md existed before materialise, restore
+    those exact bytes; otherwise unlink the one we wrote. Then `rmdir`
+    any parent dir we created (`rmdir` only succeeds on empty dirs, so
+    sibling content the user owns is preserved automatically).
+
+    The byte restore uses `write_bytes` rather than swallowing errors —
+    if we can't put the user's tracked file back, that's a data-loss
+    bug we want loud, not silent. The unlink branch uses an explicit
+    `suppress(FileNotFoundError)` rather than `missing_ok=True` so that
+    other `OSError` subtypes (perms, replaced-by-dir) still surface
+    instead of masking the originating launch exception when this
+    runs inside `finally`.
+    """
+    skills_root = manifest.workspace / ".agents" / "skills"
+    for name, snap in manifest.skills.items():
+        skill_md = skills_root / name / SKILL_FILE_NAME
+        if snap.original_skill_md is not None:
+            skill_md.write_bytes(snap.original_skill_md)
+        else:
+            with contextlib.suppress(FileNotFoundError):
+                skill_md.unlink()
+        if not snap.skill_dir_existed:
+            _rmdir_if_empty(skills_root / name)
+
+    if not manifest.skills_root_existed:
+        _rmdir_if_empty(skills_root)
+    if not manifest.agents_dir_existed:
+        _rmdir_if_empty(manifest.workspace / ".agents")
 
 
 def _build_cli_command(cli: CliChoice, prompt_text: str) -> list[str]:
@@ -167,12 +326,20 @@ def _build_cli_command(cli: CliChoice, prompt_text: str) -> list[str]:
     if cli == "claude":
         return ["claude", "--permission-mode", "acceptEdits", prompt_text]
     if cli == "codex":
+        # `-c sandbox_workspace_write.network_access=true` keeps the
+        # filesystem sandbox (writes scoped to the workspace) but
+        # restores network access — required so `gh api …` calls in the
+        # post-inline review path can reach GitHub. Without this override
+        # codex's workspace-write sandbox blocks network by default,
+        # and the review silently fails to publish inline comments.
         return [
             "codex",
             "--ask-for-approval",
             "never",
             "--sandbox",
             "workspace-write",
+            "-c",
+            "sandbox_workspace_write.network_access=true",
             prompt_text,
         ]
     if cli == "gemini":
@@ -323,6 +490,16 @@ _CLI_CYCLE: dict[CliChoice, CliChoice] = {
     "gemini": "claude",
 }
 DEFAULT_CLI: CliChoice = "claude"
+
+# CLIs that consume bundled `.agents/skills/` material (i.e. ones that
+# need `_materialise_skills` / `_cleanup_skills` around the launch).
+# Names the concept once so the materialise-site and finally-block
+# gates can't drift apart — without it, adding a fourth skill-using
+# CLI later means updating two literal tuples and forgetting one would
+# leak files (materialise without cleanup) or skip skills entirely
+# (cleanup-gate hit, materialise-gate missed). Claude has its own
+# plugin marketplace and doesn't use this path.
+_SKILL_BASED_CLIS: frozenset[CliChoice] = frozenset({"codex", "gemini"})
 
 # Human-facing display names for banners, modal labels, and toast messages.
 _CLI_DISPLAY: dict[CliChoice, str] = {
@@ -495,15 +672,43 @@ def check_prereqs() -> list[str]:
             "    • OpenAI Codex CLI: https://github.com/openai/codex\n"
             "    • Google Gemini CLI: https://github.com/google-gemini/gemini-cli"
         )
-    elif not _review_agents_dir().is_dir():
-        # The bundled agent prompts are mandatory for codex/gemini and
-        # harmless for claude. If they're missing the install is broken
-        # regardless of which CLI the user ends up on, so this stays a
-        # hard startup failure.
-        problems.append(
-            f"bundled review-agent prompts missing at {_review_agents_dir()} "
-            "— reinstall cc-pr-reviewer"
-        )
+    else:
+        skills_dir = _skills_dir()
+        missing: list[str] = []
+        malformed: list[str] = []
+        for name in REVIEW_SKILLS:
+            skill_md = skills_dir / name / SKILL_FILE_NAME
+            if not skill_md.is_file():
+                missing.append(name)
+                continue
+            # A present-but-malformed SKILL.md (empty file from a
+            # half-extracted wheel, frontmatter stripped by a bad merge)
+            # would pass an `is_file()` check and only surface as a
+            # "skill not found" error from codex/gemini mid-review.
+            # Cheap shape check (~200 bytes per skill at startup) keeps
+            # the failure in the same `problems` flow as missing files.
+            try:
+                head = skill_md.read_bytes()[:512].decode("utf-8", errors="replace")
+            except OSError:
+                malformed.append(name)
+                continue
+            if not head.startswith("---\n") or f"name: {name}" not in head:
+                malformed.append(name)
+        if missing:
+            # The bundled skills are mandatory for codex/gemini and harmless
+            # for claude. Verify every expected SKILL.md is on disk (not just
+            # the parent dir) so a partial extraction surfaces here rather
+            # than later as a "skill not found" runtime error from the CLI.
+            problems.append(
+                f"bundled review skills missing at {skills_dir} "
+                f"(missing: {', '.join(missing)}) — reinstall cc-pr-reviewer"
+            )
+        if malformed:
+            problems.append(
+                f"bundled review skills present but malformed at {skills_dir} "
+                f"(missing/incorrect frontmatter: {', '.join(malformed)}) — "
+                "reinstall cc-pr-reviewer"
+            )
 
     if shutil.which("git") is None:
         problems.append("`git` not found on PATH — install git")
@@ -771,8 +976,9 @@ def build_review_prompt(
 
     `cli` selects the base review prompt: `claude` uses the
     plugin-driven `REVIEW_PROMPT_CLAUDE`, while `codex` and `gemini`
-    share `REVIEW_PROMPT_FILE_BASED` (which references the bundled
-    agent Markdown files). All `POST_INLINE_*` suffixes apply identically
+    share `REVIEW_PROMPT_SKILL_BASED` (which references the six bundled
+    skills by name; materialisation into `.agents/skills/` happens in
+    `_launch_claude`). All `POST_INLINE_*` suffixes apply identically
     to every CLI — they're about `gh` CLI usage, not the reviewing
     agent. `cli` defaults to `"claude"` so existing callers and tests
     remain valid without churn.
@@ -804,7 +1010,7 @@ def build_review_prompt(
     # but drop the auto-approve instruction.
     rereview_can_approve = rereview and author_login != my_login
 
-    base = REVIEW_PROMPT_CLAUDE if cli == "claude" else REVIEW_PROMPT_FILE_BASED
+    base = REVIEW_PROMPT_CLAUDE if cli == "claude" else REVIEW_PROMPT_SKILL_BASED
     sections = [base]
     # Strip defensively — the current ConfirmResult dataclass already strips,
     # but `build_review_prompt` is now an API boundary and a future caller
@@ -2628,13 +2834,14 @@ class PRReviewer(App):
 
         # Claude additionally needs the PR Review Toolkit plugin (the
         # base prompt invokes the toolkit's agents by name). Codex and
-        # Gemini reference the bundled `.md` files instead, so no extra
-        # check applies to them. The plugin check is the slow one — it
-        # shells out to `claude plugin list --json` — so it stays gated
-        # behind the binary check above. `None` (undetectable) is
-        # surfaced separately so a hung/crashed `claude plugin list`
-        # doesn't silently pass-through into a review where the prompt
-        # refers to agents the plugin can't load.
+        # Gemini load the bundled skills from `.agents/skills/` instead
+        # (materialised below per launch), so no extra check applies to
+        # them. The plugin check is the slow one — it shells out to
+        # `claude plugin list --json` — so it stays gated behind the
+        # binary check above. `None` (undetectable) is surfaced
+        # separately so a hung/crashed `claude plugin list` doesn't
+        # silently pass-through into a review where the prompt refers
+        # to agents the plugin can't load.
         if cli == "claude":
             plugin_state = _pr_review_toolkit_enabled()
             if plugin_state is False:
@@ -2681,6 +2888,11 @@ class PRReviewer(App):
                 input("Press Enter to return to the TUI…")
                 return
 
+            # Captured here so the `finally` block can call `_cleanup_skills`
+            # only if materialisation actually completed — early-return paths
+            # below (clone-fail, checkout-fail) leave it `None` and skip the
+            # restore.
+            skills_manifest: _MaterialisedSkills | None = None
             try:
                 if not local_path.exists():
                     print(f"Cloning {repo_full} → {local_path}…")
@@ -2709,6 +2921,20 @@ class PRReviewer(App):
                     head_sha = ""
                 else:
                     head_sha = sha_r.stdout.strip()
+
+                # Materialise the bundled review skills into the PR
+                # workspace so the skill-based CLIs (see _SKILL_BASED_CLIS)
+                # discover them at session start. Done AFTER `gh pr
+                # checkout --force` (which would otherwise reset our
+                # writes). The returned manifest snapshots any pre-existing
+                # SKILL.md bytes so `_cleanup_skills` can restore them
+                # exactly even if the reviewed PR ships its own colliding
+                # skill of the same name. Cleanup runs in `finally` so
+                # Ctrl-C, crashes, and clean exits all leave the workspace
+                # byte-identical to its pre-launch state.
+                if cli in _SKILL_BASED_CLIS:
+                    print(f"Materialising review skills under {local_path}/.agents/skills/…")
+                    skills_manifest = _materialise_skills(local_path)
 
                 print("Fetching existing review comments…")
                 existing, fetch_ok = fetch_existing_review_comments(repo_full, number)
@@ -2784,6 +3010,17 @@ class PRReviewer(App):
                     f"\n── {_CLI_DISPLAY[cli]} session ended. Press Enter to return to the TUI ──"
                 )
             finally:
+                # Restore the materialised skills before releasing the
+                # reservation so the workspace is in its pre-launch state
+                # by the time the slot is yielded. (The reservation is
+                # per-PR, so it doesn't serialise peers reviewing
+                # *different* PRs of the same repo — and `gh pr checkout
+                # --force` already races on the shared worktree for those,
+                # which is a pre-existing limitation orthogonal to skills.)
+                # The `None` guard handles early-return paths above where
+                # materialisation never ran — there's nothing to restore.
+                if skills_manifest is not None:
+                    _cleanup_skills(skills_manifest)
                 _release_in_progress(self.review_db, key)
 
         # Refresh in case review state changed (e.g. you approved the PR).
