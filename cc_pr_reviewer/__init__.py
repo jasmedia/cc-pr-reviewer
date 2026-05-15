@@ -80,13 +80,109 @@ _APP_HOSTNAME = socket.gethostname()
 # The prompt we hand Claude Code when it starts up in the PR's working tree.
 # The PR Review Toolkit plugin will pick up on these cues and route to the
 # right sub-agents.
-REVIEW_PROMPT = (
+REVIEW_PROMPT_CLAUDE = (
     "Please perform a comprehensive review of the current PR using the "
     "PR Review Toolkit. Run the relevant agents — Comment Analyzer, PR Test "
     "Analyzer, Silent Failure Hunter, Type Design Analyzer, Code Reviewer, "
     "and Code Simplifier — and give me a prioritised summary of findings "
     "with file:line references and suggested fixes."
 )
+
+# Codex and Gemini don't have a plugin marketplace, so the six toolkit
+# agents ship as bundled Markdown files (see `cc_pr_reviewer/pr_review_agents/`).
+# The order here is the order Codex/Gemini will be asked to apply them —
+# code-reviewer first sets project-guideline context, then the targeted
+# checks (silent failures, type design, tests), then the cleanup-oriented
+# passes (comments, simplification). Changing the order is a behaviour
+# change, so the tuple is the single source of truth consulted by both the
+# prompt builder and the prereq check.
+REVIEW_AGENT_FILES: tuple[str, ...] = (
+    "code-reviewer.md",
+    "silent-failure-hunter.md",
+    "type-design-analyzer.md",
+    "pr-test-analyzer.md",
+    "comment-analyzer.md",
+    "code-simplifier.md",
+)
+
+
+def _review_agents_dir() -> Path:
+    """Return the bundled directory holding the file-based agent prompts.
+
+    Resolved against `__file__` so editable installs (`uv sync`) and wheel
+    installs (`pip install`) both work — hatchling packages the directory
+    next to `__init__.py` in both cases. `importlib.resources` is avoided
+    because the agents are read by an external subprocess (`codex` /
+    `gemini`), not by Python — so we always need a filesystem path, not
+    a `Traversable`.
+    """
+    return Path(__file__).parent / "pr_review_agents"
+
+
+def _build_file_based_prompt() -> str:
+    """Compose the review prompt for the file-based CLIs (codex, gemini).
+
+    The agent files live in this repo (not in any Claude plugin), so the
+    prompt simply lists their absolute paths and asks the CLI to read each
+    one in turn. Identical for codex and gemini — they share the prompt and
+    differ only in how they're launched.
+    """
+    agents_dir = _review_agents_dir()
+    bullets = "\n".join(f"  • {agents_dir / name}" for name in REVIEW_AGENT_FILES)
+    return (
+        "Please perform a comprehensive review of the current PR by applying "
+        "the six review criteria documented in these files (read each before "
+        "reviewing):\n\n"
+        f"{bullets}\n\n"
+        "Then give me a prioritised summary of findings with file:line "
+        "references and suggested fixes."
+    )
+
+
+REVIEW_PROMPT_FILE_BASED = _build_file_based_prompt()
+
+
+def _build_cli_command(cli: CliChoice, prompt_text: str) -> list[str]:
+    """Build the subprocess argv for handing control to the selected CLI.
+
+    Flag picks mirror Claude's `--permission-mode acceptEdits` posture as
+    closely as each CLI permits — no approval prompts, edits allowed
+    inside the cloned PR workspace, but no broader host access:
+
+    * `claude --permission-mode acceptEdits` (unchanged).
+    * `codex --ask-for-approval never --sandbox workspace-write`. Picking
+      `never` + `workspace-write` keeps the sandbox guard while skipping
+      approval prompts. `--yolo` / `--dangerously-bypass-approvals-and-sandbox`
+      is rejected because it also removes the sandbox — a behaviour shift
+      vs the existing Claude flow.
+    * `gemini --approval-mode auto_edit`. The `auto_edit` value is the
+      documented analogue of Claude's `acceptEdits` (auto-approve edits,
+      still gate risky operations). The older `--yolo` / `-y` flag is
+      deprecated upstream in favour of `--approval-mode=yolo`.
+
+    Only this function knows the flag surface — every other launch-path
+    code path is CLI-agnostic, so flag-name churn in either upstream CLI
+    is a one-function change.
+    """
+    if cli == "claude":
+        return ["claude", "--permission-mode", "acceptEdits", prompt_text]
+    if cli == "codex":
+        return [
+            "codex",
+            "--ask-for-approval",
+            "never",
+            "--sandbox",
+            "workspace-write",
+            prompt_text,
+        ]
+    if cli == "gemini":
+        return ["gemini", "--approval-mode", "auto_edit", prompt_text]
+    # Defensive: CliChoice is a Literal of exactly those three, so this
+    # is reachable only if someone widens the type without updating this
+    # switch. Make that failure loud rather than silently emitting a
+    # mystery argv.
+    raise ValueError(f"unknown CLI choice: {cli!r}")
+
 
 POST_INLINE_PROMPT = (
     "Additionally, publish each finding as an inline PR review comment on "
@@ -216,6 +312,25 @@ _GROUP_CYCLE: dict[GroupBy, GroupBy] = {"": "repo", "repo": "author", "author": 
 SortBy = Literal["", "updated"]
 _SORT_CYCLE: dict[SortBy, SortBy] = {"": "updated", "updated": ""}
 
+# Which coding-agent CLI to hand the review off to. Single source of truth
+# for the cycle order (footer-key `c` and the modal Ctrl+L override both
+# consult `_CLI_CYCLE`), so adding a fourth CLI later is one dict edit.
+# Default is "claude" for back-compat with installs that predate the toggle.
+CliChoice = Literal["claude", "codex", "gemini"]
+_CLI_CYCLE: dict[CliChoice, CliChoice] = {
+    "claude": "codex",
+    "codex": "gemini",
+    "gemini": "claude",
+}
+DEFAULT_CLI: CliChoice = "claude"
+
+# Human-facing display names for banners, modal labels, and toast messages.
+_CLI_DISPLAY: dict[CliChoice, str] = {
+    "claude": "Claude Code",
+    "codex": "Codex",
+    "gemini": "Gemini",
+}
+
 # PyPI update-check lifecycle. "unavailable" is for source/editable installs
 # where `_installed_version()` returns None and there's nothing to compare;
 # the worker doesn't run and `action_upgrade` shows a tailored message rather
@@ -266,8 +381,24 @@ PR_REVIEW_TOOLKIT_URL = "https://claude.com/plugins/pr-review-toolkit"
 
 
 def _pr_review_toolkit_enabled() -> bool | None:
-    """True if the plugin is installed & enabled, False if not, None if undetectable."""
-    r = run(["claude", "plugin", "list", "--json"])
+    """True if the plugin is installed & enabled, False if not, None if undetectable.
+
+    Callers must treat `None` distinctly from `False` — `None` means we
+    couldn't determine plugin status (binary missing, subprocess hung
+    past the timeout, malformed JSON), not "no". Silently treating
+    `None` as `True` (or as `False`) is exactly the silent-fallback
+    anti-pattern called out in CLAUDE.md.
+
+    The 5 s timeout guards the TUI thread: this runs synchronously
+    before `self.suspend()` inside `_launch_claude`, so a stalled
+    `claude` (slow disk, hung child, network-mounted plugin dir, an
+    unresponsive marketplace probe) would otherwise freeze the entire
+    TUI indefinitely with no frame updates and no Ctrl-C handling.
+    """
+    try:
+        r = run(["claude", "plugin", "list", "--json"], timeout=5)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
     if r.returncode != 0:
         return None
     try:
@@ -282,24 +413,98 @@ def _pr_review_toolkit_enabled() -> bool | None:
     return False
 
 
+def _persisted_cli() -> CliChoice:
+    """Read the persisted CLI choice without instantiating the full app.
+
+    `check_prereqs` runs before `PRReviewer.__init__`, so it can't reach
+    through `self.review_db`. Returns `DEFAULT_CLI` on any failure
+    (missing DB, corrupt row, unrecognised value, unwritable workspace)
+    so a transient I/O issue can't crash startup before the TUI mounts
+    — the launcher's pre-flight check surfaces a missing binary at
+    review time anyway.
+
+    Both exception classes are needed: `_open_review_db()` calls
+    `Path.mkdir(parents=True, exist_ok=True)` which raises `OSError`
+    on a read-only or permission-denied workspace dir; and
+    `_get_setting()` raises `sqlite3.Error` on a corrupt settings table
+    or an `OperationalError: database is locked past busy_timeout`. The
+    original implementation caught only the connect-time `sqlite3.Error`
+    and left both of these uncovered.
+    """
+    try:
+        conn = _open_review_db()
+        try:
+            v = _get_setting(conn, "cli", DEFAULT_CLI)
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError):
+        return DEFAULT_CLI
+    return v if v in _CLI_CYCLE else DEFAULT_CLI
+
+
+def _first_available_cli(preferred: CliChoice) -> CliChoice | None:
+    """Walk the CLI cycle starting at `preferred`; return the first on PATH.
+
+    Used at startup to pick a session-level fallback when the persisted
+    CLI isn't installed on this machine — a Codex-only user who sees
+    `claude` as the persisted default (because that's `DEFAULT_CLI`)
+    should still be able to launch the TUI. The cycle order (claude →
+    codex → gemini → claude) keeps the fallback predictable: the next
+    CLI you'd land on if you pressed `c` once.
+
+    Returns `None` if none of the three supported CLIs is installed —
+    in which case the app genuinely can't review anything and startup
+    should fail.
+    """
+    candidate = preferred
+    for _ in range(len(_CLI_CYCLE)):
+        if shutil.which(candidate) is not None:
+            return candidate
+        candidate = _CLI_CYCLE[candidate]
+    return None
+
+
 def check_prereqs() -> list[str]:
-    """Return a list of human-readable problems (empty if everything is ready)."""
+    """Return a list of human-readable problems (empty if everything is ready).
+
+    Gates startup on the absolute minimum — `gh` (authenticated), `git`,
+    and **at least one** of the three supported review CLIs on PATH.
+    The specific CLI the user picked may be unavailable on this machine,
+    but as long as one CLI is installed the TUI can launch and the user
+    can fall back to / toggle to the installed one. The launcher does a
+    second pre-flight check at review time that surfaces the
+    CLI-specific problem (missing binary, missing toolkit plugin)
+    against whichever CLI is selected for that launch.
+
+    The toolkit-plugin check is intentionally NOT here: it only matters
+    when cli=claude, and a Codex/Gemini user shouldn't be blocked from
+    starting the TUI because the Claude plugin isn't installed. The
+    pre-flight check inside `_launch_claude` covers it.
+    """
     problems: list[str] = []
     if shutil.which("gh") is None:
         problems.append("`gh` CLI not found on PATH — install from https://cli.github.com")
-    else:
-        if run(["gh", "auth", "status"]).returncode != 0:
-            problems.append("`gh` is not authenticated — run: gh auth login")
-    if shutil.which("claude") is None:
-        problems.append("`claude` CLI not found on PATH — install Claude Code")
-    else:
-        enabled = _pr_review_toolkit_enabled()
-        if enabled is False:
-            problems.append(
-                "PR Review Toolkit plugin not enabled — "
-                f"install & enable from {PR_REVIEW_TOOLKIT_URL} "
-                f"(or run: claude plugin install {PR_REVIEW_TOOLKIT_PLUGIN})"
-            )
+    elif run(["gh", "auth", "status"]).returncode != 0:
+        problems.append("`gh` is not authenticated — run: gh auth login")
+
+    if _first_available_cli(_persisted_cli()) is None:
+        problems.append(
+            "no supported review CLI on PATH — install at least one of:\n"
+            "    • Claude Code: https://claude.com (and: claude plugin install "
+            f"{PR_REVIEW_TOOLKIT_PLUGIN})\n"
+            "    • OpenAI Codex CLI: https://github.com/openai/codex\n"
+            "    • Google Gemini CLI: https://github.com/google-gemini/gemini-cli"
+        )
+    elif not _review_agents_dir().is_dir():
+        # The bundled agent prompts are mandatory for codex/gemini and
+        # harmless for claude. If they're missing the install is broken
+        # regardless of which CLI the user ends up on, so this stays a
+        # hard startup failure.
+        problems.append(
+            f"bundled review-agent prompts missing at {_review_agents_dir()} "
+            "— reinstall cc-pr-reviewer"
+        )
+
     if shutil.which("git") is None:
         problems.append("`git` not found on PATH — install git")
     return problems
@@ -555,13 +760,22 @@ def build_review_prompt(
     fetch_ok: bool,
     my_login: str | None,
     author_login: str | None,
+    cli: CliChoice = DEFAULT_CLI,
 ) -> BuiltPrompt:
-    """Assemble the user message for `claude`. Pure — no I/O.
+    """Assemble the user message for the selected coding-agent CLI. Pure — no I/O.
 
     Isolated from `_launch_claude` so the conditional `POST_INLINE_*`
     suffix matrix (locked by `tests/test_cc_pr_reviewer.py`) is
     unit-testable in isolation; that matrix is the most regression-prone
     part of the file.
+
+    `cli` selects the base review prompt: `claude` uses the
+    plugin-driven `REVIEW_PROMPT_CLAUDE`, while `codex` and `gemini`
+    share `REVIEW_PROMPT_FILE_BASED` (which references the bundled
+    agent Markdown files). All `POST_INLINE_*` suffixes apply identically
+    to every CLI — they're about `gh` CLI usage, not the reviewing
+    agent. `cli` defaults to `"claude"` so existing callers and tests
+    remain valid without churn.
 
     Contract: `fetch_existing_review_comments` guarantees that
     `fetch_ok=False` always returns `existing=[]`. Passing a non-empty
@@ -590,7 +804,8 @@ def build_review_prompt(
     # but drop the auto-approve instruction.
     rereview_can_approve = rereview and author_login != my_login
 
-    sections = [REVIEW_PROMPT]
+    base = REVIEW_PROMPT_CLAUDE if cli == "claude" else REVIEW_PROMPT_FILE_BASED
+    sections = [base]
     # Strip defensively — the current ConfirmResult dataclass already strips,
     # but `build_review_prompt` is now an API boundary and a future caller
     # (or test) passing whitespace-only `extra_prompt` would otherwise render
@@ -1240,10 +1455,16 @@ class ConfirmResult:
     `extra_prompt` is normalised on construction: leading/trailing whitespace
     is stripped so a whitespace-only value can never reach the prompt-builder
     and inject an empty `Additional instructions from reviewer:` section.
+
+    `cli` carries the per-launch CLI choice. It defaults to the global
+    `PRReviewer.cli` at modal-open time and may be cycled inside the modal
+    via Ctrl+L. The override is one-shot — the launcher honours it but
+    does NOT write back to the global setting.
     """
 
     post_inline: bool
     extra_prompt: str = ""
+    cli: CliChoice = DEFAULT_CLI
 
     def __post_init__(self) -> None:
         # `frozen=True` blocks attribute assignment; bypass via __setattr__
@@ -1300,27 +1521,32 @@ class ConfirmScreen(ModalScreen[ConfirmResult | None]):
         #
         # Toggle is on `ctrl+t` (not `ctrl+p`) because Textual's command
         # palette is a `priority=True` App-level binding on `ctrl+p` and
-        # would otherwise win.
+        # would otherwise win. CLI cycling is on `ctrl+l` for the same
+        # reason — `ctrl+c` exits Textual.
         Binding("enter", "confirm", "Confirm", priority=True),
         Binding("ctrl+y", "confirm", "Confirm", priority=True, show=False),
         Binding("escape", "cancel", "Cancel", priority=True),
         Binding("ctrl+n", "cancel", "Cancel", priority=True, show=False),
         Binding("ctrl+t", "toggle_post_inline", "Toggle post-inline", priority=True),
+        Binding("ctrl+l", "cycle_cli", "Cycle CLI", priority=True),
     ]
 
-    def __init__(self, prompt: str):
+    def __init__(self, prompt: str, default_cli: CliChoice = DEFAULT_CLI):
         super().__init__()
         self.prompt = prompt
         self.post_inline = True
+        self.cli: CliChoice = default_cli
 
     def compose(self) -> ComposeResult:
         hint = (
             "[b]Enter[/] / [b]Ctrl+Y[/] confirm • [b]Esc[/] / [b]Ctrl+N[/] cancel "
-            "• [b]Ctrl+T[/] toggle post-inline • [b]Shift+Enter[/] newline"
+            "• [b]Ctrl+T[/] toggle post-inline • [b]Ctrl+L[/] cycle CLI "
+            "• [b]Shift+Enter[/] newline"
         )
         yield Vertical(
             Label(self.prompt, id="confirm-title", markup=False),
             Label(self._checkbox_text(), id="confirm-checkbox", markup=False),
+            Label(self._cli_text(), id="confirm-cli", markup=False),
             Label("Extra prompt (optional):", id="confirm-extra-label"),
             ExtraPromptTextArea(id="confirm-extra"),
             Label(hint, id="confirm-hint"),
@@ -1331,9 +1557,12 @@ class ConfirmScreen(ModalScreen[ConfirmResult | None]):
         mark = "[x]" if self.post_inline else "[ ]"
         return f"{mark} Post findings as inline PR comments"
 
+    def _cli_text(self) -> str:
+        return f"CLI: {_CLI_DISPLAY[self.cli]}"
+
     def action_confirm(self) -> None:
         text = self.query_one("#confirm-extra", TextArea).text
-        self.dismiss(ConfirmResult(post_inline=self.post_inline, extra_prompt=text))
+        self.dismiss(ConfirmResult(post_inline=self.post_inline, extra_prompt=text, cli=self.cli))
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -1341,6 +1570,10 @@ class ConfirmScreen(ModalScreen[ConfirmResult | None]):
     def action_toggle_post_inline(self) -> None:
         self.post_inline = not self.post_inline
         self.query_one("#confirm-checkbox", Label).update(self._checkbox_text())
+
+    def action_cycle_cli(self) -> None:
+        self.cli = _CLI_CYCLE[self.cli]
+        self.query_one("#confirm-cli", Label).update(self._cli_text())
 
 
 # --- In-progress warning modal ---------------------------------------------
@@ -1669,13 +1902,14 @@ class PRReviewer(App):
 
     BINDINGS = [
         Binding("r,f5", "refresh", "Refresh"),
-        Binding("enter", "review", "Review w/ Claude"),
+        Binding("enter", "review", "Review"),
         Binding("o", "open_web", "Open in browser"),
         Binding("d", "show_diff", "View diff"),
         Binding("m", "toggle_mine", "Toggle my PRs"),
         Binding("f", "filter", "Filter by repo"),
         Binding("g", "toggle_group", "Group by"),
         Binding("s", "toggle_sort", "Sort by"),
+        Binding("c", "toggle_cli", "CLI"),
         Binding("u", "upgrade", "Upgrade"),
         Binding("q", "quit", "Quit"),
     ]
@@ -1703,6 +1937,35 @@ class PRReviewer(App):
         self.group_by: GroupBy = stored_group if stored_group in _GROUP_CYCLE else ""
         stored_sort = _get_setting(self.review_db, "sort_by", "")
         self.sort_by: SortBy = stored_sort if stored_sort in _SORT_CYCLE else ""
+        stored_cli = _get_setting(self.review_db, "cli", DEFAULT_CLI)
+        persisted: CliChoice = stored_cli if stored_cli in _CLI_CYCLE else DEFAULT_CLI
+        # If the persisted CLI isn't on PATH, fall back to whatever IS
+        # installed (in cycle order from the persisted preference) so a
+        # Codex-only user on a fresh install doesn't get stuck with the
+        # `claude` default. The fallback is session-only — pressing `c`
+        # is what persists a new choice. `check_prereqs` already
+        # guaranteed at least one CLI is available, but a TOCTOU race
+        # (every CLI uninstalled between prereq check and __init__) is
+        # surfaced as `_no_cli_available=True` so `on_mount` can warn
+        # rather than silently leaving the user with a broken `self.cli`
+        # whose failure only appears at first Enter-to-review.
+        self._cli_fallback_from: CliChoice | None = None
+        self._no_cli_available: bool = False
+        if shutil.which(persisted) is None:
+            fallback = _first_available_cli(persisted)
+            if fallback is None:
+                # No supported CLI on PATH at all. Keep `self.cli` as
+                # the persisted preference so the footer/status reflect
+                # what the user *wanted*; on_mount fires a high-severity
+                # toast and pre-flight in `_launch_claude` re-checks.
+                self.cli: CliChoice = persisted
+                self._no_cli_available = True
+            else:
+                self.cli = fallback
+                if fallback != persisted:
+                    self._cli_fallback_from = persisted
+        else:
+            self.cli = persisted
         self._row_to_pr_idx: list[int | None] = []
         # Snapshot of `reviews_in_progress` rows from the most recent poll,
         # keyed by `pr_key`. `_poll_in_progress` diffs against this to
@@ -1755,6 +2018,32 @@ class PRReviewer(App):
             ),
         )
         self._refresh_footer_indicators()
+        # Surface CLI-availability problems set in `__init__`. Two
+        # distinct cases:
+        #   * `_no_cli_available`: TOCTOU race — every supported CLI was
+        #     uninstalled between `check_prereqs` and now. Show a
+        #     persistent error toast so the user isn't blindsided by
+        #     the pre-flight failure when they hit Enter.
+        #   * `_cli_fallback_from`: persisted CLI is missing but
+        #     another one is on PATH. Warning toast — the TUI still
+        #     works, just not on the CLI they wanted.
+        if self._no_cli_available:
+            self.notify(
+                "no review CLI on PATH — install one of `claude`, "
+                "`codex`, or `gemini` before pressing Enter on a PR. "
+                "(`check_prereqs` accepted startup; the binary disappeared "
+                "between then and now.)",
+                severity="error",
+                timeout=15,
+            )
+        elif self._cli_fallback_from is not None:
+            self.notify(
+                f"`{self._cli_fallback_from}` not on PATH — "
+                f"using {_CLI_DISPLAY[self.cli]} this session. "
+                "Press `c` to switch, or install the missing CLI.",
+                severity="warning",
+                timeout=10,
+            )
         self.action_refresh()
         # Cross-instance "in review" indicator. 3 s is fast enough to feel
         # live (another tab finishing/starting a review is reflected
@@ -1779,6 +2068,10 @@ class PRReviewer(App):
         self._set_footer_active("f", self.repo_filter is not None)
         self._set_footer_active("g", bool(self.group_by))
         self._set_footer_active("s", bool(self.sort_by))
+        # Highlight `c` whenever the user has moved off the default CLI,
+        # so the footer always advertises a non-default selection without
+        # consuming a separate status-bar slot.
+        self._set_footer_active("c", self.cli != DEFAULT_CLI)
 
     def _set_footer_active(self, key: str, active: bool, retries: int = 2) -> None:
         """Toggle the `-state-active` CSS class on the FooterKey for `key`.
@@ -2104,7 +2397,7 @@ class PRReviewer(App):
             return
         repo = pr["repository"]["nameWithOwner"]
         title = pr.get("title", "")
-        prompt = f"Launch Claude Code review for {repo}#{pr['number']}?\n{title}"
+        prompt = f"Launch review for {repo}#{pr['number']}?\n{title}"
         pr_label = f"{repo}#{pr['number']}"
 
         def _confirm(expected_holder: InProgressHolder | None) -> None:
@@ -2114,10 +2407,11 @@ class PRReviewer(App):
                         pr,
                         result.post_inline,
                         result.extra_prompt,
+                        cli=result.cli,
                         expected_holder=expected_holder,
                     )
 
-            self.push_screen(ConfirmScreen(prompt), _proceed)
+            self.push_screen(ConfirmScreen(prompt, default_cli=self.cli), _proceed)
 
         # Use the cached snapshot from the periodic worker-thread poll
         # rather than a synchronous re-poll. Two reasons:
@@ -2211,6 +2505,20 @@ class PRReviewer(App):
                     table.move_cursor(row=row)
                     break
 
+    def action_toggle_cli(self) -> None:
+        # CLI choice doesn't affect the table contents, so there's no
+        # cursor preservation or re-populate to do — just cycle, persist,
+        # update the footer indicator, and notify. The launcher reads
+        # `self.cli` at action_review time.
+        nxt = _CLI_CYCLE[self.cli]
+        self.cli = nxt
+        try:
+            _set_setting(self.review_db, "cli", nxt)
+        except sqlite3.Error as e:
+            self.notify(f"Couldn't persist CLI toggle: {e}", severity="warning")
+        self.notify(f"CLI: {_CLI_DISPLAY[nxt]}", timeout=3)
+        self._refresh_footer_indicators()
+
     def action_toggle_sort(self) -> None:
         # Mirrors `action_toggle_group`: capture cursor PR identity, cycle the
         # mode, persist, render-only re-populate, then restore the cursor onto
@@ -2294,6 +2602,7 @@ class PRReviewer(App):
         pr: dict[str, Any],
         post_inline: bool,
         extra_prompt: str,
+        cli: CliChoice = DEFAULT_CLI,
         expected_holder: InProgressHolder | None = None,
     ) -> None:
         repo_full = pr["repository"]["nameWithOwner"]
@@ -2302,10 +2611,55 @@ class PRReviewer(App):
         local_path = WORKSPACE / owner / name
         key = _pr_key(pr)
 
-        # Suspend the TUI so Claude Code can take over stdin/stdout.
+        # Pre-flight: surface a missing CLI binary as a toast in the TUI
+        # rather than suspending and immediately failing at exec. This
+        # primarily catches the per-launch override case (user toggles
+        # CLI from the modal to one they don't have installed). Startup
+        # `check_prereqs` only verifies that at least one CLI exists —
+        # not the specific one being launched — so this check is the
+        # one that catches "you toggled to claude but it's not here".
+        if shutil.which(cli) is None:
+            self.notify(
+                f"`{cli}` not found on PATH — install it or pick a different CLI",
+                severity="error",
+                timeout=8,
+            )
+            return
+
+        # Claude additionally needs the PR Review Toolkit plugin (the
+        # base prompt invokes the toolkit's agents by name). Codex and
+        # Gemini reference the bundled `.md` files instead, so no extra
+        # check applies to them. The plugin check is the slow one — it
+        # shells out to `claude plugin list --json` — so it stays gated
+        # behind the binary check above. `None` (undetectable) is
+        # surfaced separately so a hung/crashed `claude plugin list`
+        # doesn't silently pass-through into a review where the prompt
+        # refers to agents the plugin can't load.
+        if cli == "claude":
+            plugin_state = _pr_review_toolkit_enabled()
+            if plugin_state is False:
+                self.notify(
+                    "PR Review Toolkit plugin not enabled — run "
+                    f"`claude plugin install {PR_REVIEW_TOOLKIT_PLUGIN}` "
+                    "or pick a different CLI",
+                    severity="error",
+                    timeout=10,
+                )
+                return
+            if plugin_state is None:
+                self.notify(
+                    "couldn't determine PR Review Toolkit plugin status "
+                    "(`claude plugin list --json` failed or timed out) — "
+                    "proceeding; if the review can't reach the toolkit "
+                    "agents, run that command manually to diagnose",
+                    severity="warning",
+                    timeout=10,
+                )
+
+        # Suspend the TUI so the coding-agent CLI can take over stdin/stdout.
         with self.suspend():
             WORKSPACE.mkdir(parents=True, exist_ok=True)
-            print(f"\n── Reviewing {repo_full}#{number} ──\n")
+            print(f"\n── Reviewing {repo_full}#{number} with {_CLI_DISPLAY[cli]} ──\n")
 
             # Reserve BEFORE clone/checkout: `gh pr checkout --force`
             # mutates the shared workspace tree. Two tabs both passing
@@ -2373,6 +2727,7 @@ class PRReviewer(App):
                     fetch_ok=fetch_ok,
                     my_login=my_login,
                     author_login=(pr.get("author") or {}).get("login"),
+                    cli=cli,
                 )
 
                 if not fetch_ok:
@@ -2383,7 +2738,7 @@ class PRReviewer(App):
                         f"{built.existing_total} fetched"
                     )
 
-                cmd = ["claude", "--permission-mode", "acceptEdits", built.text]
+                cmd = _build_cli_command(cli, built.text)
                 post_inline_desc = "on" if post_inline else "off"
                 if post_inline and built.rereview:
                     post_inline_desc += ", rereview"
@@ -2392,21 +2747,22 @@ class PRReviewer(App):
                 parts = [f"post-inline: {post_inline_desc}", existing_desc]
                 if extra_prompt:
                     # `!r` keeps newlines/control chars visible so a misclick paste
-                    # (e.g. a secret) is spottable before claude consumes it. The
+                    # (e.g. a secret) is spottable before the CLI consumes it. The
                     # explicit `(+N more chars)` suffix is the load-bearing piece:
                     # without it, a 201-char paste renders identically to a clean
-                    # 200-char one while the full text still flows into claude's
-                    # argv, defeating the whole point of the preview.
+                    # 200-char one while the full text still flows into argv,
+                    # defeating the whole point of the preview.
                     shown = extra_prompt[:EXTRA_PROMPT_BANNER_CAP]
                     hidden = len(extra_prompt) - len(shown)
                     suffix = f" (+{hidden} more chars)" if hidden else ""
                     parts.append(f"extra prompt: {shown!r}{suffix}")
                 print(
-                    f"\nLaunching Claude Code ({', '.join(parts)}) — type /exit when you're done.\n"
+                    f"\nLaunching {_CLI_DISPLAY[cli]} ({', '.join(parts)})"
+                    " — exit the CLI when you're done.\n"
                 )
                 rc = subprocess.call(cmd, cwd=local_path)
 
-                # Only count this as a review if Claude exited cleanly.
+                # Only count this as a review if the CLI exited cleanly.
                 # Ctrl-C, crashes, or a failed launch leave rc != 0;
                 # recording those would inflate the "Reviews" count and
                 # reset staleness for a PR that wasn't actually reviewed,
@@ -2419,9 +2775,14 @@ class PRReviewer(App):
                         head_sha,
                     )
                 else:
-                    print(f"\nClaude exited with status {rc}; not recording this as a review.")
+                    print(
+                        f"\n{_CLI_DISPLAY[cli]} exited with status {rc}; "
+                        "not recording this as a review."
+                    )
 
-                input("\n── Claude session ended. Press Enter to return to the TUI ──")
+                input(
+                    f"\n── {_CLI_DISPLAY[cli]} session ended. Press Enter to return to the TUI ──"
+                )
             finally:
                 _release_in_progress(self.review_db, key)
 
@@ -2593,10 +2954,7 @@ def main() -> None:
         print("⚠  Prerequisites not met:\n")
         for p in problems:
             print(f"  • {p}")
-        print(
-            "\nAlso make sure the PR Review Toolkit plugin is installed in Claude Code:"
-            "\n  https://claude.com/plugins/pr-review-toolkit\n"
-        )
+        print()
         raise SystemExit(1)
     PRReviewer().run()
 

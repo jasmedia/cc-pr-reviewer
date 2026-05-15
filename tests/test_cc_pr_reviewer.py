@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 
+import cc_pr_reviewer as _mod
 from cc_pr_reviewer import (
     _APP_HOSTNAME,
     EXISTING_COMMENT_BODY_CAP,
@@ -28,9 +29,13 @@ from cc_pr_reviewer import (
     POST_INLINE_REREVIEW_RESOLVE_SUFFIX,
     POST_INLINE_REREVIEW_SUFFIX,
     PROMPT_SECTION_SEP,
-    REVIEW_PROMPT,
+    REVIEW_AGENT_FILES,
+    REVIEW_PROMPT_CLAUDE,
+    REVIEW_PROMPT_FILE_BASED,
     InProgressHolder,
     ReviewInProgressError,
+    _build_cli_command,
+    _first_available_cli,
     _in_progress_age_str,
     _is_newer,
     _load_in_progress,
@@ -39,8 +44,10 @@ from cc_pr_reviewer import (
     _pid_alive,
     _release_in_progress,
     _reserve_in_progress,
+    _review_agents_dir,
     _review_cell,
     build_review_prompt,
+    check_prereqs,
     format_existing_comments,
 )
 
@@ -60,8 +67,21 @@ def _comment(login: str, **overrides: Any) -> dict[str, Any]:
     return base
 
 
-def test_plain_review_equals_base_prompt() -> None:
-    """post_inline=False with no extras returns REVIEW_PROMPT verbatim."""
+@pytest.mark.parametrize(
+    ("cli", "expected_base"),
+    [
+        ("claude", REVIEW_PROMPT_CLAUDE),
+        ("codex", REVIEW_PROMPT_FILE_BASED),
+        ("gemini", REVIEW_PROMPT_FILE_BASED),
+    ],
+)
+def test_plain_review_equals_base_prompt(cli: str, expected_base: str) -> None:
+    """post_inline=False with no extras returns the CLI's base prompt verbatim.
+
+    Claude uses the plugin-driven REVIEW_PROMPT_CLAUDE; codex and gemini
+    share REVIEW_PROMPT_FILE_BASED (they have no plugin marketplace, so
+    they reference the bundled agent .md files instead).
+    """
     built = build_review_prompt(
         post_inline=False,
         extra_prompt="",
@@ -69,8 +89,9 @@ def test_plain_review_equals_base_prompt() -> None:
         fetch_ok=True,
         my_login="alice",
         author_login="bob",
+        cli=cli,
     )
-    assert built.text == REVIEW_PROMPT
+    assert built.text == expected_base
     assert not built.rereview
     assert built.existing_shown == 0
     assert built.existing_total == 0
@@ -156,12 +177,23 @@ def test_my_comment_on_others_pr_triggers_full_rereview_chain() -> None:
     assert POST_INLINE_REREVIEW_RESOLVE_SUFFIX in built.text
 
 
-def test_full_chain_assembles_in_canonical_order() -> None:
+@pytest.mark.parametrize(
+    ("cli", "expected_base"),
+    [
+        ("claude", REVIEW_PROMPT_CLAUDE),
+        ("codex", REVIEW_PROMPT_FILE_BASED),
+        ("gemini", REVIEW_PROMPT_FILE_BASED),
+    ],
+)
+def test_full_chain_assembles_in_canonical_order(cli: str, expected_base: str) -> None:
     """Lock the canonical assembly for a representative non-trivial
     composition. The other tests use `in`/`not in` against `built.text`
     and would let through regressions that swap `PROMPT_SECTION_SEP`
     for `\\n`, duplicate a section, or reorder sections — exactly the
-    kind of bug suffix-matrix changes are most likely to introduce."""
+    kind of bug suffix-matrix changes are most likely to introduce.
+    Parameterised over CLI so a future refactor can't accidentally
+    branch the suffix matrix on CLI choice (the suffixes are gh-CLI
+    instructions, not coding-agent-specific)."""
     existing = [_comment("alice")]
     built = build_review_prompt(
         post_inline=True,
@@ -170,10 +202,11 @@ def test_full_chain_assembles_in_canonical_order() -> None:
         fetch_ok=True,
         my_login="alice",
         author_login="bob",
+        cli=cli,
     )
     expected = PROMPT_SECTION_SEP.join(
         [
-            REVIEW_PROMPT,
+            expected_base,
             "Additional instructions from reviewer:\nx",
             format_existing_comments(existing)[0],
             POST_INLINE_PROMPT
@@ -253,6 +286,229 @@ def test_my_login_none_never_triggers_rereview() -> None:
     assert POST_INLINE_REREVIEW_SUFFIX not in built.text
     assert POST_INLINE_REREVIEW_APPROVE_SUFFIX not in built.text
     assert POST_INLINE_REREVIEW_RESOLVE_SUFFIX not in built.text
+
+
+# --- File-based prompt (codex / gemini share this) -------------------------
+
+
+def test_file_based_prompt_references_all_bundled_agent_paths() -> None:
+    """The codex/gemini prompt instructs the CLI to read every bundled
+    agent file. If a file is added to REVIEW_AGENT_FILES but
+    `_build_file_based_prompt` doesn't pick it up, codex/gemini would
+    silently skip that review dimension — catch the drift here."""
+    agents_dir = _review_agents_dir()
+    for name in REVIEW_AGENT_FILES:
+        assert str(agents_dir / name) in REVIEW_PROMPT_FILE_BASED
+
+
+def test_file_based_prompt_does_not_name_pr_review_toolkit() -> None:
+    """The PR Review Toolkit is a Claude-plugin concept. Codex and gemini
+    have no plugin marketplace, so the file-based prompt must NOT mention
+    it — doing so would invite the CLI to fail-search for a plugin that
+    doesn't exist in its environment."""
+    assert "PR Review Toolkit" not in REVIEW_PROMPT_FILE_BASED
+
+
+def test_codex_and_gemini_share_byte_identical_base_prompt() -> None:
+    """Codex and gemini both consume REVIEW_PROMPT_FILE_BASED unchanged.
+    If they ever need to diverge, splitting them is a deliberate change
+    — this test makes that intent explicit."""
+    codex = build_review_prompt(
+        post_inline=False,
+        extra_prompt="",
+        existing=[],
+        fetch_ok=True,
+        my_login=None,
+        author_login=None,
+        cli="codex",
+    )
+    gemini = build_review_prompt(
+        post_inline=False,
+        extra_prompt="",
+        existing=[],
+        fetch_ok=True,
+        my_login=None,
+        author_login=None,
+        cli="gemini",
+    )
+    assert codex.text == gemini.text
+
+
+def test_bundled_agent_files_exist_on_disk() -> None:
+    """REVIEW_AGENT_FILES is the manifest used by the codex/gemini prompt;
+    any name listed there must actually exist in the package data dir, or
+    codex/gemini will be told to read a path that 404s. This guards both
+    against typo drift in the manifest and packaging regressions that
+    drop the pr_review_agents/ directory from the wheel."""
+    agents_dir = _review_agents_dir()
+    for name in REVIEW_AGENT_FILES:
+        assert (agents_dir / name).is_file(), f"missing bundled agent file: {name}"
+
+
+# --- _build_cli_command ----------------------------------------------------
+
+
+def test_build_cli_command_claude_uses_accept_edits() -> None:
+    """The Claude flag set is unchanged from the original launcher — keep
+    the test explicit so a future flag rename doesn't slip through."""
+    cmd = _build_cli_command("claude", "prompt body")
+    assert cmd == ["claude", "--permission-mode", "acceptEdits", "prompt body"]
+
+
+def test_build_cli_command_codex_uses_sandbox_workspace_write() -> None:
+    """Codex picks `--ask-for-approval never --sandbox workspace-write` —
+    auto-approve edits inside the workspace, no broader host access. The
+    more permissive `--yolo` is deliberately not used (would shift
+    sandbox posture vs Claude)."""
+    cmd = _build_cli_command("codex", "prompt body")
+    assert cmd == [
+        "codex",
+        "--ask-for-approval",
+        "never",
+        "--sandbox",
+        "workspace-write",
+        "prompt body",
+    ]
+
+
+def test_build_cli_command_gemini_uses_auto_edit_approval_mode() -> None:
+    """Gemini's `--approval-mode auto_edit` is the documented analogue of
+    Claude's `acceptEdits`. The deprecated `--yolo` / `-y` flag is
+    intentionally avoided in favour of the modern equivalent."""
+    cmd = _build_cli_command("gemini", "prompt body")
+    assert cmd == ["gemini", "--approval-mode", "auto_edit", "prompt body"]
+
+
+def test_build_cli_command_rejects_unknown_cli() -> None:
+    """Defensive: CliChoice is a Literal, so this branch should never run
+    in well-typed code. If someone widens the type without updating the
+    switch, fail loud rather than emit a mystery argv."""
+    with pytest.raises(ValueError, match="unknown CLI choice"):
+        _build_cli_command("nonsense", "prompt body")  # type: ignore[arg-type]
+
+
+# --- _first_available_cli --------------------------------------------------
+
+
+def _only_installed(*installed: str):
+    """Build a `shutil.which`-shaped stub that returns a path only for the
+    listed binaries. Centralised so the test intent is the binary list,
+    not the lambda shape, and so a future signature change (e.g. adding
+    `mode=` / `path=`) lands in one place."""
+
+    def fake_which(cmd: str, *_args, **_kwargs) -> str | None:
+        return f"/usr/bin/{cmd}" if cmd in installed else None
+
+    return fake_which
+
+
+def test_first_available_cli_returns_preferred_when_installed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_mod.shutil, "which", _only_installed("claude", "codex", "gemini"))
+    assert _first_available_cli("claude") == "claude"
+    assert _first_available_cli("codex") == "codex"
+    assert _first_available_cli("gemini") == "gemini"
+
+
+def test_first_available_cli_walks_cycle_when_preferred_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex-only user with `claude` persisted should land on codex —
+    the next CLI in the cycle from `claude`."""
+    monkeypatch.setattr(_mod.shutil, "which", _only_installed("codex"))
+    assert _first_available_cli("claude") == "codex"
+
+
+def test_first_available_cli_skips_through_multiple_misses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Persisted=claude, claude missing, codex missing, gemini installed
+    → fall all the way through to gemini."""
+    monkeypatch.setattr(_mod.shutil, "which", _only_installed("gemini"))
+    assert _first_available_cli("claude") == "gemini"
+
+
+def test_first_available_cli_returns_none_when_all_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Genuine 'no CLI installed' state — caller (`check_prereqs`) must
+    treat this as a startup blocker."""
+    monkeypatch.setattr(_mod.shutil, "which", _only_installed())
+    assert _first_available_cli("claude") is None
+    assert _first_available_cli("codex") is None
+    assert _first_available_cli("gemini") is None
+
+
+# --- check_prereqs ---------------------------------------------------------
+
+
+class _RunOk:
+    """Minimal stand-in for `subprocess.CompletedProcess` that satisfies
+    `check_prereqs` (it only inspects `.returncode`). Lets us stub
+    `cc_pr_reviewer.run` without dragging the full mock framework in."""
+
+    returncode = 0
+
+
+def _stub_prereq_deps(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    installed: tuple[str, ...],
+    persisted: str = "claude",
+) -> None:
+    """Stub all the external-world calls `check_prereqs` makes so the
+    test can pin the only inputs that matter (which binaries are on
+    PATH, and which CLI is persisted)."""
+    monkeypatch.setattr(
+        _mod.shutil,
+        "which",
+        _only_installed("gh", "git", *installed),
+    )
+    monkeypatch.setattr(_mod, "run", lambda _cmd, **_kw: _RunOk())
+    monkeypatch.setattr(_mod, "_persisted_cli", lambda: persisted)
+
+
+def test_check_prereqs_passes_with_only_codex_installed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bug fix: a Codex-only user on a fresh install (persisted=claude
+    by default) must be allowed to start the TUI. Previously the
+    persisted=claude branch hard-failed on missing `claude`, leaving the
+    user with no way to switch."""
+    _stub_prereq_deps(monkeypatch, installed=("codex",), persisted="claude")
+    assert check_prereqs() == []
+
+
+def test_check_prereqs_passes_with_only_gemini_installed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Symmetric to the codex-only case — gemini-only install must also
+    pass startup regardless of what's persisted."""
+    _stub_prereq_deps(monkeypatch, installed=("gemini",), persisted="claude")
+    assert check_prereqs() == []
+
+
+def test_check_prereqs_fails_when_no_supported_cli_installed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`gh` and `git` present but none of the three review CLIs — the
+    one case where startup genuinely can't proceed."""
+    _stub_prereq_deps(monkeypatch, installed=(), persisted="claude")
+    problems = check_prereqs()
+    assert problems, "expected a startup blocker when no review CLI is installed"
+    assert any("no supported review CLI" in p for p in problems)
+
+
+def test_check_prereqs_fails_when_gh_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`gh` is the data source — without it the TUI has nothing to show,
+    so this stays a hard blocker independent of which CLI is selected."""
+    # gh absent, codex present — CLI is fine, gh is the problem.
+    monkeypatch.setattr(_mod.shutil, "which", _only_installed("git", "codex"))
+    monkeypatch.setattr(_mod, "run", lambda _cmd, **_kw: _RunOk())
+    monkeypatch.setattr(_mod, "_persisted_cli", lambda: "codex")
+    problems = check_prereqs()
+    assert any("gh" in p and "not found" in p.lower() for p in problems)
 
 
 # --- _parse_semver / _is_newer ---------------------------------------------
