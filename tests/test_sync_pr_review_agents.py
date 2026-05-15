@@ -12,7 +12,7 @@ The script is imported via the `pythonpath = ["scripts"]` setting in
 from __future__ import annotations
 
 import sync_pr_review_agents as sync
-from sync_pr_review_agents import normalise_upstream
+from sync_pr_review_agents import normalise_upstream, strip_bundled_frontmatter
 
 # --- normalise_upstream ----------------------------------------------------
 
@@ -156,3 +156,36 @@ def test_plugin_id_matches_marketplace_format() -> None:
     name, marketplace = sync.PLUGIN_ID.split("@", 1)
     assert name == "pr-review-toolkit"
     assert marketplace
+
+
+# --- strip_bundled_frontmatter ---------------------------------------------
+
+
+def test_strip_bundled_frontmatter_removes_skills_frontmatter() -> None:
+    """Bundled SKILL.md files have hand-written Codex/Gemini Skills
+    frontmatter (`name:` + `description:`) we inject when adapting from
+    upstream. The sync script's prose-vs-prose comparison strips this
+    so it doesn't show up as drift on every run."""
+    text = (
+        "---\n"
+        "name: code-reviewer\n"
+        "description: Reviews PR diffs for project-guideline violations.\n"
+        "---\n"
+        "\n"
+        "# Code Reviewer\n"
+        "\n"
+        "Prose body.\n"
+    )
+    out = strip_bundled_frontmatter(text)
+    assert "name: code-reviewer" not in out
+    assert "description:" not in out
+    assert out.startswith("# Code Reviewer")
+
+
+def test_strip_bundled_frontmatter_is_noop_when_absent() -> None:
+    """If a bundled SKILL.md somehow loses its frontmatter (broken
+    write, missed edit), the stripper must round-trip unchanged so the
+    sync diff surfaces it as drift rather than silently mangling the
+    file."""
+    text = "# Code Reviewer\n\nProse body.\n"
+    assert strip_bundled_frontmatter(text) == text

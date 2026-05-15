@@ -29,23 +29,26 @@ from cc_pr_reviewer import (
     POST_INLINE_REREVIEW_RESOLVE_SUFFIX,
     POST_INLINE_REREVIEW_SUFFIX,
     PROMPT_SECTION_SEP,
-    REVIEW_AGENT_FILES,
     REVIEW_PROMPT_CLAUDE,
-    REVIEW_PROMPT_FILE_BASED,
+    REVIEW_PROMPT_SKILL_BASED,
+    REVIEW_SKILLS,
+    SKILL_FILE_NAME,
     InProgressHolder,
     ReviewInProgressError,
     _build_cli_command,
+    _cleanup_skills,
     _first_available_cli,
     _in_progress_age_str,
     _is_newer,
     _load_in_progress,
+    _materialise_skills,
     _open_review_db,
     _parse_semver,
     _pid_alive,
     _release_in_progress,
     _reserve_in_progress,
-    _review_agents_dir,
     _review_cell,
+    _skills_dir,
     build_review_prompt,
     check_prereqs,
     format_existing_comments,
@@ -71,15 +74,15 @@ def _comment(login: str, **overrides: Any) -> dict[str, Any]:
     ("cli", "expected_base"),
     [
         ("claude", REVIEW_PROMPT_CLAUDE),
-        ("codex", REVIEW_PROMPT_FILE_BASED),
-        ("gemini", REVIEW_PROMPT_FILE_BASED),
+        ("codex", REVIEW_PROMPT_SKILL_BASED),
+        ("gemini", REVIEW_PROMPT_SKILL_BASED),
     ],
 )
 def test_plain_review_equals_base_prompt(cli: str, expected_base: str) -> None:
     """post_inline=False with no extras returns the CLI's base prompt verbatim.
 
     Claude uses the plugin-driven REVIEW_PROMPT_CLAUDE; codex and gemini
-    share REVIEW_PROMPT_FILE_BASED (they have no plugin marketplace, so
+    share REVIEW_PROMPT_SKILL_BASED (they have no plugin marketplace, so
     they reference the bundled agent .md files instead).
     """
     built = build_review_prompt(
@@ -181,8 +184,8 @@ def test_my_comment_on_others_pr_triggers_full_rereview_chain() -> None:
     ("cli", "expected_base"),
     [
         ("claude", REVIEW_PROMPT_CLAUDE),
-        ("codex", REVIEW_PROMPT_FILE_BASED),
-        ("gemini", REVIEW_PROMPT_FILE_BASED),
+        ("codex", REVIEW_PROMPT_SKILL_BASED),
+        ("gemini", REVIEW_PROMPT_SKILL_BASED),
     ],
 )
 def test_full_chain_assembles_in_canonical_order(cli: str, expected_base: str) -> None:
@@ -288,31 +291,36 @@ def test_my_login_none_never_triggers_rereview() -> None:
     assert POST_INLINE_REREVIEW_RESOLVE_SUFFIX not in built.text
 
 
-# --- File-based prompt (codex / gemini share this) -------------------------
+# --- Skill-based prompt (codex / gemini share this) ------------------------
 
 
-def test_file_based_prompt_references_all_bundled_agent_paths() -> None:
-    """The codex/gemini prompt instructs the CLI to read every bundled
-    agent file. If a file is added to REVIEW_AGENT_FILES but
-    `_build_file_based_prompt` doesn't pick it up, codex/gemini would
-    silently skip that review dimension — catch the drift here."""
-    agents_dir = _review_agents_dir()
-    for name in REVIEW_AGENT_FILES:
-        assert str(agents_dir / name) in REVIEW_PROMPT_FILE_BASED
+def test_skill_prompt_mentions_every_skill_with_dollar_prefix() -> None:
+    """The codex/gemini prompt uses `$<skill-name>` mentions to force
+    explicit activation of every review dimension (implicit activation
+    is non-deterministic — the model might skip one). If a skill is
+    added to REVIEW_SKILLS but `_build_skill_based_prompt` doesn't pick
+    it up, codex/gemini would silently skip that dimension — catch the
+    drift here."""
+    for name in REVIEW_SKILLS:
+        assert f"${name}" in REVIEW_PROMPT_SKILL_BASED, (
+            f"skill prompt missing explicit `${name}` mention"
+        )
 
 
-def test_file_based_prompt_does_not_name_pr_review_toolkit() -> None:
+def test_skill_prompt_does_not_name_pr_review_toolkit() -> None:
     """The PR Review Toolkit is a Claude-plugin concept. Codex and gemini
-    have no plugin marketplace, so the file-based prompt must NOT mention
-    it — doing so would invite the CLI to fail-search for a plugin that
-    doesn't exist in its environment."""
-    assert "PR Review Toolkit" not in REVIEW_PROMPT_FILE_BASED
+    have no plugin marketplace; they auto-discover skills under
+    `.agents/skills/`. The prompt must NOT mention the toolkit — doing
+    so would invite the CLI to fail-search for a plugin that doesn't
+    exist in its environment."""
+    assert "PR Review Toolkit" not in REVIEW_PROMPT_SKILL_BASED
 
 
 def test_codex_and_gemini_share_byte_identical_base_prompt() -> None:
-    """Codex and gemini both consume REVIEW_PROMPT_FILE_BASED unchanged.
-    If they ever need to diverge, splitting them is a deliberate change
-    — this test makes that intent explicit."""
+    """Codex and gemini both consume REVIEW_PROMPT_SKILL_BASED unchanged
+    and share the `.agents/skills/` discovery convention. If they ever
+    need to diverge, splitting them is a deliberate change — this test
+    makes that intent explicit."""
     codex = build_review_prompt(
         post_inline=False,
         extra_prompt="",
@@ -334,15 +342,99 @@ def test_codex_and_gemini_share_byte_identical_base_prompt() -> None:
     assert codex.text == gemini.text
 
 
-def test_bundled_agent_files_exist_on_disk() -> None:
-    """REVIEW_AGENT_FILES is the manifest used by the codex/gemini prompt;
-    any name listed there must actually exist in the package data dir, or
-    codex/gemini will be told to read a path that 404s. This guards both
-    against typo drift in the manifest and packaging regressions that
-    drop the pr_review_agents/ directory from the wheel."""
-    agents_dir = _review_agents_dir()
-    for name in REVIEW_AGENT_FILES:
-        assert (agents_dir / name).is_file(), f"missing bundled agent file: {name}"
+def test_bundled_skills_exist_on_disk_with_frontmatter() -> None:
+    """REVIEW_SKILLS is the manifest used by the codex/gemini prompt;
+    every name listed there must have a corresponding SKILL.md on disk
+    with the YAML frontmatter Codex/Gemini need for skill discovery
+    (auto-discovery parses `name:` + `description:` from the frontmatter).
+    Guards against typo drift in the manifest, packaging regressions
+    that drop `skills/`, and frontmatter that decays to plain prose."""
+    skills_dir = _skills_dir()
+    for name in REVIEW_SKILLS:
+        skill_md = skills_dir / name / SKILL_FILE_NAME
+        assert skill_md.is_file(), f"missing bundled SKILL.md for skill: {name}"
+        text = skill_md.read_text(encoding="utf-8")
+        # The skill loader needs a fenced YAML block at the very top; if
+        # the file starts with anything else (a stray BOM, a markdown
+        # heading, blank lines) the frontmatter parse fails and the
+        # skill won't be discoverable.
+        assert text.startswith("---\n"), f"{name}: SKILL.md missing leading `---`"
+        assert f"name: {name}" in text, f"{name}: frontmatter missing `name: {name}`"
+        assert "description:" in text, f"{name}: frontmatter missing `description:`"
+
+
+# --- _materialise_skills / _cleanup_skills ---------------------------------
+
+
+def test_materialise_writes_every_skill_to_workspace(tmp_path: Any) -> None:
+    """`_materialise_skills(workspace)` must populate exactly
+    `<workspace>/.agents/skills/<name>/SKILL.md` for every name in
+    REVIEW_SKILLS — that's the path codex and gemini auto-discover at."""
+    _materialise_skills(tmp_path)
+    for name in REVIEW_SKILLS:
+        dst = tmp_path / ".agents" / "skills" / name / SKILL_FILE_NAME
+        assert dst.is_file(), f"materialise didn't write {dst.relative_to(tmp_path)}"
+        # Sanity-check the body landed (frontmatter present); a 0-byte
+        # write would tell codex/gemini the skill exists but has no
+        # instructions, which is worse than not materialising.
+        assert dst.read_text(encoding="utf-8").startswith("---\n")
+
+
+def test_cleanup_removes_only_materialised_paths(tmp_path: Any) -> None:
+    """Cleanup must undo materialise — remove our SKILL.md files and any
+    parent dirs we'd have created. After a clean materialise/cleanup
+    cycle the workspace should look untouched."""
+    _materialise_skills(tmp_path)
+    _cleanup_skills(tmp_path)
+    assert not (tmp_path / ".agents").exists(), (
+        "cleanup left `.agents/` behind — should be removed if we created it empty"
+    )
+
+
+def test_cleanup_preserves_user_content_inside_skill_dir(tmp_path: Any) -> None:
+    """If a user happens to have other files inside a skill dir (e.g. a
+    `references/` subdir from a project-tracked skill that shares the
+    name), cleanup must NOT remove them. Using `unlink` + `rmdir`
+    (rmdir fails on non-empty) keeps user content safe even in this
+    collision case."""
+    _materialise_skills(tmp_path)
+    user_file = tmp_path / ".agents" / "skills" / REVIEW_SKILLS[0] / "user_extra.txt"
+    user_file.write_text("user content", encoding="utf-8")
+
+    _cleanup_skills(tmp_path)
+
+    # Our SKILL.md is gone, user's file survived.
+    assert not (tmp_path / ".agents" / "skills" / REVIEW_SKILLS[0] / SKILL_FILE_NAME).exists()
+    assert user_file.is_file()
+    assert user_file.read_text(encoding="utf-8") == "user content"
+
+
+def test_cleanup_is_idempotent_and_safe_on_empty_workspace(tmp_path: Any) -> None:
+    """Cleanup runs in `finally` regardless of whether materialise
+    actually ran (early-return paths in `_launch_claude`). Calling it
+    on a pristine workspace must not raise."""
+    _cleanup_skills(tmp_path)  # never materialised — must not raise
+    _materialise_skills(tmp_path)
+    _cleanup_skills(tmp_path)
+    _cleanup_skills(tmp_path)  # second call — must not raise either
+
+
+def test_cleanup_preserves_preexisting_agents_dir(tmp_path: Any) -> None:
+    """If the user already has a populated `.agents/` for their own
+    purposes (a sibling tool's skill, project-tracked config), our
+    cleanup must leave it intact — the empty-parent-rmdir is best-
+    effort and only succeeds when the dir is genuinely empty."""
+    user_skill = tmp_path / ".agents" / "skills" / "user-own-skill" / SKILL_FILE_NAME
+    user_skill.parent.mkdir(parents=True)
+    user_skill.write_text("---\nname: user-own-skill\n---\n", encoding="utf-8")
+
+    _materialise_skills(tmp_path)
+    _cleanup_skills(tmp_path)
+
+    # Our six skill dirs are gone; user's stays.
+    for name in REVIEW_SKILLS:
+        assert not (tmp_path / ".agents" / "skills" / name).exists()
+    assert user_skill.is_file()
 
 
 # --- _build_cli_command ----------------------------------------------------

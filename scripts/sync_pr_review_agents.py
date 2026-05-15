@@ -1,28 +1,36 @@
-"""Compare bundled review-agent prompts against the upstream Claude plugin.
+"""Compare bundled review skills against the upstream Claude plugin.
 
-The bundled `.md` files in `cc_pr_reviewer/pr_review_agents/` are a static
-fork of the `pr-review-toolkit` Claude plugin's agent prompts, adapted
-for Codex and Gemini (which have no plugin marketplace, so they read the
-prompts as files).
+The bundled SKILL.md files in `cc_pr_reviewer/skills/<name>/SKILL.md`
+are a static fork of the `pr-review-toolkit` Claude plugin's agent
+prompts, adapted for Codex/Gemini Skills (which auto-discover under
+`.agents/skills/<name>/SKILL.md` at session start).
 
 `claude plugin update pr-review-toolkit@claude-plugins-official` reports
 the plugin version as `unknown`, so the only way to detect upstream
 drift is by content diff. This script normalises each upstream file
-(strips the YAML frontmatter and any `## When to invoke` section — the
-two structural strips we always apply when bundling), then compares
-against two reference points:
+(strips the upstream YAML frontmatter and any `## When to invoke`
+section — the two structural strips we always apply when bundling),
+then compares against two reference points:
 
   1. The **baseline snapshot** (`scripts/upstream_baseline/*.md`) — a
      committed copy of the normalised upstream as of the last sync.
      Diffing current upstream against this catches **upstream changes**
      in isolation (no adaptation noise).
-  2. The **bundled file** (`cc_pr_reviewer/pr_review_agents/*.md`) —
-     diffing current upstream against this shows the full gap
-     (upstream changes + our prose adaptations).
+  2. The **bundled SKILL.md body** (with our injected `name:` /
+     `description:` frontmatter stripped) — diffing current upstream
+     against this shows the full gap (upstream changes + our prose
+     adaptations).
 
 The baseline is the load-bearing piece: it converts a per-run "did the
 line counts grow?" eyeball check into a zero-effort "UPSTREAM CHANGED"
 signal that's reliable across machines and contributors.
+
+The asymmetry between upstream and bundled is deliberate: upstream
+frontmatter (`name:`, `description:`, `model:`) describes Claude's
+sub-agent dispatch and is stripped on the way in; our frontmatter is
+Codex/Gemini Skills metadata we hand-wrote for skill discovery and is
+stripped on the way out (so the comparison reduces to "is the prose
+the same?"). Don't conflate them.
 
 Typical workflows:
 
@@ -38,8 +46,9 @@ Typical workflows:
 
 Reset-and-re-adapt escape hatch (rare):
 
-    # Overwrite bundled with normalised upstream, discarding our
-    # adaptations. Review via `git diff` and re-apply manually.
+    # Overwrite bundled SKILL.md bodies with normalised upstream,
+    # preserving our hand-written frontmatter. Review via `git diff`
+    # and re-apply prose adaptations manually before committing.
     uv run python scripts/sync_pr_review_agents.py --write
 """
 
@@ -52,7 +61,14 @@ import subprocess
 import sys
 from pathlib import Path
 
-from cc_pr_reviewer import REVIEW_AGENT_FILES, _review_agents_dir
+from cc_pr_reviewer import REVIEW_SKILLS, SKILL_FILE_NAME, _skills_dir
+
+# Upstream agents are still flat `<name>.md` files in the plugin's
+# `agents/` dir; the renaming-to-SKILL.md only happens on our side
+# when we bundle them as Codex/Gemini Skills. The baseline mirrors
+# the upstream layout so a contributor can drop an upstream file
+# in side-by-side and the diff makes sense.
+UPSTREAM_FILE_SUFFIX = ".md"
 
 DEFAULT_UPSTREAM = (
     Path.home()
@@ -94,7 +110,8 @@ def normalise_upstream(text: str) -> str:
       * the YAML frontmatter block at the top (Claude's per-agent
         declaration — irrelevant outside Claude Code), and
       * the `## When to invoke` section (describes sub-agent-dispatch
-        scenarios — doesn't apply to Codex/Gemini's flat invocation).
+        scenarios — doesn't apply to Codex/Gemini's skill-based
+        invocation).
 
     Prose adaptations (CLAUDE.md → CLAUDE.md/AGENTS.md, scope phrasing,
     project-specific logging refs) are judgment-call edits and stay
@@ -103,6 +120,20 @@ def normalise_upstream(text: str) -> str:
     text = _FRONTMATTER_RE.sub("", text)
     text = _WHEN_TO_INVOKE_RE.sub("", text)
     return text
+
+
+def strip_bundled_frontmatter(text: str) -> str:
+    """Strip the YAML frontmatter we inject into each bundled SKILL.md.
+
+    Codex/Gemini Skills require a `name:` + `description:` block at the
+    top of each SKILL.md for discovery. Upstream doesn't have this
+    block (it carries its own Claude-sub-agent frontmatter, which we
+    strip via `normalise_upstream`). For a meaningful prose-vs-prose
+    comparison we strip the Skills frontmatter off the bundled side
+    too — same regex as the upstream stripper, since the syntax
+    (`---\\n...\\n---\\n`) is identical.
+    """
+    return _FRONTMATTER_RE.sub("", text)
 
 
 def _run_plugin_update() -> None:
@@ -145,10 +176,11 @@ def _save_baseline(args: argparse.Namespace) -> int:
     """
     BASELINE_DIR.mkdir(parents=True, exist_ok=True)
     wrote = skipped = 0
-    for name in REVIEW_AGENT_FILES:
-        upstream_path = args.upstream / name
+    for name in REVIEW_SKILLS:
+        upstream_file = name + UPSTREAM_FILE_SUFFIX
+        upstream_path = args.upstream / upstream_file
         if not upstream_path.is_file():
-            print(f"  SKIP (no upstream)  {name}", file=sys.stderr)
+            print(f"  SKIP (no upstream)  {upstream_file}", file=sys.stderr)
             skipped += 1
             continue
         # Explicit utf-8: agent prompts contain em-dashes and Unicode
@@ -156,8 +188,8 @@ def _save_baseline(args: argparse.Namespace) -> int:
         # would mis-decode those silently. Same reasoning for every
         # other read_text/write_text in this file.
         normalised = normalise_upstream(upstream_path.read_text(encoding="utf-8"))
-        (BASELINE_DIR / name).write_text(normalised, encoding="utf-8")
-        print(f"  captured            {name}")
+        (BASELINE_DIR / upstream_file).write_text(normalised, encoding="utf-8")
+        print(f"  captured            {upstream_file}")
         wrote += 1
     print()
     print(f"wrote {wrote} baseline snapshots to {BASELINE_DIR}")
@@ -237,51 +269,57 @@ def main() -> int:
     if args.save_baseline:
         return _save_baseline(args)
 
-    local_dir = _review_agents_dir()
+    local_dir = _skills_dir()
     baseline_exists = BASELINE_DIR.is_dir() and all(
-        (BASELINE_DIR / name).is_file() for name in REVIEW_AGENT_FILES
+        (BASELINE_DIR / (name + UPSTREAM_FILE_SUFFIX)).is_file() for name in REVIEW_SKILLS
     )
 
     in_sync = drifted = rewrote = missing = 0
     upstream_changed: list[tuple[str, str, str]] = []  # (name, baseline_text, normalised)
 
-    for name in REVIEW_AGENT_FILES:
-        upstream_path = args.upstream / name
-        local_path = local_dir / name
+    for name in REVIEW_SKILLS:
+        upstream_file = name + UPSTREAM_FILE_SUFFIX
+        upstream_path = args.upstream / upstream_file
+        local_path = local_dir / name / SKILL_FILE_NAME
 
         if not upstream_path.is_file():
-            print(f"  MISSING UPSTREAM  {name}")
+            print(f"  MISSING UPSTREAM  {upstream_file}")
             missing += 1
             continue
         if not local_path.is_file():
-            print(f"  MISSING BUNDLED   {name}")
+            print(f"  MISSING BUNDLED   {name}/{SKILL_FILE_NAME}")
             missing += 1
             continue
 
         normalised = normalise_upstream(upstream_path.read_text(encoding="utf-8"))
-        local = local_path.read_text(encoding="utf-8")
+        local_full = local_path.read_text(encoding="utf-8")
+        local_body = strip_bundled_frontmatter(local_full)
 
         # Upstream-vs-baseline check — the load-bearing automation: when
         # this trips, the maintainer has actual work to do. The
         # upstream-vs-bundled "drift" reading below is informational
         # (mostly the persistent adaptation noise).
         if baseline_exists:
-            baseline_text = (BASELINE_DIR / name).read_text(encoding="utf-8")
+            baseline_text = (BASELINE_DIR / upstream_file).read_text(encoding="utf-8")
             if normalised != baseline_text:
                 upstream_changed.append((name, baseline_text, normalised))
 
-        if normalised == local:
+        if normalised == local_body:
             print(f"  in sync           {name}")
             in_sync += 1
             continue
 
-        # `--write` mode overwrites with the normalised upstream and skips
-        # the inline diff (the user reviews via `git diff`, which gives
-        # better tooling — coloured output, per-hunk staging, undo via
-        # `git checkout --`). Counts as "rewrote", not "drift", so the
-        # final summary reflects post-write state.
+        # `--write` mode overwrites the SKILL.md BODY with the normalised
+        # upstream, preserving our Codex/Gemini Skills frontmatter (which
+        # upstream doesn't have). Skips the inline diff — the user reviews
+        # via `git diff`, which gives better tooling (coloured output,
+        # per-hunk staging, undo via `git checkout --`). Counts as
+        # "rewrote", not "drift", so the final summary reflects post-write
+        # state.
         if args.write:
-            local_path.write_text(normalised, encoding="utf-8")
+            frontmatter_match = _FRONTMATTER_RE.match(local_full)
+            frontmatter = frontmatter_match.group(0) if frontmatter_match else ""
+            local_path.write_text(frontmatter + normalised, encoding="utf-8")
             print(f"  rewrote           {name}")
             rewrote += 1
             continue
@@ -289,9 +327,9 @@ def main() -> int:
         diff_lines = list(
             difflib.unified_diff(
                 normalised.splitlines(keepends=True),
-                local.splitlines(keepends=True),
-                fromfile=f"upstream(normalised)/{name}",
-                tofile=f"bundled/{name}",
+                local_body.splitlines(keepends=True),
+                fromfile=f"upstream(normalised)/{upstream_file}",
+                tofile=f"bundled/{name}/{SKILL_FILE_NAME}(body)",
                 n=3,
             )
         )
@@ -312,8 +350,8 @@ def main() -> int:
     # Surface any upstream files that aren't in our manifest — they'd
     # represent a new agent the toolkit added since we forked, which is
     # worth a human deciding whether to bundle.
-    bundled_names = set(REVIEW_AGENT_FILES)
-    extras = sorted(p.name for p in args.upstream.glob("*.md") if p.name not in bundled_names)
+    bundled_files = {name + UPSTREAM_FILE_SUFFIX for name in REVIEW_SKILLS}
+    extras = sorted(p.name for p in args.upstream.glob("*.md") if p.name not in bundled_files)
 
     # ---- final report ----
 
@@ -384,7 +422,7 @@ def main() -> int:
         print("re-run with --diff to see how bundled differs from upstream (mostly adaptations)")
     if rewrote:
         print(
-            "review the overwrites with `git diff cc_pr_reviewer/pr_review_agents/` "
+            "review the overwrites with `git diff cc_pr_reviewer/skills/` "
             "and re-apply adaptations before committing"
         )
 

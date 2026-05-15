@@ -9,8 +9,10 @@ requested reviewer, and hands the selected PR off to a coding-agent CLI
 of your choice — **Claude Code**, **OpenAI Codex CLI**, or **Google
 Gemini CLI** — to perform the review. Claude Code uses the
 [PR Review Toolkit](https://claude.com/plugins/pr-review-toolkit) plugin;
-Codex and Gemini read the same review-criteria prompts that ship with
-this package (`cc_pr_reviewer/pr_review_agents/*.md`).
+Codex and Gemini load the same six review criteria as native **Skills**
+that ship with this package (`cc_pr_reviewer/skills/<name>/SKILL.md`),
+materialised into the checked-out PR workspace under `.agents/skills/`
+for the duration of each review.
 
 ![cc-pr-reviewer screenshot](assets/cc-reviewer.png)
 
@@ -161,10 +163,15 @@ CLIs:
 - **Claude Code** delegates to the PR Review Toolkit plugin's six
   sub-agents (Comment Analyzer, PR Test Analyzer, Silent Failure Hunter,
   Type Design Analyzer, Code Reviewer, Code Simplifier).
-- **Codex** and **Gemini** read the same six review criteria from
-  Markdown files bundled with this package
-  (`cc_pr_reviewer/pr_review_agents/*.md`), which are an adapted fork of
-  the upstream toolkit's agent prompts.
+- **Codex** and **Gemini** auto-discover the same six review criteria as
+  native Skills. The bundled `SKILL.md` files
+  (`cc_pr_reviewer/skills/<name>/SKILL.md`) are an adapted fork of the
+  upstream toolkit's agent prompts with Codex/Gemini Skills frontmatter
+  prepended. At launch they're copied into
+  `<workspace>/.agents/skills/<name>/SKILL.md` (the cross-tool interop
+  path Codex and Gemini both scan at session start) and removed on exit,
+  so only metadata is loaded eagerly — full instructions are pulled in
+  on activation.
 
 If the modal's **post-inline** toggle (`Ctrl+T`) is on, the prompt is
 extended to ask the CLI to publish each finding as an inline review
@@ -178,9 +185,10 @@ When you exit the CLI, press Enter and the TUI returns.
 
 ### Keeping the bundled review prompts in sync with upstream
 
-The bundled `cc_pr_reviewer/pr_review_agents/*.md` files are a static
+The bundled `cc_pr_reviewer/skills/<name>/SKILL.md` files are a static
 fork of the [PR Review Toolkit](https://claude.com/plugins/pr-review-toolkit)
-plugin's agent prompts. To check for upstream changes:
+plugin's agent prompts (with Codex/Gemini Skills frontmatter prepended).
+To check for upstream changes:
 
 ```sh
 uv run python scripts/sync_pr_review_agents.py --update-plugin

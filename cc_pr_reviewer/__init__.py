@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
 """
 cc-pr-reviewer — a small Textual TUI that lists GitHub PRs where you are a
-requested reviewer and hands any selected PR off to Claude Code, with the
-PR Review Toolkit plugin driving the review.
+requested reviewer and hands any selected PR off to a coding-agent CLI
+(Claude Code, OpenAI Codex CLI, or Google Gemini CLI), with the PR Review
+Toolkit (Claude) or the bundled `.agents/skills/` (Codex/Gemini) driving
+the review.
 
 Flow when you pick a PR and press Enter:
     1. Clone the repo into $GH_PR_WORKSPACE (if not already there)
-    2. `gh pr checkout <N>` so Claude sees the PR's working tree
-    3. Launch `claude` with a prompt that invokes the PR Review Toolkit agents
-    4. When you /exit Claude, the TUI resumes
+    2. `gh pr checkout <N>` so the CLI sees the PR's working tree
+    3. For codex/gemini: materialise the six bundled review skills into
+       `<workspace>/.agents/skills/` for auto-discovery (cleaned up on exit)
+    4. Launch the chosen CLI with a prompt that drives the six review dimensions
+    5. When you /exit the CLI, the TUI resumes
 
 Prerequisites:
     • gh CLI, authenticated                     https://cli.github.com
-    • claude CLI (Claude Code)                  https://docs.claude.com/claude-code
-    • PR Review Toolkit plugin installed        https://claude.com/plugins/pr-review-toolkit
+    • at least one of:
+        - Claude Code                           https://docs.claude.com/claude-code
+          (+ PR Review Toolkit plugin           https://claude.com/plugins/pr-review-toolkit)
+        - OpenAI Codex CLI                      https://github.com/openai/codex
+        - Google Gemini CLI                     https://github.com/google-gemini/gemini-cli
 
 Run:
     uv sync
@@ -88,58 +95,116 @@ REVIEW_PROMPT_CLAUDE = (
     "with file:line references and suggested fixes."
 )
 
-# Codex and Gemini don't have a plugin marketplace, so the six toolkit
-# agents ship as bundled Markdown files (see `cc_pr_reviewer/pr_review_agents/`).
-# The order here is the order Codex/Gemini will be asked to apply them —
-# code-reviewer first sets project-guideline context, then the targeted
-# checks (silent failures, type design, tests), then the cleanup-oriented
-# passes (comments, simplification). Changing the order is a behaviour
-# change, so the tuple is the single source of truth consulted by both the
-# prompt builder and the prereq check.
-REVIEW_AGENT_FILES: tuple[str, ...] = (
-    "code-reviewer.md",
-    "silent-failure-hunter.md",
-    "type-design-analyzer.md",
-    "pr-test-analyzer.md",
-    "comment-analyzer.md",
-    "code-simplifier.md",
+# Codex and Gemini don't have a plugin marketplace, but both natively
+# auto-discover skills at `<workspace>/.agents/skills/<name>/SKILL.md`. The
+# six toolkit agents ship as bundled SKILL.md files (see
+# `cc_pr_reviewer/skills/`); at launch we materialise them into the
+# checked-out PR's workspace and clean up on exit. Names appear in the
+# review prompt prefixed with `$` to force explicit activation — we want
+# every dimension to run, not have the model implicitly pick a subset.
+#
+# The order here is the order the prompt asks for them — code-reviewer
+# first sets project-guideline context, then the targeted checks (silent
+# failures, type design, tests), then the cleanup-oriented passes
+# (comments, simplification). Changing the order is a behaviour change,
+# so the tuple is the single source of truth consulted by both the
+# prompt builder and the materialise/cleanup helpers.
+REVIEW_SKILLS: tuple[str, ...] = (
+    "code-reviewer",
+    "silent-failure-hunter",
+    "type-design-analyzer",
+    "pr-test-analyzer",
+    "comment-analyzer",
+    "code-simplifier",
 )
 
+SKILL_FILE_NAME = "SKILL.md"
 
-def _review_agents_dir() -> Path:
-    """Return the bundled directory holding the file-based agent prompts.
+
+def _skills_dir() -> Path:
+    """Return the bundled directory holding the Codex/Gemini SKILL.md files.
 
     Resolved against `__file__` so editable installs (`uv sync`) and wheel
     installs (`pip install`) both work — hatchling packages the directory
     next to `__init__.py` in both cases. `importlib.resources` is avoided
-    because the agents are read by an external subprocess (`codex` /
-    `gemini`), not by Python — so we always need a filesystem path, not
-    a `Traversable`.
+    because the SKILL.md files are read by an external subprocess
+    (`codex` / `gemini`) after we copy them into the PR workspace, not by
+    Python — so we always need a filesystem path, not a `Traversable`.
     """
-    return Path(__file__).parent / "pr_review_agents"
+    return Path(__file__).parent / "skills"
 
 
-def _build_file_based_prompt() -> str:
-    """Compose the review prompt for the file-based CLIs (codex, gemini).
+def _build_skill_based_prompt() -> str:
+    """Compose the review prompt for the skill-based CLIs (codex, gemini).
 
-    The agent files live in this repo (not in any Claude plugin), so the
-    prompt simply lists their absolute paths and asks the CLI to read each
-    one in turn. Identical for codex and gemini — they share the prompt and
-    differ only in how they're launched.
+    Codex and Gemini auto-discover skills at session start by scanning
+    `.agents/skills/<name>/SKILL.md` and inject only the metadata
+    (name + description) into context. The full SKILL.md body is loaded
+    only when the model activates the skill. `$<name>` mentions force
+    explicit activation — we want every review dimension to run, not
+    have the model implicitly pick a subset.
+
+    Identical for codex and gemini — they share both the prompt and the
+    `.agents/skills/` interop convention, and differ only in how they're
+    launched.
     """
-    agents_dir = _review_agents_dir()
-    bullets = "\n".join(f"  • {agents_dir / name}" for name in REVIEW_AGENT_FILES)
+    mentions = ", ".join(f"${name}" for name in REVIEW_SKILLS)
     return (
-        "Please perform a comprehensive review of the current PR by applying "
-        "the six review criteria documented in these files (read each before "
-        "reviewing):\n\n"
-        f"{bullets}\n\n"
-        "Then give me a prioritised summary of findings with file:line "
-        "references and suggested fixes."
+        "Please perform a comprehensive review of the current PR using the "
+        f"six review skills available in this workspace: {mentions}. "
+        "Activate each skill in turn — they cover project-guideline "
+        "compliance, silent failures, type design, test coverage, comments, "
+        "and code simplification — then give me a prioritised summary of "
+        "findings with file:line references and suggested fixes."
     )
 
 
-REVIEW_PROMPT_FILE_BASED = _build_file_based_prompt()
+REVIEW_PROMPT_SKILL_BASED = _build_skill_based_prompt()
+
+
+def _materialise_skills(workspace: Path) -> None:
+    """Copy each bundled SKILL.md into `<workspace>/.agents/skills/<name>/SKILL.md`.
+
+    Codex and Gemini auto-discover skills under `.agents/skills/`. We
+    write the six bundled skills there so they're picked up by the CLI
+    at session start. Existing SKILL.md content at the target is
+    overwritten — a PR that happens to ship its own competing skill of
+    the same name would be temporarily shadowed during the review;
+    `_cleanup_skills` then deletes our copy on exit and `git status`
+    would surface any tracked-content drift the next time the workspace
+    is reused.
+    """
+    src_dir = _skills_dir()
+    for name in REVIEW_SKILLS:
+        dst = workspace / ".agents" / "skills" / name
+        dst.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_dir / name / SKILL_FILE_NAME, dst / SKILL_FILE_NAME)
+
+
+def _cleanup_skills(workspace: Path) -> None:
+    """Reverse of `_materialise_skills`: remove the SKILL.md files we wrote
+    and any now-empty parent dirs we'd have created.
+
+    Uses `unlink` + `rmdir` rather than `shutil.rmtree` so any user
+    content that happens to sit inside `.agents/skills/<name>/` (a
+    references/ subdir, a project-specific sibling skill, etc.) stays
+    untouched. The parent-dir cleanup is best-effort — `rmdir` only
+    succeeds when the dir is empty, so a non-empty `.agents/` or
+    `.agents/skills/` is left in place.
+
+    Idempotent: safe to call on a workspace that was never materialised
+    into (e.g. when the launch aborted before `_materialise_skills`),
+    and safe to call twice.
+    """
+    skills_root = workspace / ".agents" / "skills"
+    for name in REVIEW_SKILLS:
+        skill_md = skills_root / name / SKILL_FILE_NAME
+        skill_md.unlink(missing_ok=True)
+        with contextlib.suppress(OSError):
+            (skills_root / name).rmdir()
+    for parent in [skills_root, workspace / ".agents"]:
+        with contextlib.suppress(OSError):
+            parent.rmdir()
 
 
 def _build_cli_command(cli: CliChoice, prompt_text: str) -> list[str]:
@@ -495,15 +560,18 @@ def check_prereqs() -> list[str]:
             "    • OpenAI Codex CLI: https://github.com/openai/codex\n"
             "    • Google Gemini CLI: https://github.com/google-gemini/gemini-cli"
         )
-    elif not _review_agents_dir().is_dir():
-        # The bundled agent prompts are mandatory for codex/gemini and
-        # harmless for claude. If they're missing the install is broken
-        # regardless of which CLI the user ends up on, so this stays a
-        # hard startup failure.
-        problems.append(
-            f"bundled review-agent prompts missing at {_review_agents_dir()} "
-            "— reinstall cc-pr-reviewer"
-        )
+    else:
+        skills_dir = _skills_dir()
+        missing = [n for n in REVIEW_SKILLS if not (skills_dir / n / SKILL_FILE_NAME).is_file()]
+        if missing:
+            # The bundled skills are mandatory for codex/gemini and harmless
+            # for claude. Verify every expected SKILL.md is on disk (not just
+            # the parent dir) so a partial extraction surfaces here rather
+            # than later as a "skill not found" runtime error from the CLI.
+            problems.append(
+                f"bundled review skills missing at {skills_dir} "
+                f"(missing: {', '.join(missing)}) — reinstall cc-pr-reviewer"
+            )
 
     if shutil.which("git") is None:
         problems.append("`git` not found on PATH — install git")
@@ -771,8 +839,9 @@ def build_review_prompt(
 
     `cli` selects the base review prompt: `claude` uses the
     plugin-driven `REVIEW_PROMPT_CLAUDE`, while `codex` and `gemini`
-    share `REVIEW_PROMPT_FILE_BASED` (which references the bundled
-    agent Markdown files). All `POST_INLINE_*` suffixes apply identically
+    share `REVIEW_PROMPT_SKILL_BASED` (which references the six bundled
+    skills by name; materialisation into `.agents/skills/` happens in
+    `_launch_claude`). All `POST_INLINE_*` suffixes apply identically
     to every CLI — they're about `gh` CLI usage, not the reviewing
     agent. `cli` defaults to `"claude"` so existing callers and tests
     remain valid without churn.
@@ -804,7 +873,7 @@ def build_review_prompt(
     # but drop the auto-approve instruction.
     rereview_can_approve = rereview and author_login != my_login
 
-    base = REVIEW_PROMPT_CLAUDE if cli == "claude" else REVIEW_PROMPT_FILE_BASED
+    base = REVIEW_PROMPT_CLAUDE if cli == "claude" else REVIEW_PROMPT_SKILL_BASED
     sections = [base]
     # Strip defensively — the current ConfirmResult dataclass already strips,
     # but `build_review_prompt` is now an API boundary and a future caller
@@ -2628,13 +2697,14 @@ class PRReviewer(App):
 
         # Claude additionally needs the PR Review Toolkit plugin (the
         # base prompt invokes the toolkit's agents by name). Codex and
-        # Gemini reference the bundled `.md` files instead, so no extra
-        # check applies to them. The plugin check is the slow one — it
-        # shells out to `claude plugin list --json` — so it stays gated
-        # behind the binary check above. `None` (undetectable) is
-        # surfaced separately so a hung/crashed `claude plugin list`
-        # doesn't silently pass-through into a review where the prompt
-        # refers to agents the plugin can't load.
+        # Gemini load the bundled skills from `.agents/skills/` instead
+        # (materialised below per launch), so no extra check applies to
+        # them. The plugin check is the slow one — it shells out to
+        # `claude plugin list --json` — so it stays gated behind the
+        # binary check above. `None` (undetectable) is surfaced
+        # separately so a hung/crashed `claude plugin list` doesn't
+        # silently pass-through into a review where the prompt refers
+        # to agents the plugin can't load.
         if cli == "claude":
             plugin_state = _pr_review_toolkit_enabled()
             if plugin_state is False:
@@ -2710,6 +2780,17 @@ class PRReviewer(App):
                 else:
                     head_sha = sha_r.stdout.strip()
 
+                # Materialise the bundled review skills into the PR
+                # workspace so codex/gemini auto-discover them at session
+                # start. Done AFTER `gh pr checkout --force` (which would
+                # otherwise reset our writes) and only for the skill-based
+                # CLIs — claude uses its own plugin marketplace. The paired
+                # `_cleanup_skills` runs in `finally` so Ctrl-C, crashes,
+                # and clean exits all leave the workspace tidy.
+                if cli in ("codex", "gemini"):
+                    print(f"Materialising review skills under {local_path}/.agents/skills/…")
+                    _materialise_skills(local_path)
+
                 print("Fetching existing review comments…")
                 existing, fetch_ok = fetch_existing_review_comments(repo_full, number)
 
@@ -2784,6 +2865,13 @@ class PRReviewer(App):
                     f"\n── {_CLI_DISPLAY[cli]} session ended. Press Enter to return to the TUI ──"
                 )
             finally:
+                # Order matters: drop the materialised skills BEFORE releasing
+                # the in-progress reservation so a peer that grabs the slot
+                # next can't race against our half-deleted `.agents/skills/`
+                # tree. `_cleanup_skills` is idempotent and skip-safe when
+                # materialisation never ran (early-return paths above).
+                if cli in ("codex", "gemini"):
+                    _cleanup_skills(local_path)
                 _release_in_progress(self.review_db, key)
 
         # Refresh in case review state changed (e.g. you approved the PR).
