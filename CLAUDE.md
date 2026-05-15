@@ -40,13 +40,13 @@ Three coding-agent CLIs are supported and switchable from the TUI: `claude` (Cla
 
 **Launch flag surfaces** (verified against current upstream docs; localised to `_build_cli_command` so flag churn in any single CLI is a one-function change):
 
-| CLI    | argv                                                                                 |
-| ------ | ------------------------------------------------------------------------------------ |
-| claude | `claude --permission-mode acceptEdits "<prompt>"`                                    |
-| codex  | `codex --ask-for-approval never --sandbox workspace-write "<prompt>"`                |
-| gemini | `gemini --approval-mode auto_edit "<prompt>"`                                        |
+| CLI    | argv                                                                                                                       |
+| ------ | -------------------------------------------------------------------------------------------------------------------------- |
+| claude | `claude --permission-mode acceptEdits "<prompt>"`                                                                          |
+| codex  | `codex --ask-for-approval never --sandbox workspace-write -c sandbox_workspace_write.network_access=true "<prompt>"`       |
+| gemini | `gemini --approval-mode auto_edit "<prompt>"`                                                                              |
 
-All three are "auto-approve edits inside the workspace, no broader host access". For codex, `--yolo` is **rejected** because it removes the sandbox too. For gemini, the older `--yolo`/`-y` is **rejected** in favour of the modern `--approval-mode=yolo` (and we pick `auto_edit`, the documented analogue of Claude's `acceptEdits`).
+All three auto-approve edits inside the workspace. For codex, `--yolo` is **rejected** because it removes the filesystem sandbox too; instead we override `sandbox_workspace_write.network_access=true` to restore network (the post-inline review path needs `gh api …`, which codex's workspace-write sandbox blocks by default). For gemini, the older `--yolo`/`-y` is **rejected** in favour of the modern `--approval-mode=yolo` (and we pick `auto_edit`, the documented analogue of Claude's `acceptEdits`).
 
 ### Things to know when editing
 

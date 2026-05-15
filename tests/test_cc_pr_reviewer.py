@@ -448,10 +448,11 @@ def test_build_cli_command_claude_uses_accept_edits() -> None:
 
 
 def test_build_cli_command_codex_uses_sandbox_workspace_write() -> None:
-    """Codex picks `--ask-for-approval never --sandbox workspace-write` —
-    auto-approve edits inside the workspace, no broader host access. The
-    more permissive `--yolo` is deliberately not used (would shift
-    sandbox posture vs Claude)."""
+    """Codex picks `--ask-for-approval never --sandbox workspace-write` plus
+    `-c sandbox_workspace_write.network_access=true` — auto-approve edits
+    inside the workspace and restore network so post-inline `gh api …`
+    calls can reach GitHub. The more permissive `--yolo` is deliberately
+    not used (would also remove the filesystem sandbox)."""
     cmd = _build_cli_command("codex", "prompt body")
     assert cmd == [
         "codex",
@@ -459,6 +460,8 @@ def test_build_cli_command_codex_uses_sandbox_workspace_write() -> None:
         "never",
         "--sandbox",
         "workspace-write",
+        "-c",
+        "sandbox_workspace_write.network_access=true",
         "prompt body",
     ]
 

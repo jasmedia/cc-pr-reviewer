@@ -232,12 +232,20 @@ def _build_cli_command(cli: CliChoice, prompt_text: str) -> list[str]:
     if cli == "claude":
         return ["claude", "--permission-mode", "acceptEdits", prompt_text]
     if cli == "codex":
+        # `-c sandbox_workspace_write.network_access=true` keeps the
+        # filesystem sandbox (writes scoped to the workspace) but
+        # restores network access — required so `gh api …` calls in the
+        # post-inline review path can reach GitHub. Without this override
+        # codex's workspace-write sandbox blocks network by default,
+        # and the review silently fails to publish inline comments.
         return [
             "codex",
             "--ask-for-approval",
             "never",
             "--sandbox",
             "workspace-write",
+            "-c",
+            "sandbox_workspace_write.network_access=true",
             prompt_text,
         ]
     if cli == "gemini":
