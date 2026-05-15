@@ -162,49 +162,112 @@ def _build_skill_based_prompt() -> str:
 REVIEW_PROMPT_SKILL_BASED = _build_skill_based_prompt()
 
 
-def _materialise_skills(workspace: Path) -> None:
+@dataclass(frozen=True)
+class _SkillSnapshot:
+    """Pre-materialise state of one `.agents/skills/<name>/` dir.
+
+    `original_skill_md` is the byte content of any pre-existing
+    `SKILL.md` at the target (or `None` if the file didn't exist).
+    `skill_dir_existed` records whether the parent skill dir was
+    already there — so cleanup only `rmdir`s the dirs we created.
+    """
+
+    original_skill_md: bytes | None
+    skill_dir_existed: bool
+
+
+@dataclass(frozen=True)
+class _MaterialisedSkills:
+    """Restoration manifest produced by `_materialise_skills`.
+
+    Captures pre-launch workspace state so `_cleanup_skills` can restore
+    the worktree byte-for-byte even when the PR happens to ship its own
+    `.agents/skills/<our-name>/SKILL.md`. Without this, materialise
+    would overwrite a tracked file and cleanup would `unlink` it,
+    leaving the working tree dirty after every review.
+    """
+
+    workspace: Path
+    skills: dict[str, _SkillSnapshot]
+    skills_root_existed: bool
+    agents_dir_existed: bool
+
+
+def _materialise_skills(workspace: Path) -> _MaterialisedSkills:
     """Copy each bundled SKILL.md into `<workspace>/.agents/skills/<name>/SKILL.md`.
 
     Codex and Gemini auto-discover skills under `.agents/skills/`. We
     write the six bundled skills there so they're picked up by the CLI
-    at session start. Existing SKILL.md content at the target is
-    overwritten — a PR that happens to ship its own competing skill of
-    the same name would be temporarily shadowed during the review;
-    `_cleanup_skills` then deletes our copy on exit and `git status`
-    would surface any tracked-content drift the next time the workspace
-    is reused.
-    """
-    src_dir = _skills_dir()
-    for name in REVIEW_SKILLS:
-        dst = workspace / ".agents" / "skills" / name
-        dst.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src_dir / name / SKILL_FILE_NAME, dst / SKILL_FILE_NAME)
-
-
-def _cleanup_skills(workspace: Path) -> None:
-    """Reverse of `_materialise_skills`: remove the SKILL.md files we wrote
-    and any now-empty parent dirs we'd have created.
-
-    Uses `unlink` + `rmdir` rather than `shutil.rmtree` so any user
-    content that happens to sit inside `.agents/skills/<name>/` (a
-    references/ subdir, a project-specific sibling skill, etc.) stays
-    untouched. The parent-dir cleanup is best-effort — `rmdir` only
-    succeeds when the dir is empty, so a non-empty `.agents/` or
-    `.agents/skills/` is left in place.
-
-    Idempotent: safe to call on a workspace that was never materialised
-    into (e.g. when the launch aborted before `_materialise_skills`),
-    and safe to call twice.
+    at session start. Pre-existing content at every target path
+    (SKILL.md bytes, parent-dir presence) is snapshotted into the
+    returned `_MaterialisedSkills` manifest BEFORE the write, so
+    `_cleanup_skills` can restore the worktree exactly — including the
+    rare case where a reviewed repo ships its own competing skill of
+    the same name.
     """
     skills_root = workspace / ".agents" / "skills"
+    agents_dir = workspace / ".agents"
+
+    agents_dir_existed = agents_dir.is_dir()
+    skills_root_existed = skills_root.is_dir()
+
+    snapshots: dict[str, _SkillSnapshot] = {}
+    src_dir = _skills_dir()
+
     for name in REVIEW_SKILLS:
+        skill_dir = skills_root / name
+        skill_md = skill_dir / SKILL_FILE_NAME
+
+        skill_dir_existed = skill_dir.is_dir()
+        original_bytes = skill_md.read_bytes() if skill_md.is_file() else None
+
+        snapshots[name] = _SkillSnapshot(
+            original_skill_md=original_bytes,
+            skill_dir_existed=skill_dir_existed,
+        )
+
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_dir / name / SKILL_FILE_NAME, skill_md)
+
+    return _MaterialisedSkills(
+        workspace=workspace,
+        skills=snapshots,
+        skills_root_existed=skills_root_existed,
+        agents_dir_existed=agents_dir_existed,
+    )
+
+
+def _cleanup_skills(manifest: _MaterialisedSkills) -> None:
+    """Reverse of `_materialise_skills` using the manifest it returned.
+
+    For each skill: if a SKILL.md existed before materialise, restore
+    those exact bytes; otherwise `unlink` the one we wrote. Then
+    `rmdir` any parent dir we created (`rmdir` only succeeds on empty
+    dirs, so sibling content the user owns is preserved automatically).
+
+    The byte restore uses `write_bytes` rather than swallowing errors —
+    if we can't put the user's tracked file back, that's a data-loss
+    bug we want loud, not silent. Best-effort `contextlib.suppress(OSError)`
+    is reserved for the empty-dir cleanup, where the cost of a leftover
+    empty dir is purely cosmetic.
+    """
+    skills_root = manifest.workspace / ".agents" / "skills"
+    for name, snap in manifest.skills.items():
         skill_md = skills_root / name / SKILL_FILE_NAME
-        skill_md.unlink(missing_ok=True)
+        if snap.original_skill_md is not None:
+            skill_md.write_bytes(snap.original_skill_md)
+        else:
+            skill_md.unlink(missing_ok=True)
+        if not snap.skill_dir_existed:
+            with contextlib.suppress(OSError):
+                (skills_root / name).rmdir()
+
+    if not manifest.skills_root_existed:
         with contextlib.suppress(OSError):
-            (skills_root / name).rmdir()
-    for parent in [skills_root, workspace / ".agents"]:
+            skills_root.rmdir()
+    if not manifest.agents_dir_existed:
         with contextlib.suppress(OSError):
-            parent.rmdir()
+            (manifest.workspace / ".agents").rmdir()
 
 
 def _build_cli_command(cli: CliChoice, prompt_text: str) -> list[str]:
@@ -2759,6 +2822,11 @@ class PRReviewer(App):
                 input("Press Enter to return to the TUI…")
                 return
 
+            # Captured here so the `finally` block can call `_cleanup_skills`
+            # only if materialisation actually completed — early-return paths
+            # below (clone-fail, checkout-fail) leave it `None` and skip the
+            # restore.
+            skills_manifest: _MaterialisedSkills | None = None
             try:
                 if not local_path.exists():
                     print(f"Cloning {repo_full} → {local_path}…")
@@ -2792,12 +2860,16 @@ class PRReviewer(App):
                 # workspace so codex/gemini auto-discover them at session
                 # start. Done AFTER `gh pr checkout --force` (which would
                 # otherwise reset our writes) and only for the skill-based
-                # CLIs — claude uses its own plugin marketplace. The paired
-                # `_cleanup_skills` runs in `finally` so Ctrl-C, crashes,
-                # and clean exits all leave the workspace tidy.
+                # CLIs — claude uses its own plugin marketplace. The
+                # returned manifest snapshots any pre-existing SKILL.md
+                # bytes so `_cleanup_skills` can restore them exactly even
+                # if the reviewed PR ships its own colliding skill of the
+                # same name. Cleanup runs in `finally` so Ctrl-C, crashes,
+                # and clean exits all leave the workspace byte-identical
+                # to its pre-launch state.
                 if cli in ("codex", "gemini"):
                     print(f"Materialising review skills under {local_path}/.agents/skills/…")
-                    _materialise_skills(local_path)
+                    skills_manifest = _materialise_skills(local_path)
 
                 print("Fetching existing review comments…")
                 existing, fetch_ok = fetch_existing_review_comments(repo_full, number)
@@ -2873,13 +2945,14 @@ class PRReviewer(App):
                     f"\n── {_CLI_DISPLAY[cli]} session ended. Press Enter to return to the TUI ──"
                 )
             finally:
-                # Order matters: drop the materialised skills BEFORE releasing
-                # the in-progress reservation so a peer that grabs the slot
-                # next can't race against our half-deleted `.agents/skills/`
-                # tree. `_cleanup_skills` is idempotent and skip-safe when
-                # materialisation never ran (early-return paths above).
-                if cli in ("codex", "gemini"):
-                    _cleanup_skills(local_path)
+                # Order matters: restore the materialised skills BEFORE
+                # releasing the in-progress reservation so a peer that
+                # grabs the slot next can't race against our half-restored
+                # `.agents/skills/` tree. The `None` guard handles
+                # early-return paths above where materialisation never
+                # ran — there's nothing to restore.
+                if skills_manifest is not None:
+                    _cleanup_skills(skills_manifest)
                 _release_in_progress(self.review_db, key)
 
         # Refresh in case review state changed (e.g. you approved the PR).

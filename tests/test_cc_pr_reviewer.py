@@ -384,52 +384,79 @@ def test_cleanup_removes_only_materialised_paths(tmp_path: Any) -> None:
     """Cleanup must undo materialise — remove our SKILL.md files and any
     parent dirs we'd have created. After a clean materialise/cleanup
     cycle the workspace should look untouched."""
-    _materialise_skills(tmp_path)
-    _cleanup_skills(tmp_path)
+    manifest = _materialise_skills(tmp_path)
+    _cleanup_skills(manifest)
     assert not (tmp_path / ".agents").exists(), (
         "cleanup left `.agents/` behind — should be removed if we created it empty"
     )
 
 
+def test_cleanup_restores_preexisting_skill_md_exactly(tmp_path: Any) -> None:
+    """The collision case the codex review caught: if the reviewed PR
+    ships its own `.agents/skills/<our-name>/SKILL.md`, materialise
+    overwrites it and cleanup must restore the original bytes exactly.
+    Without snapshot-and-restore, the review leaves the worktree with
+    either our content (if cleanup is skipped) or a missing file (if
+    cleanup unlinks blindly) — both surface as `git status` noise on
+    the next session and corrupt the PR's tracked content."""
+    skill_dir = tmp_path / ".agents" / "skills" / REVIEW_SKILLS[0]
+    skill_dir.mkdir(parents=True)
+    skill_md = skill_dir / SKILL_FILE_NAME
+    # Use bytes with a non-UTF-8-safe sequence to prove the snapshot
+    # round-trips raw bytes, not text-decoded content.
+    original_bytes = b"---\nname: user-own-version\n---\n\nOriginal \x80 prose.\n"
+    skill_md.write_bytes(original_bytes)
+
+    manifest = _materialise_skills(tmp_path)
+    # Mid-flight, our content is in place (proves materialise actually
+    # ran; otherwise the "restore" could be a no-op masquerading as success).
+    assert skill_md.read_bytes() != original_bytes
+    _cleanup_skills(manifest)
+
+    assert skill_md.read_bytes() == original_bytes
+
+
 def test_cleanup_preserves_user_content_inside_skill_dir(tmp_path: Any) -> None:
-    """If a user happens to have other files inside a skill dir (e.g. a
+    """If a user has sibling files inside a skill dir (e.g. a
     `references/` subdir from a project-tracked skill that shares the
-    name), cleanup must NOT remove them. Using `unlink` + `rmdir`
-    (rmdir fails on non-empty) keeps user content safe even in this
-    collision case."""
-    _materialise_skills(tmp_path)
-    user_file = tmp_path / ".agents" / "skills" / REVIEW_SKILLS[0] / "user_extra.txt"
-    user_file.write_text("user content", encoding="utf-8")
+    name), cleanup must NOT remove them. The empty-dir `rmdir` is
+    guarded by `skill_dir_existed` in the snapshot, so we only `rmdir`
+    dirs we created — sibling content the user owns is safe."""
+    user_file_path = tmp_path / ".agents" / "skills" / REVIEW_SKILLS[0] / "user_extra.txt"
+    user_file_path.parent.mkdir(parents=True)
+    user_file_path.write_text("user content", encoding="utf-8")
 
-    _cleanup_skills(tmp_path)
+    manifest = _materialise_skills(tmp_path)
+    _cleanup_skills(manifest)
 
-    # Our SKILL.md is gone, user's file survived.
+    # Our SKILL.md is gone (no original snapshot for it), user's file survived.
     assert not (tmp_path / ".agents" / "skills" / REVIEW_SKILLS[0] / SKILL_FILE_NAME).exists()
-    assert user_file.is_file()
-    assert user_file.read_text(encoding="utf-8") == "user content"
+    assert user_file_path.is_file()
+    assert user_file_path.read_text(encoding="utf-8") == "user content"
 
 
-def test_cleanup_is_idempotent_and_safe_on_empty_workspace(tmp_path: Any) -> None:
-    """Cleanup runs in `finally` regardless of whether materialise
-    actually ran (early-return paths in `_launch_claude`). Calling it
-    on a pristine workspace must not raise."""
-    _cleanup_skills(tmp_path)  # never materialised — must not raise
-    _materialise_skills(tmp_path)
-    _cleanup_skills(tmp_path)
-    _cleanup_skills(tmp_path)  # second call — must not raise either
+def test_cleanup_can_round_trip_repeatedly(tmp_path: Any) -> None:
+    """Sequential materialise/cleanup cycles (the common case across
+    multiple PR reviews in the same workspace) must each leave the
+    workspace pristine — no accumulating empty dirs, no stale files."""
+    for _ in range(3):
+        manifest = _materialise_skills(tmp_path)
+        _cleanup_skills(manifest)
+        assert not (tmp_path / ".agents").exists()
 
 
 def test_cleanup_preserves_preexisting_agents_dir(tmp_path: Any) -> None:
     """If the user already has a populated `.agents/` for their own
     purposes (a sibling tool's skill, project-tracked config), our
-    cleanup must leave it intact — the empty-parent-rmdir is best-
-    effort and only succeeds when the dir is genuinely empty."""
+    cleanup must leave it intact — the empty-parent-rmdir is gated
+    on `agents_dir_existed=False` in the manifest, so a pre-existing
+    `.agents/` is never touched."""
     user_skill = tmp_path / ".agents" / "skills" / "user-own-skill" / SKILL_FILE_NAME
     user_skill.parent.mkdir(parents=True)
     user_skill.write_text("---\nname: user-own-skill\n---\n", encoding="utf-8")
 
-    _materialise_skills(tmp_path)
-    _cleanup_skills(tmp_path)
+    manifest = _materialise_skills(tmp_path)
+    _cleanup_skills(manifest)
 
     # Our six skill dirs are gone; user's stays.
     for name in REVIEW_SKILLS:
