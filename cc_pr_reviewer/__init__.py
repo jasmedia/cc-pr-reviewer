@@ -447,6 +447,35 @@ POST_INLINE_FETCH_FAILED_SUFFIX = (
     "raised; prefer fewer, clearly novel comments."
 )
 
+# Appended as its own section when the workspace has a CodeGraph index
+# (`.codegraph/`). CodeGraph (https://github.com/colbymchenry/codegraph) is a
+# local MCP server that pre-indexes the codebase into a SQLite knowledge
+# graph and exposes symbol/call-graph/impact tools to the coding-agent CLI.
+# When the MCP server is wired up but the agent isn't nudged, it still
+# defaults to grep+Read fan-out — the hint steers it toward direct queries
+# so the sub-agents the review spawns answer from the index instead of
+# re-deriving relationships. CLI-agnostic: the MCP surface is identical
+# across claude/codex/gemini, and the suffix is gated only on the index
+# being present in the workspace (not on the CLI in use).
+CODEGRAPH_HINT_SUFFIX = (
+    "This workspace has a CodeGraph index (`.codegraph/`). For "
+    "symbol-relationship questions during review, prefer the CodeGraph MCP "
+    "tools (`codegraph_context`, `codegraph_impact`, `codegraph_callers`, "
+    "`codegraph_callees`, `codegraph_trace`, `codegraph_search`) over "
+    "grep+Read loops — they answer from the pre-built index in one call "
+    "instead of fanning out across the codebase. Run `codegraph_impact` on "
+    "each symbol touched by the diff to scope blast radius before "
+    "commenting. Reach for raw grep/Read only to confirm a specific detail "
+    "CodeGraph didn't cover."
+)
+
+# Cap on how many affected-test paths we'll inline into the prompt. Codegraph
+# can return hundreds on PRs touching widely-imported files; past ~50 the
+# list stops being a useful scoping hint and starts crowding out other
+# context. The block annotates the overflow so the agent knows the list
+# was truncated, not authoritative.
+CODEGRAPH_AFFECTED_TESTS_CAP = 50
+
 # Prompt sections are joined with this separator so multi-line blocks (e.g.
 # the existing-comments list) don't get smashed into neighboring prose.
 PROMPT_SECTION_SEP = "\n\n"
@@ -890,6 +919,151 @@ def fetch_existing_review_comments(repo: str, number: int) -> tuple[list[dict[st
     return data, True
 
 
+def _collect_codegraph_affected(local_path: Path, repo: str, number: int) -> list[str]:
+    """Resolve the PR's base ref and pipe the diff into `codegraph affected`.
+
+    Returns a deduplicated, stably-sorted list of paths codegraph reports
+    as transitively dependent on the changed source. `codegraph
+    affected`'s default `--filter` is auto-detect-tests, so this is
+    *typically* a test-files list — but callers and prompt phrasing
+    should treat the contract as "whatever codegraph's filter returns",
+    not "test files guaranteed" (auto-detect can miss niche frameworks).
+    Dedup lives here, not just in `format_codegraph_affected_tests`, so
+    the user-visible count printed at the launch site matches what the
+    agent actually sees in the prompt.
+
+    Returns `[]` on any failure (missing base ref, git diff error,
+    codegraph error, dropped binary, timeout) — the affected-tests block
+    is a nice-to-have, so degradation is silent in the prompt; a `print`
+    warning still surfaces in the suspended TUI output so a curious user
+    can see why the section is absent.
+
+    Caller must have already verified `.codegraph/` exists and
+    `codegraph` is on PATH; this helper still defends against
+    `shutil.which`/`Popen` racing (binary uninstalled mid-launch) via
+    the `OSError` guard. `gh pr view --repo` is explicit (rather than
+    relying on cwd repo-inference) to match `fetch_existing_review_comments`
+    and stay robust for cross-fork PRs where `gh pr checkout` adds the
+    head-repo remote.
+    """
+    try:
+        base_r = run(
+            [
+                "gh",
+                "pr",
+                "view",
+                str(number),
+                "--repo",
+                repo,
+                "--json",
+                "baseRefName",
+                "--jq",
+                ".baseRefName",
+            ],
+            cwd=local_path,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as e:
+        print(f"warning: `gh pr view --repo {repo}` failed ({e}); skipping affected-tests block.")
+        return []
+    base = (base_r.stdout or "").strip()
+    if base_r.returncode != 0 or not base:
+        err = (base_r.stderr or base_r.stdout).strip() or f"exit {base_r.returncode}"
+        print(
+            f"warning: couldn't resolve PR #{number}'s base ref for codegraph affected ({err}); "
+            "skipping affected-tests block."
+        )
+        return []
+
+    try:
+        diff_r = run(
+            ["git", "diff", f"origin/{base}...HEAD", "--name-only"],
+            cwd=local_path,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as e:
+        print(
+            f"warning: `git diff origin/{base}...HEAD` failed ({e}); skipping affected-tests block."
+        )
+        return []
+    if diff_r.returncode != 0:
+        err = (diff_r.stderr or diff_r.stdout).strip() or f"exit {diff_r.returncode}"
+        print(
+            f"warning: `git diff origin/{base}...HEAD` failed ({err}); "
+            "skipping codegraph affected-tests block."
+        )
+        return []
+    changed = [line for line in diff_r.stdout.splitlines() if line.strip()]
+    if not changed:
+        # Empty diff isn't an error — PRs can be empty mid-rebase, or the
+        # base ref might be ahead. Just no block to render.
+        return []
+
+    try:
+        aff = run(
+            ["codegraph", "affected", "--stdin", "--quiet"],
+            cwd=local_path,
+            input="\n".join(changed),
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as e:
+        print(f"warning: `codegraph affected` failed ({e}); skipping affected-tests block.")
+        return []
+    if aff.returncode != 0:
+        err = (aff.stderr or aff.stdout).strip() or f"exit {aff.returncode}"
+        print(f"warning: `codegraph affected` failed ({err}); skipping affected-tests block.")
+        return []
+    # Dedup and sort here (not just in `format_codegraph_affected_tests`)
+    # so any user-facing count printed at the call site matches the
+    # number of bullets the prompt block will render.
+    return sorted({line.strip() for line in aff.stdout.splitlines() if line.strip()})
+
+
+def format_codegraph_affected_tests(paths: list[str]) -> str:
+    """Render the affected-tests prompt block from `codegraph affected` output.
+
+    Pure — `_launch_claude` does the shell-out (gh→git→codegraph) and
+    feeds the resulting path list in here so the rendering decisions
+    (dedup, sort, cap, header phrasing) stay unit-testable in isolation.
+
+    Empty/whitespace paths are dropped before dedup; the input is
+    deduplicated to guard against `codegraph affected` returning the
+    same test twice when multiple changed files reach it. Capped at
+    `CODEGRAPH_AFFECTED_TESTS_CAP` with an explicit overflow note so
+    the agent knows the list was truncated, not authoritative.
+    Returns `""` when no usable paths remain — the empty string sentinel
+    means "skip this section" in `build_review_prompt`.
+    """
+    cleaned = sorted({p.strip() for p in paths if p and p.strip()})
+    if not cleaned:
+        return ""
+    truncated = len(cleaned) > CODEGRAPH_AFFECTED_TESTS_CAP
+    shown = cleaned[:CODEGRAPH_AFFECTED_TESTS_CAP]
+    # Phrased as "files codegraph identifies as affected" rather than
+    # asserting "test files": `codegraph affected`'s default `--filter`
+    # auto-detects tests, but the auto-detect can miss niche frameworks.
+    # The footer still names test-coverage as the intended scoping use
+    # (that's what the filter targets), but the bullet list itself is
+    # honest about provenance — if an oddball non-test slips through, the
+    # agent can still reason about it.
+    lines = [
+        "Files identified by `codegraph affected` as transitively reached "
+        "by this PR's diff (default filter auto-detects test files):"
+    ]
+    lines.extend(f"- {p}" for p in shown)
+    if truncated:
+        lines.append(
+            f"(showing {CODEGRAPH_AFFECTED_TESTS_CAP} of {len(cleaned)} total — list truncated)"
+        )
+    lines.append(
+        "Use this list to scope the test-coverage review: missing or weak "
+        "coverage for any of these is a stronger signal than for tests not "
+        "on this list. Tests outside this set are unlikely to exercise the "
+        "diff and shouldn't drive review focus."
+    )
+    return "\n".join(lines)
+
+
 def format_existing_comments(comments: list[dict[str, Any]]) -> tuple[str, int]:
     """Compact prompt block listing up to `EXISTING_COMMENT_LIST_CAP` most
     recent inline review comments (bodies truncated to
@@ -966,6 +1140,8 @@ def build_review_prompt(
     my_login: str | None,
     author_login: str | None,
     cli: CliChoice = DEFAULT_CLI,
+    codegraph_present: bool = False,
+    codegraph_affected_tests: str = "",
 ) -> BuiltPrompt:
     """Assemble the user message for the selected coding-agent CLI. Pure — no I/O.
 
@@ -982,6 +1158,29 @@ def build_review_prompt(
     to every CLI — they're about `gh` CLI usage, not the reviewing
     agent. `cli` defaults to `"claude"` so existing callers and tests
     remain valid without churn.
+
+    `codegraph_present` is set by `_launch_claude` based on whether the
+    workspace has a `.codegraph/` directory. When true, `CODEGRAPH_HINT_SUFFIX`
+    is appended as its own section so the agent steers MCP queries toward
+    the pre-built index instead of grep+Read loops. Defaults to `False`
+    so any caller that hasn't probed the workspace (tests, future
+    integrations) keeps the existing prompt verbatim.
+
+    `codegraph_affected_tests` is the pre-rendered block produced by
+    `format_codegraph_affected_tests` from the output of `codegraph
+    affected <changed-files>`. When non-empty, it lands after the
+    CodeGraph hint (if present) and before existing-comments; the two
+    CodeGraph sections are independently gated, so the hint may be off
+    while the block is on (and vice versa). The unenforced combination
+    is deliberate: a future caller (e.g. a CI driver that ships a
+    pre-computed affected-tests block without configuring the MCP
+    server) should be able to inject the list without claiming index
+    presence. This intentionally diverges from the `fetch_ok`/`existing`
+    invariant below — that pair has a strict producer contract
+    (`fetch_existing_review_comments`), while these two are derived from
+    independent shell-outs in `_launch_claude`. Empty string (the default)
+    skips the section entirely — that covers both "no index" and "empty
+    diff / no affected files" without callers needing to disambiguate.
 
     Contract: `fetch_existing_review_comments` guarantees that
     `fetch_ok=False` always returns `existing=[]`. Passing a non-empty
@@ -1020,6 +1219,17 @@ def build_review_prompt(
     stripped_extra = extra_prompt.strip()
     if stripped_extra:
         sections.append(f"Additional instructions from reviewer:\n{stripped_extra}")
+    # Placed AFTER the reviewer extras so a per-launch override stays adjacent
+    # to the base prompt (highest visibility), but BEFORE existing-comments
+    # and the post-inline output instructions — CodeGraph is workflow guidance
+    # for how to gather evidence, so it belongs next to the "what to review"
+    # blocks, not the "how to publish findings" block. The affected-tests
+    # block follows the hint so the agent reads both CodeGraph sections
+    # contiguously.
+    if codegraph_present:
+        sections.append(CODEGRAPH_HINT_SUFFIX)
+    if codegraph_affected_tests:
+        sections.append(codegraph_affected_tests)
     if existing_block:
         sections.append(existing_block)
     if post_inline:
@@ -2116,6 +2326,7 @@ class PRReviewer(App):
         Binding("g", "toggle_group", "Group by"),
         Binding("s", "toggle_sort", "Sort by"),
         Binding("c", "toggle_cli", "CLI"),
+        Binding("x", "toggle_codegraph", "CodeGraph"),
         Binding("u", "upgrade", "Upgrade"),
         Binding("q", "quit", "Quit"),
     ]
@@ -2143,6 +2354,13 @@ class PRReviewer(App):
         self.group_by: GroupBy = stored_group if stored_group in _GROUP_CYCLE else ""
         stored_sort = _get_setting(self.review_db, "sort_by", "")
         self.sort_by: SortBy = stored_sort if stored_sort in _SORT_CYCLE else ""
+        # When on AND `.codegraph/` is missing in the workspace, `_launch_claude`
+        # prompts the user once per launch to run `codegraph init --index`
+        # before handing off to the agent. When off (default), missing
+        # `.codegraph/` is silent — Tier 1's prompt suffix and Tier 2's sync
+        # both gate on existence regardless. Lives in `settings` so a user
+        # who flips it on stays in helper mode across sessions.
+        self.codegraph_assist: bool = _get_setting(self.review_db, "codegraph_assist", "0") == "1"
         stored_cli = _get_setting(self.review_db, "cli", DEFAULT_CLI)
         persisted: CliChoice = stored_cli if stored_cli in _CLI_CYCLE else DEFAULT_CLI
         # If the persisted CLI isn't on PATH, fall back to whatever IS
@@ -2278,6 +2496,7 @@ class PRReviewer(App):
         # so the footer always advertises a non-default selection without
         # consuming a separate status-bar slot.
         self._set_footer_active("c", self.cli != DEFAULT_CLI)
+        self._set_footer_active("x", self.codegraph_assist)
 
     def _set_footer_active(self, key: str, active: bool, retries: int = 2) -> None:
         """Toggle the `-state-active` CSS class on the FooterKey for `key`.
@@ -2725,6 +2944,24 @@ class PRReviewer(App):
         self.notify(f"CLI: {_CLI_DISPLAY[nxt]}", timeout=3)
         self._refresh_footer_indicators()
 
+    def action_toggle_codegraph(self) -> None:
+        # Render-free like `action_toggle_cli` — the table doesn't depend
+        # on this toggle. `_launch_claude` reads `self.codegraph_assist`
+        # at launch time to decide whether to prompt the user about
+        # initialising CodeGraph in workspaces that don't have an index.
+        self.codegraph_assist = not self.codegraph_assist
+        state = "on" if self.codegraph_assist else "off"
+        try:
+            _set_setting(
+                self.review_db,
+                "codegraph_assist",
+                "1" if self.codegraph_assist else "0",
+            )
+        except sqlite3.Error as e:
+            self.notify(f"Couldn't persist CodeGraph toggle: {e}", severity="warning")
+        self.notify(f"CodeGraph assist: {state}", timeout=3)
+        self._refresh_footer_indicators()
+
     def action_toggle_sort(self) -> None:
         # Mirrors `action_toggle_group`: capture cursor PR identity, cycle the
         # mode, persist, render-only re-populate, then restore the cursor onto
@@ -2922,6 +3159,112 @@ class PRReviewer(App):
                 else:
                     head_sha = sha_r.stdout.strip()
 
+                # Hoist the `codegraph` PATH probe once: the Tier 2/3/4
+                # blocks below all share this gate, and three separate
+                # `shutil.which` calls would also create a TOCTOU surface
+                # where the binary could disappear between probes. The
+                # `subprocess.call`/`run()` wrappers below still defend
+                # against the probe-vs-launch race (binary uninstalled
+                # mid-launch) via `OSError` guards.
+                codegraph_on_path = shutil.which("codegraph") is not None
+                codegraph_present = (local_path / ".codegraph").is_dir()
+
+                # Tier 3: opt-in init helper. When `self.codegraph_assist`
+                # is on (`x` toggle) AND the workspace doesn't yet have an
+                # index AND the `codegraph` binary is on PATH, prompt the
+                # user during the suspended terminal session to bootstrap
+                # one. We never auto-init — `codegraph init --index` can
+                # take ~30s on a large repo and adds files to the workspace,
+                # so it's a conscious user step. The toggle's only purpose
+                # is to make that step opt-in rather than nag-on-every-launch.
+                if not codegraph_present and self.codegraph_assist and codegraph_on_path:
+                    print(
+                        f"\nNo CodeGraph index in {local_path}. "
+                        "`codegraph init --index` takes ~30s on first run, then "
+                        "amortises across every future review in this workspace."
+                    )
+                    # Match the EOFError pattern established at the upgrade
+                    # path: non-interactive / piped stdin must not crash
+                    # the launch; an EOF is a "no" and we move on.
+                    answer = "n"
+                    with contextlib.suppress(EOFError):
+                        answer = input("Initialize CodeGraph now? [y/N]: ").strip().lower()
+                    if answer in ("y", "yes"):
+                        print("Running `codegraph init --index`…")
+                        init_rc = 1
+                        try:
+                            init_rc = subprocess.call(
+                                ["codegraph", "init", str(local_path), "--index"]
+                            )
+                        except OSError as e:
+                            # Mirrors the `uv tool upgrade` path: ENOENT/
+                            # permission errors from `subprocess.call`
+                            # raise rather than returning non-zero, and
+                            # an uncaught OSError post-`suspend()` drops
+                            # the user into a half-restored terminal.
+                            print(f"\nFailed to launch `codegraph init`: {e}")
+                        if init_rc == 0:
+                            # Re-probe — the sync block below now becomes a
+                            # no-op (the just-built index is current), and
+                            # `build_review_prompt` gets the right flag.
+                            codegraph_present = (local_path / ".codegraph").is_dir()
+                        else:
+                            print(
+                                f"warning: `codegraph init --index` exited with status {init_rc}; "
+                                "continuing without an index."
+                            )
+
+                # If the user has wired CodeGraph into this workspace
+                # (`codegraph init` writes `.codegraph/`), refresh the
+                # index incrementally for the freshly-checked-out PR
+                # branch before launching. CodeGraph's MCP server has its
+                # own file watcher, but it only runs while the CLI is
+                # alive — at this point the CLI hasn't started yet, so
+                # the index can be stale (especially after `gh pr
+                # checkout --force`, which can rewrite many files at
+                # once). `codegraph sync` is incremental and idempotent;
+                # no-op when the index is already current.
+                if codegraph_present and codegraph_on_path:
+                    print("Syncing CodeGraph index for the checked-out branch…")
+                    sync_rc = 1
+                    try:
+                        sync_rc = subprocess.call(["codegraph", "sync", str(local_path)])
+                    except OSError as e:
+                        print(f"warning: failed to launch `codegraph sync`: {e}")
+                    if sync_rc != 0:
+                        # Sync failure is non-fatal: the agent can
+                        # still launch, MCP queries just hit a stale
+                        # index. Loud so the user knows their answers
+                        # may lag the branch.
+                        print(
+                            f"warning: `codegraph sync` exited with status {sync_rc} — "
+                            "agent will see a possibly stale CodeGraph index."
+                        )
+                elif codegraph_present:
+                    print(
+                        "warning: `.codegraph/` exists but `codegraph` binary not on PATH — "
+                        "skipping index sync; MCP queries (if wired) will hit a stale index."
+                    )
+
+                # Tier 4: query codegraph for tests whose imports transitively
+                # reach this PR's changed files, and inline the list into the
+                # prompt as a scoping hint for the test-coverage review.
+                # Runs AFTER the sync block so the index reflects the
+                # checked-out branch. Gated on the same (index-present +
+                # binary-on-PATH) precondition as sync — without both, the
+                # affected-tests query can't run.
+                codegraph_affected_block = ""
+                if codegraph_present and codegraph_on_path:
+                    print("Querying CodeGraph for tests affected by this PR's diff…")
+                    affected = _collect_codegraph_affected(local_path, repo_full, number)
+                    codegraph_affected_block = format_codegraph_affected_tests(affected)
+                    if codegraph_affected_block:
+                        # Visible count: `_collect_codegraph_affected` now
+                        # returns dedup'd output, so `len(affected)` matches
+                        # the number of bullets the agent sees in the
+                        # prompt block — no pre/post-dedup mismatch.
+                        print(f"CodeGraph reports {len(affected)} affected file(s) for the diff.")
+
                 # Materialise the bundled review skills into the PR
                 # workspace so the skill-based CLIs (see _SKILL_BASED_CLIS)
                 # discover them at session start. Done AFTER `gh pr
@@ -2954,6 +3297,8 @@ class PRReviewer(App):
                     my_login=my_login,
                     author_login=(pr.get("author") or {}).get("login"),
                     cli=cli,
+                    codegraph_present=codegraph_present,
+                    codegraph_affected_tests=codegraph_affected_block,
                 )
 
                 if not fetch_ok:
