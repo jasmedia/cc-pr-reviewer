@@ -4,6 +4,68 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] — 2026-05-25
+
+### Added
+- **CodeGraph MCP integration to cut review token usage.** Opportunistically
+  wires [CodeGraph](https://github.com/colbymchenry/codegraph) (a local MCP
+  server that pre-indexes the codebase into a SQLite knowledge graph) into the
+  PR-review launch flow across four tiers. CodeGraph's upstream benchmark is
+  ~35% cheaper / ~57% fewer tokens / ~71% fewer tool calls for a single agent
+  answering a single architecture question; cc-reviewer's six-sub-agent
+  review fan-out should meet or exceed those numbers, and the workspace reuse
+  at `$GH_PR_WORKSPACE/<owner>/<repo>` is exactly CodeGraph's amortisation
+  model. All four hooks are silent no-ops when `codegraph` isn't on PATH or
+  `.codegraph/` is absent — zero behaviour change for users who haven't
+  installed CodeGraph.
+  - **Tier 1 — prompt nudge.** `CODEGRAPH_HINT_SUFFIX` is appended to the
+    review prompt when `.codegraph/` is present, steering agents to the six
+    core MCP tools (`codegraph_context`, `codegraph_impact`,
+    `codegraph_callers`, `codegraph_callees`, `codegraph_trace`,
+    `codegraph_search`) instead of grep+Read fan-out. CLI-agnostic — the MCP
+    surface is identical across claude/codex/gemini.
+  - **Tier 2 — auto-sync after checkout.** Runs `codegraph sync` after
+    `gh pr checkout` so the index reflects the checked-out branch before the
+    agent queries it (CodeGraph's file-watcher only runs while the CLI is
+    alive). Non-fatal on failure: warns and continues.
+  - **Tier 3 — opt-in init helper.** New persisted `x` keybinding/toggle
+    (`codegraph_assist` in the `settings` table). When on AND `.codegraph/`
+    is missing AND `codegraph` is on PATH, prompts the user once per launch
+    to run `codegraph init --index`. Default off — missing-index workspaces
+    stay silent. EOF-guarded so piped/non-interactive stdin doesn't crash
+    the launch.
+  - **Tier 4 — affected-tests injection for the pr-test-analyzer agent.**
+    Chains `gh pr view --repo <repo> --json baseRefName` → `git diff
+    origin/<base>...HEAD --name-only` → `codegraph affected --stdin --quiet`,
+    then inlines the deduplicated/sorted path list as a scoping hint for
+    the test-coverage review. Capped at 50 entries (`CODEGRAPH_AFFECTED_TESTS_CAP`)
+    with an explicit overflow note so a truncated list isn't mistaken for
+    authoritative. Distinct from the others — `codegraph affected` doesn't
+    show up in CodeGraph's own docs as a review-workflow tool, but it
+    directly improves the pr-test-analyzer agent's ability to scope
+    coverage gaps to the diff.
+
+### Hardening (folded in from PR #41 review)
+- All three external calls in `_collect_codegraph_affected` (`gh pr view`,
+  `git diff`, `codegraph affected`) are wrapped in `try/except (OSError,
+  SubprocessError, UnicodeDecodeError)` with explicit timeouts (10s/10s/30s).
+  Without these, a binary that disappeared between `shutil.which` and the
+  subprocess call, or a hung index build, would crash the launch
+  post-`App.suspend()` with an uncaught traceback in a half-restored
+  terminal. Same `OSError` guard added around the `subprocess.call`s for
+  `codegraph init` and `codegraph sync`, matching the `uv tool upgrade`
+  pattern at line 2752. `gh pr view` passes `--repo <owner/repo>` explicitly
+  (rather than relying on cwd repo-inference) for robustness on cross-fork
+  PRs where `gh pr checkout` adds the head-repo remote.
+- `shutil.which("codegraph")` hoisted into a single `codegraph_on_path`
+  probe instead of being re-evaluated across Tiers 2/3/4 — removes a TOCTOU
+  window where the binary could be uninstalled mid-launch between probes.
+- `_collect_codegraph_affected` now dedupes and stably sorts its return
+  value so the user-visible "CodeGraph reports N affected file(s)" status
+  print exactly matches the number of bullets the agent sees in the prompt
+  block (pre-fix, the print used the raw stdout count while the formatter
+  deduped downstream).
+
 ## [0.12.0] — 2026-05-15
 
 ### Added
