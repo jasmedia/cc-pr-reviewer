@@ -21,6 +21,8 @@ import pytest
 import cc_pr_reviewer as _mod
 from cc_pr_reviewer import (
     _APP_HOSTNAME,
+    CODEGRAPH_AFFECTED_TESTS_CAP,
+    CODEGRAPH_HINT_SUFFIX,
     EXISTING_COMMENT_BODY_CAP,
     EXISTING_COMMENT_LIST_CAP,
     POST_INLINE_DEDUP_SUFFIX,
@@ -52,6 +54,7 @@ from cc_pr_reviewer import (
     _skills_dir,
     build_review_prompt,
     check_prereqs,
+    format_codegraph_affected_tests,
     format_existing_comments,
 )
 
@@ -290,6 +293,217 @@ def test_my_login_none_never_triggers_rereview() -> None:
     assert POST_INLINE_REREVIEW_SUFFIX not in built.text
     assert POST_INLINE_REREVIEW_APPROVE_SUFFIX not in built.text
     assert POST_INLINE_REREVIEW_RESOLVE_SUFFIX not in built.text
+
+
+# --- CodeGraph hint suffix (gated on `.codegraph/` presence) ---------------
+
+
+@pytest.mark.parametrize("cli", ["claude", "codex", "gemini"])
+def test_codegraph_suffix_absent_by_default(cli: str) -> None:
+    """Default `codegraph_present=False` must leave the prompt untouched.
+    Guards against accidentally appending the hint on workspaces that
+    don't have an index — the suffix references MCP tools that wouldn't
+    resolve, which would just waste tokens."""
+    built = build_review_prompt(
+        post_inline=False,
+        extra_prompt="",
+        existing=[],
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+        cli=cli,
+    )
+    assert CODEGRAPH_HINT_SUFFIX not in built.text
+
+
+@pytest.mark.parametrize("cli", ["claude", "codex", "gemini"])
+def test_codegraph_suffix_present_when_flag_set(cli: str) -> None:
+    """When `_launch_claude` detects `.codegraph/` and sets the flag, the
+    suffix must land in the prompt for every CLI — the MCP tool surface
+    is identical across claude/codex/gemini, so the gate is presence of
+    the index, not the CLI in use."""
+    built = build_review_prompt(
+        post_inline=False,
+        extra_prompt="",
+        existing=[],
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+        cli=cli,
+        codegraph_present=True,
+    )
+    assert CODEGRAPH_HINT_SUFFIX in built.text
+
+
+def test_codegraph_suffix_placed_after_extra_prompt_before_existing() -> None:
+    """Lock the canonical section order when CodeGraph is present:
+    base → reviewer extras → CodeGraph hint → existing comments →
+    post-inline. Reviewer extras stay adjacent to the base (highest
+    visibility for per-launch overrides); the hint sits with the
+    "what to review" blocks rather than the "how to publish" block."""
+    existing = [_comment("charlie")]
+    built = build_review_prompt(
+        post_inline=True,
+        extra_prompt="focus on the auth changes",
+        existing=existing,
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+        cli="claude",
+        codegraph_present=True,
+    )
+    expected = PROMPT_SECTION_SEP.join(
+        [
+            REVIEW_PROMPT_CLAUDE,
+            "Additional instructions from reviewer:\nfocus on the auth changes",
+            CODEGRAPH_HINT_SUFFIX,
+            format_existing_comments(existing)[0],
+            POST_INLINE_PROMPT + POST_INLINE_DEDUP_SUFFIX,
+        ]
+    )
+    assert built.text == expected
+
+
+def test_codegraph_suffix_mentions_core_mcp_tools() -> None:
+    """The hint's value is steering the agent to specific MCP tools by
+    name. If a refactor decays it to generic "use CodeGraph", the agent
+    falls back to grep+Read fan-out — defeats the integration. Lock the
+    minimal set the prompt must call out."""
+    for tool in (
+        "codegraph_context",
+        "codegraph_impact",
+        "codegraph_callers",
+        "codegraph_callees",
+        "codegraph_trace",
+        "codegraph_search",
+    ):
+        assert tool in CODEGRAPH_HINT_SUFFIX, f"hint missing `{tool}` mention"
+
+
+# --- format_codegraph_affected_tests ---------------------------------------
+
+
+def test_affected_tests_empty_list_returns_empty_string() -> None:
+    """Empty input → empty sentinel. `build_review_prompt` skips the
+    section on falsy strings, so this is the path taken when the diff
+    has no codegraph-traceable test impact."""
+    assert format_codegraph_affected_tests([]) == ""
+
+
+def test_affected_tests_whitespace_only_paths_drop_to_empty() -> None:
+    """Pure-whitespace lines from `codegraph affected` stdout must not
+    render as `- ` bullets — they'd waste tokens and confuse the agent."""
+    assert format_codegraph_affected_tests(["", "   ", "\t"]) == ""
+
+
+def test_affected_tests_dedups_and_sorts() -> None:
+    """`codegraph affected` can report the same test twice when multiple
+    changed files reach it. Dedup is on the cleaned path; sort gives
+    stable prompt output across runs (otherwise diffing prompts becomes
+    noisy and cache hits suffer)."""
+    block = format_codegraph_affected_tests(
+        ["tests/b.py", "tests/a.py", "tests/b.py", "  tests/a.py  "]
+    )
+    bullets = [line for line in block.splitlines() if line.startswith("- ")]
+    assert bullets == ["- tests/a.py", "- tests/b.py"]
+
+
+def test_affected_tests_caps_with_overflow_note() -> None:
+    """Beyond the cap, the block must say so explicitly — otherwise a
+    truncated 50-item list looks authoritative to the agent and it'll
+    rely on a partial view of the impact surface."""
+    paths = [f"tests/t_{i:03d}.py" for i in range(CODEGRAPH_AFFECTED_TESTS_CAP + 25)]
+    block = format_codegraph_affected_tests(paths)
+    bullets = [line for line in block.splitlines() if line.startswith("- ")]
+    assert len(bullets) == CODEGRAPH_AFFECTED_TESTS_CAP
+    assert f"showing {CODEGRAPH_AFFECTED_TESTS_CAP} of " in block
+    assert "truncated" in block
+
+
+def test_affected_tests_at_cap_does_not_show_overflow_note() -> None:
+    """Exactly-at-cap is the boundary that's easy to off-by-one. No
+    overflow note when the list fits exactly — saying "showing 50 of
+    50, truncated" would lie about a complete list."""
+    paths = [f"tests/t_{i:03d}.py" for i in range(CODEGRAPH_AFFECTED_TESTS_CAP)]
+    block = format_codegraph_affected_tests(paths)
+    assert "truncated" not in block
+
+
+@pytest.mark.parametrize("cli", ["claude", "codex", "gemini"])
+def test_affected_tests_block_lands_after_hint_before_existing(cli: str) -> None:
+    """Lock the section order across CLIs: base → extras → CodeGraph hint
+    → CodeGraph affected tests → existing comments → post-inline. The two
+    CodeGraph sections must be contiguous so the agent reads them as one
+    coherent block; placing the affected-tests block before the hint
+    (or after existing-comments) would split the CodeGraph context."""
+    existing = [_comment("charlie")]
+    affected_block = format_codegraph_affected_tests(["tests/foo_test.py"])
+    built = build_review_prompt(
+        post_inline=True,
+        extra_prompt="extra",
+        existing=existing,
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+        cli=cli,
+        codegraph_present=True,
+        codegraph_affected_tests=affected_block,
+    )
+    base = REVIEW_PROMPT_CLAUDE if cli == "claude" else REVIEW_PROMPT_SKILL_BASED
+    expected = PROMPT_SECTION_SEP.join(
+        [
+            base,
+            "Additional instructions from reviewer:\nextra",
+            CODEGRAPH_HINT_SUFFIX,
+            affected_block,
+            format_existing_comments(existing)[0],
+            POST_INLINE_PROMPT + POST_INLINE_DEDUP_SUFFIX,
+        ]
+    )
+    assert built.text == expected
+
+
+def test_affected_tests_block_absent_when_kwarg_empty() -> None:
+    """The block-skipping default keeps existing test fixtures unchanged
+    and matches the "no diff impact / no index" runtime path. Without
+    this guard, an empty-string section would still render as an extra
+    PROMPT_SECTION_SEP, polluting the assembled prompt."""
+    built = build_review_prompt(
+        post_inline=False,
+        extra_prompt="",
+        existing=[],
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+        cli="claude",
+        codegraph_present=True,
+        codegraph_affected_tests="",
+    )
+    assert built.text == PROMPT_SECTION_SEP.join([REVIEW_PROMPT_CLAUDE, CODEGRAPH_HINT_SUFFIX])
+
+
+def test_affected_tests_block_can_render_without_codegraph_hint() -> None:
+    """Edge case: `codegraph_present=False` with a non-empty affected
+    block can't happen in normal `_launch_claude` flow (the orchestration
+    gates both on the same precondition), but the prompt builder
+    shouldn't enforce that coupling — each section is independently
+    gated so a future caller (e.g. a CI driver that ships a pre-computed
+    block without the MCP wiring) doesn't have to lie about
+    `codegraph_present` to inject the list."""
+    affected_block = format_codegraph_affected_tests(["tests/a.py"])
+    built = build_review_prompt(
+        post_inline=False,
+        extra_prompt="",
+        existing=[],
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+        cli="claude",
+        codegraph_present=False,
+        codegraph_affected_tests=affected_block,
+    )
+    assert CODEGRAPH_HINT_SUFFIX not in built.text
+    assert affected_block in built.text
 
 
 # --- Skill-based prompt (codex / gemini share this) ------------------------
