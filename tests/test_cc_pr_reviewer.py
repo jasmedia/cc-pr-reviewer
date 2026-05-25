@@ -429,6 +429,42 @@ def test_affected_tests_at_cap_does_not_show_overflow_note() -> None:
     assert "truncated" not in block
 
 
+def test_affected_tests_one_over_cap_shows_overflow_note() -> None:
+    """The other side of the at-cap boundary: CAP+1 is the smallest
+    input that should trigger the overflow note. Pairs with the
+    at-cap test to pin the `>` vs `>=` gate exactly. Catches a regression
+    that flipped the inequality (would render `truncated` on a complete
+    50-item list, or omit it on an actual 51-item one)."""
+    paths = [f"tests/t_{i:03d}.py" for i in range(CODEGRAPH_AFFECTED_TESTS_CAP + 1)]
+    block = format_codegraph_affected_tests(paths)
+    bullets = [line for line in block.splitlines() if line.startswith("- ")]
+    assert len(bullets) == CODEGRAPH_AFFECTED_TESTS_CAP
+    assert "truncated" in block
+
+
+def test_affected_tests_preserves_internal_whitespace_in_paths() -> None:
+    """`p.strip()` should clean leading/trailing whitespace only; interior
+    spaces (e.g. paths shipped from Windows test dirs, or rare repos with
+    spaces in names) must round-trip verbatim. A regression that swapped
+    `strip()` for `replace(" ", "")` or `split()` would silently corrupt
+    these paths in the prompt — the agent then can't find the file."""
+    block = format_codegraph_affected_tests(["  tests/has space.py  ", "tests/normal.py"])
+    bullets = [line for line in block.splitlines() if line.startswith("- ")]
+    assert bullets == ["- tests/has space.py", "- tests/normal.py"]
+
+
+def test_affected_tests_mixed_case_sort_is_deterministic_ascii() -> None:
+    """File paths are case-sensitive on POSIX; the sort key must be
+    deterministic so the prompt's section bytes stay stable across runs
+    (cache-hit stability). Default `sorted({...})` uses ASCII ordering,
+    which puts uppercase before lowercase. Lock that behaviour here —
+    if a future refactor adds `key=str.lower` the order changes silently
+    and prompt-cache hit rates drop."""
+    block = format_codegraph_affected_tests(["tests/a.py", "Tests/B.py", "tests/B.py"])
+    bullets = [line for line in block.splitlines() if line.startswith("- ")]
+    assert bullets == ["- Tests/B.py", "- tests/B.py", "- tests/a.py"]
+
+
 @pytest.mark.parametrize("cli", ["claude", "codex", "gemini"])
 def test_affected_tests_block_lands_after_hint_before_existing(cli: str) -> None:
     """Lock the section order across CLIs: base → extras → CodeGraph hint
