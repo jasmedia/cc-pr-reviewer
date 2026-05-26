@@ -1050,9 +1050,23 @@ def _codegraph_mcp_registered(
     any_file_seen = False
     had_parse_error = False
     for path in json_candidates:
-        if not path.exists():
+        # `path.exists()`/`is_file()` reach into the filesystem and
+        # re-raise `PermissionError` (EACCES is NOT in pathlib's ignored-
+        # errno set) when an ancestor dir like `~`, `~/.codex`, or
+        # `~/.gemini` lacks search/execute permission. Wrapping the
+        # stat-level calls in the same `OSError` bucket as the `read_text`
+        # below means an unreadable tree degrades to `None`/parse-error
+        # honestly instead of bubbling a traceback out of `_launch_claude`
+        # post-`suspend()` (or out of `on_mount` for the startup path
+        # this PR adds).
+        try:
+            if not path.exists():
+                continue
+            is_regular_file = path.is_file()
+        except OSError:
+            had_parse_error = True
             continue
-        if not path.is_file():
+        if not is_regular_file:
             # Path slot exists but isn't a regular file (accidental
             # `mkdir ~/.claude.json`, dangling symlink, device node).
             # Bucket as parse-failure: we can't read it, so we can't
@@ -1109,9 +1123,18 @@ def _codegraph_mcp_registered(
             return True
 
     for path in toml_candidates:
-        if not path.exists():
+        # Same stat-level guard as the JSON loop above — PermissionError
+        # on an unreadable ancestor (e.g. `chmod 000 ~/.codex`) must
+        # degrade cleanly to "had_parse_error" rather than crashing the
+        # caller post-`suspend()` or during `on_mount`.
+        try:
+            if not path.exists():
+                continue
+            is_regular_file = path.is_file()
+        except OSError:
+            had_parse_error = True
             continue
-        if not path.is_file():
+        if not is_regular_file:
             had_parse_error = True
             continue
         any_file_seen = True
@@ -1145,8 +1168,10 @@ def _check_codegraph_setup(
 ) -> CodegraphSetupState:
     """Workspace-free startup health check for codegraph + per-CLI MCP wiring.
 
-    Returns a coarse three-state diagnosis suitable for a one-time toast
-    at TUI startup or after a `c` toggle. Distinct from
+    Returns a coarse three-state diagnosis suitable for a per-invocation
+    toast at TUI startup AND on each `c` toggle (no internal dedup —
+    every call evaluates fresh, every binary-only result re-emits the
+    toast). Distinct from
     `_codegraph_mcp_registered` in two ways:
       1. No workspace argument — startup runs before a PR is selected,
          so workspace-local config probes (`<workspace>/.mcp.json`,
@@ -2743,8 +2768,9 @@ class PRReviewer(App):
                 severity="warning",
                 timeout=10,
             )
-        # One-time CodeGraph health check: early-warning when the binary
-        # is installed but the active CLI isn't wired up. Silent in the
+        # CodeGraph health check at startup, also re-run on each `c`
+        # toggle (see `action_toggle_cli`). Early-warning when the binary
+        # is installed but the active CLI isn't wired up; silent in the
         # other two states — "not-installed" is the default for users
         # who don't care, and "wired" doesn't need a toast. Per-launch
         # verification (which also probes the workspace-local config
@@ -3235,23 +3261,40 @@ class PRReviewer(App):
         self._maybe_notify_codegraph_setup()
 
     def _maybe_notify_codegraph_setup(self) -> None:
-        """Surface a one-shot warning if CodeGraph is installed but the
-        active CLI isn't wired up. Silent for `not-installed` (don't nag
-        non-users) and `wired` (happy path). Called from `on_mount` and
-        `action_toggle_cli`; the orchestration in `_launch_claude` does
-        the per-workspace deep check.
+        """Per-invocation: surface a warning if CodeGraph is installed but
+        the active CLI isn't wired up. Silent for `not-installed` (don't
+        nag non-users) and `wired` (happy path). Called once from
+        `on_mount` and re-emitted on each `action_toggle_cli` — every CLI
+        change surfaces the gap for the new selection. No internal dedup
+        guard; the user toggling cycle → wired → binary-only → wired is
+        meant to fire and clear repeatedly. The per-workspace deep check
+        in `_launch_claude` remains the source of truth.
         """
-        state = _check_codegraph_setup(self.cli)
-        if state != "binary-only":
+        # Best-effort early-warning: never let a probe failure escape into
+        # `on_mount` (no surrounding try) or `action_toggle_cli` (whose
+        # only try guards `_set_setting`). The root fix in
+        # `_codegraph_mcp_registered` already buckets `OSError` into the
+        # parse-error path, but a future refactor could reintroduce a
+        # raise path; degrading silently here is the cheap belt-and-
+        # suspenders so a misconfigured filesystem can never crash the
+        # TUI startup or a keypress.
+        try:
+            state = _check_codegraph_setup(self.cli)
+        except Exception:  # noqa: BLE001
             return
-        self.notify(
-            f"CodeGraph binary on PATH but not registered for "
-            f"{_CLI_DISPLAY[self.cli]}. {_CODEGRAPH_INSTALL_HINT[self.cli]} "
-            f"Until then, the MCP-tools prompt hint stays off for "
-            f"{_CLI_DISPLAY[self.cli]} reviews.",
-            severity="warning",
-            timeout=12,
-        )
+        # Positive match — silent in the other two states. Phrased
+        # positively (rather than `if state != "binary-only": return`)
+        # so a future 4th `CodegraphSetupState` member defaults to
+        # silent rather than mistakenly nagging the user.
+        if state == "binary-only":
+            self.notify(
+                f"CodeGraph binary on PATH but not registered for "
+                f"{_CLI_DISPLAY[self.cli]}. {_CODEGRAPH_INSTALL_HINT[self.cli]} "
+                f"Until then, the MCP-tools prompt hint stays off for "
+                f"{_CLI_DISPLAY[self.cli]} reviews.",
+                severity="warning",
+                timeout=12,
+            )
 
     def action_toggle_codegraph(self) -> None:
         # Render-free like `action_toggle_cli` — the table doesn't depend
