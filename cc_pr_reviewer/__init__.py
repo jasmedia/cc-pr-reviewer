@@ -1064,10 +1064,42 @@ def _codegraph_mcp_registered(
             # setup this probe exists to support.
             had_parse_error = True
             continue
-        if isinstance(data, dict):
-            mcp = data.get("mcpServers")
-            if isinstance(mcp, dict) and "codegraph" in mcp:
-                return True
+        # A readable-but-structurally-malformed config (top-level not a
+        # dict, or `mcpServers` present but not a dict) is "undetectable",
+        # not "confirmed-not-registered": the file is unusable for our
+        # purpose, so the honest state is None. Without bucketing these
+        # branches into `had_parse_error`, the helper would fall through
+        # to `return False`, and `_launch_claude` would print the
+        # "config exists but lacks the entry — run `codegraph install`"
+        # remediation, which won't fix a structurally broken config.
+        # `isinstance(mcp, dict)` ALSO guards against substring-style
+        # false-positives: `"codegraph" in "codegraph"` is True (char
+        # membership) and `"codegraph" in ["codegraph"]` is True (list
+        # membership), both of which would wrongly resolve to a True
+        # registration if the dict-typed check were dropped.
+        if not isinstance(data, dict):
+            had_parse_error = True
+            continue
+        if "mcpServers" not in data:
+            # Key simply absent is a valid "no entry" state, not a
+            # malformed shape — falls through to the final `return False`
+            # below if nothing else trips. Distinguishing absent-vs-null
+            # requires the `in` check; `data.get("mcpServers")` would
+            # collapse `{}` and `{"mcpServers": None}` into the same
+            # `None`, hiding the malformed case from the bucket below.
+            continue
+        mcp = data["mcpServers"]
+        if not isinstance(mcp, dict):
+            # Key present but the value is malformed (string, list, null,
+            # primitive). `isinstance(mcp, dict)` also guards against
+            # substring-style false-positives — `"codegraph" in "codegraph"`
+            # (char membership) and `"codegraph" in ["codegraph"]` (list
+            # membership) are both truthy and would wrongly resolve to a
+            # True registration if the dict-typed check were dropped.
+            had_parse_error = True
+            continue
+        if "codegraph" in mcp:
+            return True
 
     for path in toml_candidates:
         if not path.exists():

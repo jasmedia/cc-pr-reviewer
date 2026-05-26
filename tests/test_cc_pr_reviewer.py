@@ -754,6 +754,51 @@ def test_mcp_registered_returns_none_on_corrupt_toml(tmp_path: Path) -> None:
     assert _codegraph_mcp_registered("codex", workspace, home=home) is None
 
 
+def test_mcp_registered_top_level_non_dict_is_none(tmp_path: Path) -> None:
+    """A JSON file that parses but whose root isn't a dict (`[]`, `"x"`,
+    `42`) is structurally unusable — we can't navigate to `mcpServers`.
+    Must resolve to None ("couldn't find or parse"), not False ("exists
+    but lacks the entry"): the latter routes the user to
+    `codegraph install`, which won't fix a malformed config. Pre-fix
+    this fell through to `return False`."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".claude.json").write_text('["not", "a", "dict"]', encoding="utf-8")
+    assert _codegraph_mcp_registered("claude", workspace, home=home) is None
+
+
+def test_mcp_registered_mcp_servers_non_dict_is_none(tmp_path: Path) -> None:
+    """`mcpServers` present but not a dict (string, list, null,
+    primitive) is structurally malformed and must resolve to None for
+    the same reason as the top-level case — and also because
+    `isinstance(mcp, dict)` is the ONLY thing keeping the substring
+    membership tests (`"codegraph" in "codegraph"` → True;
+    `"codegraph" in ["codegraph"]` → True) from false-positively
+    returning True. Locking the dict-typed guard here means a future
+    refactor that drops it (e.g. `if "codegraph" in mcp: return True`)
+    fails this test loudly instead of quietly claiming registration
+    based on a substring match."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    # The pathological-but-realistic case: mcpServers is a string that
+    # contains the substring "codegraph". Without the dict guard, this
+    # would return True via `"codegraph" in "codegraph"`.
+    _write_json(home / ".claude.json", {"mcpServers": "codegraph"})
+    assert _codegraph_mcp_registered("claude", workspace, home=home) is None
+    # Also exercise the list-shape (membership check would pass on
+    # `"codegraph" in ["codegraph"]` if the guard were dropped).
+    _write_json(home / ".claude.json", {"mcpServers": ["codegraph"]})
+    assert _codegraph_mcp_registered("claude", workspace, home=home) is None
+    # And null — `None.get("codegraph")` would AttributeError if the
+    # guard were dropped; the helper must surface None cleanly.
+    _write_json(home / ".claude.json", {"mcpServers": None})
+    assert _codegraph_mcp_registered("claude", workspace, home=home) is None
+
+
 def test_mcp_registered_handles_non_regular_file_at_config_path(tmp_path: Path) -> None:
     """If the user has accidentally `mkdir ~/.claude.json` (or a dangling
     symlink at the config path), `is_file()` is False but `exists()` is
