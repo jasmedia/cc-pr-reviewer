@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.1] — 2026-05-26
+
+### Fixed
+- **Tier 1 CodeGraph hint suffix now requires both `.codegraph/` AND the
+  `codegraph` binary on PATH.** Previously the suffix only gated on the
+  index directory existing in the workspace, so a stray `.codegraph/`
+  left behind by a prior `codegraph uninstall` (or a partial install)
+  emitted "use these MCP tools" guidance to an agent whose session had
+  no codegraph MCP server registered. The agent then read a misleading
+  instruction, fell back to grep+Read, and surfaced
+  "CodeGraph MCP tools weren't registered in this session" to the
+  reviewer — defeating the integration AND making cc-reviewer look
+  broken. Tier 2/3/4 already composed both signals; the suffix gate
+  was the lone outlier. Fix composes the AND at the `build_review_prompt`
+  call site and tightens the kwarg's docstring so a future caller
+  can't reintroduce the bare index-on-disk gate.
+
 ## [0.13.0] — 2026-05-25
 
 ### Added
