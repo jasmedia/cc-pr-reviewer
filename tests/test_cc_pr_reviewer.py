@@ -690,6 +690,87 @@ def test_mcp_registered_returns_true_for_gemini_workspace_local(tmp_path: Path) 
     assert _codegraph_mcp_registered("gemini", workspace, home=home) is True
 
 
+def test_mcp_registered_corrupt_global_does_not_mask_valid_workspace(
+    tmp_path: Path,
+) -> None:
+    """Regression test for the early-return bug: when `~/.claude.json` is
+    corrupt but `<workspace>/.mcp.json` has a valid `codegraph` entry, the
+    helper must still return True. Pre-refactor the JSON-parse `except`
+    returned None immediately, suppressing the suffix despite the agent
+    having the tools available via the workspace-local config. Locks the
+    "loop-don't-return on errors" behaviour the helper now implements."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    # Corrupt global config.
+    (home / ".claude.json").write_text("{not valid", encoding="utf-8")
+    # Valid workspace-local config WITH codegraph.
+    _write_json(
+        workspace / ".mcp.json",
+        {"mcpServers": {"codegraph": {"command": "codegraph"}}},
+    )
+    assert _codegraph_mcp_registered("claude", workspace, home=home) is True
+
+
+def test_mcp_registered_absent_global_plus_workspace_without_codegraph_is_false(
+    tmp_path: Path,
+) -> None:
+    """Multi-candidate accumulation: with the global config absent and
+    only the workspace-local present-without-codegraph, the helper must
+    return False (one config was seen and lacked the entry), NOT None
+    (which would imply no config was seen at all). The warning prose
+    branches on this distinction — under-reporting as None would steer
+    the user to "couldn't find a config" when their config exists and
+    just lacks the entry."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    _write_json(
+        workspace / ".mcp.json",
+        {"mcpServers": {"other-server": {"command": "other"}}},
+    )
+    assert _codegraph_mcp_registered("claude", workspace, home=home) is False
+
+
+def test_mcp_registered_returns_none_on_corrupt_toml(tmp_path: Path) -> None:
+    """Locks the codex TOML `except (OSError, UnicodeDecodeError)` path
+    (currently the only way to exercise it is a non-UTF-8 byte sequence,
+    since `read_text` doesn't raise on a syntactically-broken TOML body
+    — that just causes the regex to not match and the helper returns
+    False). A refactor that drops or narrows the except tuple would let
+    OSError escape into `_launch_claude` and crash the launch
+    post-suspend; this test pins the silent-degrade behaviour."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    cfg = home / ".codex" / "config.toml"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    # Non-UTF-8 bytes — `read_text(encoding="utf-8")` raises
+    # UnicodeDecodeError, which the helper's except catches and turns
+    # into `had_parse_error=True` → returns None at the end.
+    cfg.write_bytes(b"\xff\xfe not valid utf-8 \x80")
+    assert _codegraph_mcp_registered("codex", workspace, home=home) is None
+
+
+def test_mcp_registered_handles_non_regular_file_at_config_path(tmp_path: Path) -> None:
+    """If the user has accidentally `mkdir ~/.claude.json` (or a dangling
+    symlink at the config path), `is_file()` is False but `exists()` is
+    True. Pre-refactor this was conflated with "no config" (return None),
+    sending the user a "couldn't find" warning that doesn't fit the
+    actual state. Now it's bucketed as a parse-failure: `any_file_seen`
+    stays False but `had_parse_error` flips True, the return is still
+    None, but the warning prose ("couldn't find or parse") now covers
+    the case honestly."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    # Make a directory at the config path — `is_file()` returns False.
+    (home / ".claude.json").mkdir(parents=True)
+    assert _codegraph_mcp_registered("claude", workspace, home=home) is None
+
+
 def test_mcp_registered_per_cli_isolation(tmp_path: Path) -> None:
     """A codegraph entry registered for Claude only must NOT be reported
     as registered for codex or gemini — the gate is per-launched-CLI,

@@ -538,6 +538,34 @@ _CLI_DISPLAY: dict[CliChoice, str] = {
     "gemini": "Gemini",
 }
 
+# Per-CLI remediation prose printed when `.codegraph/` and the binary are
+# both present but the CLI's MCP config doesn't reference codegraph.
+# Codegraph's installer (`codegraph install`) supports `--target=claude`
+# and `--target=codex` but NOT `--target=gemini` — gemini doesn't appear
+# in the installer's target list (verified against codegraph v0.9.5,
+# which errors `Unknown --target id(s): gemini. Known: claude, cursor,
+# codex, opencode, hermes`). For gemini we point at the manual-setup
+# path instead, otherwise a copy-paste would land users on a confusing
+# installer error. Keeping the prose in a dict (rather than building it
+# inline at the launch site) makes it cheap to keep accurate as
+# codegraph upstream adds/removes installer targets.
+_CODEGRAPH_INSTALL_HINT: dict[CliChoice, str] = {
+    "claude": (
+        "Run `codegraph install --target=claude --location=global --yes` "
+        "to wire it up, then restart Claude Code once."
+    ),
+    "codex": (
+        "Run `codegraph install --target=codex --location=global --yes` "
+        "to wire it up, then restart Codex once."
+    ),
+    "gemini": (
+        "CodeGraph's installer has no `--target=gemini` option — add an "
+        "`mcpServers.codegraph` entry to `~/.gemini/settings.json` manually "
+        "(see https://github.com/colbymchenry/codegraph#manual-setup-alternative "
+        "for the canonical JSON snippet), then restart Gemini once."
+    ),
+}
+
 # PyPI update-check lifecycle. "unavailable" is for source/editable installs
 # where `_installed_version()` returns None and there's nothing to compare;
 # the worker doesn't run and `action_upgrade` shows a tailored message rather
@@ -932,18 +960,30 @@ def _codegraph_mcp_registered(
     that way):
 
     - `True`: a `codegraph` MCP entry was found in at least one of the
-      per-CLI config locations (global user-level OR workspace-local).
+      per-CLI config locations probed (global user-level for every CLI;
+      plus workspace-local for claude and gemini — codex has no
+      project-local MCP path).
     - `False`: every config file we checked exists and confirms there
       is no codegraph entry — the user has the CLI configured but
       didn't run `codegraph install` for it (or ran it for a different
       CLI than the one currently selected via the `c` toggle).
-    - `None`: undetectable — no config file existed at any checked
-      path, or a file existed but parsing failed. Callers gating the
-      Tier 1 prompt suffix should treat `None` the same as `False`
-      (don't promise tools we can't confirm), but the distinction is
-      preserved so warning prose can differentiate "you haven't run
-      the installer at all for this CLI" (None) from "you ran it for
-      a different CLI" (False).
+    - `None`: undetectable — either NO config file existed at any
+      checked path, OR a file existed but couldn't be parsed/read.
+      Callers gating the Tier 1 prompt suffix should treat `None` the
+      same as `False` (don't promise tools we can't confirm).
+
+    Why distinguish `None` from `False`: a user who sees the warning
+    benefits from prose that names the actual failure shape (no config
+    vs. unreadable config), so cc-reviewer's launch banner reads
+    "couldn't find or parse a {cli} config" for None and "config exists
+    but lacks the codegraph entry" for False. The distinction is also
+    intentionally lossy on parse-failures: with multiple candidates
+    (claude/gemini both have global + workspace-local), if EARLIER
+    candidates fail to parse but a LATER one validly contains the
+    entry, we return `True` — under-promising on a valid setup just
+    because the global file was transiently malformed would be worse
+    than the warning we'd otherwise print. The `had_parse_error` flag
+    only matters when no candidate returned True.
 
     Why this lives between cc-reviewer and the agent: cc-reviewer's
     Tier 1 prompt suffix tells the agent "use these MCP tools". If the
@@ -956,17 +996,24 @@ def _codegraph_mcp_registered(
     @colbymchenry/codegraph`) without running `codegraph install` to
     write per-CLI MCP entries.
 
+    Gemini caveat: codegraph's installer has no `--target=gemini`
+    option (only `claude`, `cursor`, `codex`, `opencode`, `hermes` as
+    of v0.9.5), so a positive `True` result for `cli == "gemini"` is
+    *always* from a hand-wired `mcpServers.codegraph` entry. A
+    perpetual False for gemini-only users isn't a regression — it
+    reflects codegraph upstream.
+
     `workspace` is the PR's checked-out clone — used to probe
-    project-local config files. `home` defaults to `Path.home()` and is
-    overridable for tests so we can stand up fake config trees under
-    `tmp_path` without monkeypatching `Path.home`.
+    project-local config files. `home` defaults to `Path.home()` and
+    is overridable for tests so we can stand up fake config trees
+    under `tmp_path` without monkeypatching `Path.home`.
 
     The check is best-effort: codegraph's installer writes canonical
     `mcpServers.codegraph` (JSON) or `[mcp_servers.codegraph]` (TOML)
-    entries, which is exactly what we detect. A user with a non-standard
-    config layout will see False here and a printed warning; their
-    tools may still load fine at runtime, but cc-reviewer can't confirm
-    it ahead of time.
+    entries, which is exactly what we detect. A user with a
+    non-standard config layout will see False here and a printed
+    warning; their tools may still load fine at runtime, but
+    cc-reviewer can't confirm it ahead of time.
     """
     home = home or Path.home()
     json_candidates: list[Path] = []
@@ -980,38 +1027,60 @@ def _codegraph_mcp_registered(
         # global only — codex doesn't have a project-local MCP path the
         # way Claude and Gemini do).
         toml_candidates = [home / ".codex" / "config.toml"]
-    else:  # gemini
+    elif cli == "gemini":
         json_candidates = [
             home / ".gemini" / "settings.json",
             workspace / ".gemini" / "settings.json",
         ]
+    else:
+        # Mirrors `_build_cli_command`'s house pattern: a future 4th
+        # CliChoice member must fail loud here rather than silently
+        # falling through to a wrong-but-plausible branch (e.g. probing
+        # gemini's config for a new CLI). Type-checker would catch this
+        # too, but a runtime raise is the belt-and-suspenders fallback.
+        raise ValueError(f"unknown CLI choice: {cli!r}")
 
     any_file_seen = False
+    had_parse_error = False
     for path in json_candidates:
+        if not path.exists():
+            continue
         if not path.is_file():
+            # Path slot exists but isn't a regular file (accidental
+            # `mkdir ~/.claude.json`, dangling symlink, device node).
+            # Bucket as parse-failure: we can't read it, so we can't
+            # confirm — but distinct from "no config at all" so the
+            # warning prose is accurate ("couldn't find or parse").
+            had_parse_error = True
             continue
         any_file_seen = True
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-            # File exists but we can't read it. Conservative: report
-            # `None` so the caller treats the state as unknown — better
-            # than guessing False (would suppress a working setup) or
-            # True (would emit a hint for tools that may not load).
-            return None
+            # File exists but unreadable/corrupt. Continue to the next
+            # candidate rather than returning None immediately — a
+            # corrupt global config must NOT suppress a valid workspace-
+            # local one, otherwise we'd under-promise on the exact
+            # setup this probe exists to support.
+            had_parse_error = True
+            continue
         if isinstance(data, dict):
             mcp = data.get("mcpServers")
             if isinstance(mcp, dict) and "codegraph" in mcp:
                 return True
 
     for path in toml_candidates:
+        if not path.exists():
+            continue
         if not path.is_file():
+            had_parse_error = True
             continue
         any_file_seen = True
         try:
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
-            return None
+            had_parse_error = True
+            continue
         # Match conservatively on the canonical section header form
         # `[mcp_servers.codegraph]` — that's what `codegraph install`
         # writes. Alternative shapes (inline tables under
@@ -1023,7 +1092,9 @@ def _codegraph_mcp_registered(
         if re.search(r"^\[mcp_servers\.codegraph\]\s*$", text, re.MULTILINE):
             return True
 
-    return False if any_file_seen else None
+    if had_parse_error or not any_file_seen:
+        return None
+    return False
 
 
 def _collect_codegraph_affected(local_path: Path, repo: str, number: int) -> list[str]:
@@ -1271,13 +1342,14 @@ def build_review_prompt(
     composes three signals: `.codegraph/` exists in the workspace, the
     `codegraph` binary is on PATH, AND the selected CLI's config
     (`~/.claude.json` / `~/.codex/config.toml` / `~/.gemini/settings.json`,
-    plus workspace-local variants) contains a `codegraph` MCP entry
-    (verified by `_codegraph_mcp_registered`). The kwarg name is
-    preserved for back-compat, but the semantic is "tools available",
-    not bare index-on-disk: a stray `.codegraph/`, an `npm i -g` install
-    without `codegraph install`, or a CLI toggle to one the user hadn't
-    wired up would otherwise emit a hint pointing at tools no session
-    has loaded, and the agent — taking the prompt at face value — falls
+    plus workspace-local variants for claude and gemini — codex is
+    global-only) contains a `codegraph` MCP entry (verified by
+    `_codegraph_mcp_registered`). The kwarg name is preserved for
+    back-compat, but the semantic is "tools available", not bare
+    index-on-disk: a stray `.codegraph/`, an `npm i -g` install without
+    `codegraph install`, or a CLI toggle to one the user hadn't wired
+    up would otherwise emit a hint pointing at tools no session has
+    loaded, and the agent — taking the prompt at face value — falls
     back to grep+Read while reporting that the tools weren't registered.
     Defaults to `False` so any caller that hasn't probed the workspace
     (tests, future integrations) keeps the existing prompt verbatim.
@@ -3423,29 +3495,31 @@ class PRReviewer(App):
                 if codegraph_present and codegraph_on_path:
                     mcp_state = _codegraph_mcp_registered(cli, local_path)
                     codegraph_tools_available = mcp_state is True
+                    install_hint = _CODEGRAPH_INSTALL_HINT[cli]
                     if mcp_state is False:
                         print(
                             f"warning: codegraph MCP server is not registered for "
                             f"{_CLI_DISPLAY[cli]} (no `codegraph` entry under "
                             f"`mcpServers` / `[mcp_servers.codegraph]` in its config). "
                             f"Skipping the MCP-tools prompt hint — the agent's session "
-                            f"won't have codegraph tools loaded. Run "
-                            f"`codegraph install --target={cli} --location=global --yes` "
-                            f"to wire it up, then restart {_CLI_DISPLAY[cli]} once."
+                            f"won't have codegraph tools loaded. {install_hint}"
                         )
                     elif mcp_state is None:
-                        # Binary on PATH + index present + NO config file
-                        # at any standard location ≈ the user installed
-                        # the binary directly without running the
-                        # codegraph installer. Same remediation as False
-                        # but worded so a non-standard config layout
-                        # isn't surprised by the warning.
+                        # `mcp_state == None` means either NO config file
+                        # at any standard location OR a file existed but
+                        # we couldn't parse it (corrupt JSON, unreadable
+                        # TOML, permission error, non-regular file at the
+                        # config path). Phrasing it as "couldn't find or
+                        # parse" covers both cases honestly — earlier
+                        # prose said "couldn't find" only, which
+                        # misdirected users with a corrupt config at the
+                        # standard path.
                         print(
-                            f"warning: couldn't find a {_CLI_DISPLAY[cli]} config to "
-                            f"verify codegraph MCP registration. Skipping the MCP-tools "
-                            f"prompt hint. If your config lives at a non-standard path, "
-                            f"the agent may still see the tools at runtime — otherwise "
-                            f"run `codegraph install --target={cli} --location=global --yes`."
+                            f"warning: couldn't find or parse a {_CLI_DISPLAY[cli]} "
+                            f"config to verify codegraph MCP registration. Skipping "
+                            f"the MCP-tools prompt hint. If your config lives at a "
+                            f"non-standard path, the agent may still see the tools at "
+                            f"runtime. {install_hint}"
                         )
                 built = build_review_prompt(
                     post_inline=post_inline,
