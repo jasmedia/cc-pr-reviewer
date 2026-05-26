@@ -1159,12 +1159,17 @@ def build_review_prompt(
     agent. `cli` defaults to `"claude"` so existing callers and tests
     remain valid without churn.
 
-    `codegraph_present` is set by `_launch_claude` based on whether the
-    workspace has a `.codegraph/` directory. When true, `CODEGRAPH_HINT_SUFFIX`
-    is appended as its own section so the agent steers MCP queries toward
-    the pre-built index instead of grep+Read loops. Defaults to `False`
-    so any caller that hasn't probed the workspace (tests, future
-    integrations) keeps the existing prompt verbatim.
+    `codegraph_present` should be `True` only when the agent will
+    actually have CodeGraph MCP tools available in-session — `_launch_claude`
+    computes this as `(.codegraph/ exists in workspace) AND (codegraph
+    binary is on PATH)`. The kwarg name is preserved for back-compat,
+    but the semantic is "tools available", not bare index-on-disk: a
+    stray `.codegraph/` left behind by a prior `codegraph uninstall`
+    would otherwise emit a hint pointing at MCP tools no session has
+    loaded, and the agent — taking the prompt at face value — falls
+    back to grep+Read while reporting that the tools weren't registered.
+    Defaults to `False` so any caller that hasn't probed the workspace
+    (tests, future integrations) keeps the existing prompt verbatim.
 
     `codegraph_affected_tests` is the pre-rendered block produced by
     `format_codegraph_affected_tests` from the output of `codegraph
@@ -3289,6 +3294,16 @@ class PRReviewer(App):
                 # `_current_gh_login` warning may have scrolled past during clone
                 # or checkout output.
                 my_login = _current_gh_login()
+                # AND the index probe with the binary probe before passing
+                # to the prompt builder: a stray `.codegraph/` left behind by
+                # a prior `codegraph uninstall` (or an aborted install) would
+                # otherwise emit the MCP-tools hint to an agent whose session
+                # has no codegraph MCP server registered. The agent then reads
+                # "use these tools" and falls back to grep/Read — defeats the
+                # integration AND misleads the reviewer. The Tier 2/3/4 gates
+                # already compose both signals; this collapses them here so
+                # the prompt suffix follows the same precondition.
+                codegraph_tools_available = codegraph_present and codegraph_on_path
                 built = build_review_prompt(
                     post_inline=post_inline,
                     extra_prompt=extra_prompt,
@@ -3297,7 +3312,7 @@ class PRReviewer(App):
                     my_login=my_login,
                     author_login=(pr.get("author") or {}).get("login"),
                     cli=cli,
-                    codegraph_present=codegraph_present,
+                    codegraph_present=codegraph_tools_available,
                     codegraph_affected_tests=codegraph_affected_block,
                 )
 
