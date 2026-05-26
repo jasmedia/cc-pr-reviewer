@@ -8,6 +8,7 @@ tests.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import socket
@@ -40,6 +41,7 @@ from cc_pr_reviewer import (
     ReviewInProgressError,
     _build_cli_command,
     _cleanup_skills,
+    _codegraph_mcp_registered,
     _first_available_cli,
     _in_progress_age_str,
     _is_newer,
@@ -540,6 +542,175 @@ def test_affected_tests_block_can_render_without_codegraph_hint() -> None:
     )
     assert CODEGRAPH_HINT_SUFFIX not in built.text
     assert affected_block in built.text
+
+
+# --- _codegraph_mcp_registered --------------------------------------------
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    """Write a JSON config under a fake `home`, creating parent dirs."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_mcp_registered_returns_none_when_no_config_file_exists(tmp_path: Path) -> None:
+    """No config file at any expected path → `None` (undetectable).
+    Distinct from `False` so the caller's warning can differentiate
+    "user hasn't run the installer at all for this CLI" from "user
+    has the CLI configured but skipped codegraph"."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    for cli in ("claude", "codex", "gemini"):
+        assert _codegraph_mcp_registered(cli, workspace, home=home) is None
+
+
+def test_mcp_registered_returns_true_for_claude_global_json(tmp_path: Path) -> None:
+    """`~/.claude.json` with `mcpServers.codegraph` → True. This is the
+    canonical install path written by `codegraph install --target=claude
+    --location=global`."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    _write_json(
+        home / ".claude.json",
+        {
+            "mcpServers": {
+                "codegraph": {
+                    "type": "stdio",
+                    "command": "codegraph",
+                    "args": ["serve", "--mcp"],
+                }
+            }
+        },
+    )
+    assert _codegraph_mcp_registered("claude", workspace, home=home) is True
+
+
+def test_mcp_registered_returns_true_for_claude_project_local_mcp_json(tmp_path: Path) -> None:
+    """Project-local `<workspace>/.mcp.json` is also honoured — that's
+    what `codegraph install --location=local` writes for Claude Code.
+    Skipping this path would suppress the suffix on workspaces the user
+    explicitly wired up."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    _write_json(
+        workspace / ".mcp.json",
+        {"mcpServers": {"codegraph": {"command": "codegraph"}}},
+    )
+    assert _codegraph_mcp_registered("claude", workspace, home=home) is True
+
+
+def test_mcp_registered_returns_false_when_claude_config_lacks_entry(tmp_path: Path) -> None:
+    """`~/.claude.json` exists with `mcpServers` but no `codegraph` key
+    → False (confirmed not registered). User has Claude Code set up but
+    didn't run `codegraph install` for it."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    _write_json(
+        home / ".claude.json",
+        {"mcpServers": {"other-server": {"command": "other"}}},
+    )
+    assert _codegraph_mcp_registered("claude", workspace, home=home) is False
+
+
+def test_mcp_registered_returns_false_when_mcp_servers_key_missing(tmp_path: Path) -> None:
+    """A claude config without an `mcpServers` key at all is still a
+    "confirmed not registered" — the file exists, we read it, no entry."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    _write_json(home / ".claude.json", {"theme": "dark"})
+    assert _codegraph_mcp_registered("claude", workspace, home=home) is False
+
+
+def test_mcp_registered_returns_none_on_corrupt_json(tmp_path: Path) -> None:
+    """File present but unparseable → None (undetectable). Conservative
+    fall-through: better than guessing False (would suppress a working
+    setup with a transient parse error) or True (would emit a hint for
+    tools whose load state we can't verify)."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    (home / ".claude.json").parent.mkdir(parents=True, exist_ok=True)
+    (home / ".claude.json").write_text("{not valid json", encoding="utf-8")
+    assert _codegraph_mcp_registered("claude", workspace, home=home) is None
+
+
+def test_mcp_registered_returns_true_for_codex_toml_section_header(tmp_path: Path) -> None:
+    """Codex stores MCP config in `~/.codex/config.toml` as a TOML
+    section header `[mcp_servers.codegraph]` — the canonical form
+    written by `codegraph install --target=codex`. We match the header
+    via regex (sidesteps Python 3.10's lack of stdlib tomllib)."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    cfg = home / ".codex" / "config.toml"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(
+        '[mcp_servers.codegraph]\ncommand = "codegraph"\nargs = ["serve", "--mcp"]\n',
+        encoding="utf-8",
+    )
+    assert _codegraph_mcp_registered("codex", workspace, home=home) is True
+
+
+def test_mcp_registered_returns_false_for_codex_toml_without_section(tmp_path: Path) -> None:
+    """A codex config that has other MCP servers but not codegraph →
+    False. Locks the regex's specificity — a bare `mcp_servers` mention
+    or an `[mcp_servers.other]` section must not false-positive."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    cfg = home / ".codex" / "config.toml"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(
+        '# codegraph not configured here\n[mcp_servers.other]\ncommand = "other"\n',
+        encoding="utf-8",
+    )
+    assert _codegraph_mcp_registered("codex", workspace, home=home) is False
+
+
+def test_mcp_registered_returns_true_for_gemini_workspace_local(tmp_path: Path) -> None:
+    """Gemini supports both `~/.gemini/settings.json` and
+    `<workspace>/.gemini/settings.json`. Project-local config in the
+    PR's checked-out clone wins independently of the global config —
+    needed for users who only ever wired Gemini per-project."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    _write_json(
+        workspace / ".gemini" / "settings.json",
+        {"mcpServers": {"codegraph": {"command": "codegraph"}}},
+    )
+    assert _codegraph_mcp_registered("gemini", workspace, home=home) is True
+
+
+def test_mcp_registered_per_cli_isolation(tmp_path: Path) -> None:
+    """A codegraph entry registered for Claude only must NOT be reported
+    as registered for codex or gemini — the gate is per-launched-CLI,
+    not "any CLI has codegraph". Otherwise toggling via `c` to a
+    not-yet-wired CLI would still emit the misleading hint."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    _write_json(
+        home / ".claude.json",
+        {"mcpServers": {"codegraph": {"command": "codegraph"}}},
+    )
+    # Codex/gemini configs deliberately created without codegraph so the
+    # result is False (confirmed-missing), not None (undetectable).
+    (home / ".codex").mkdir(parents=True, exist_ok=True)
+    (home / ".codex" / "config.toml").write_text("# empty\n", encoding="utf-8")
+    _write_json(home / ".gemini" / "settings.json", {"theme": "dark"})
+
+    assert _codegraph_mcp_registered("claude", workspace, home=home) is True
+    assert _codegraph_mcp_registered("codex", workspace, home=home) is False
+    assert _codegraph_mcp_registered("gemini", workspace, home=home) is False
 
 
 # --- Skill-based prompt (codex / gemini share this) ------------------------
