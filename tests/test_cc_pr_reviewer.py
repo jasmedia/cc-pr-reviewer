@@ -40,6 +40,7 @@ from cc_pr_reviewer import (
     InProgressHolder,
     ReviewInProgressError,
     _build_cli_command,
+    _check_codegraph_setup,
     _cleanup_skills,
     _codegraph_mcp_registered,
     _first_available_cli,
@@ -837,6 +838,117 @@ def test_mcp_registered_per_cli_isolation(tmp_path: Path) -> None:
     assert _codegraph_mcp_registered("claude", workspace, home=home) is True
     assert _codegraph_mcp_registered("codex", workspace, home=home) is False
     assert _codegraph_mcp_registered("gemini", workspace, home=home) is False
+
+
+# --- workspace=None (startup) path for _codegraph_mcp_registered ----------
+
+
+def test_mcp_registered_workspace_none_skips_project_local_probes(tmp_path: Path) -> None:
+    """Passing `workspace=None` (the startup path — no PR selected yet)
+    must skip workspace-local config probes. If a workspace argument is
+    threaded through anyway, a `<workspace>/.mcp.json` happening to
+    exist at some arbitrary path would leak into the startup probe.
+    Locks the workspace-aware code at the seam so a future refactor can't
+    accidentally treat `None` as "current directory" or "home" etc."""
+    home = tmp_path / "home"
+    home.mkdir()
+    # Sanity: global config WITHOUT codegraph → False for both branches.
+    _write_json(home / ".claude.json", {"mcpServers": {"other": {}}})
+    assert _codegraph_mcp_registered("claude", workspace=None, home=home) is False
+    # No global gemini config → None (undetectable, no workspace either).
+    assert _codegraph_mcp_registered("gemini", workspace=None, home=home) is None
+
+
+def test_mcp_registered_workspace_none_still_resolves_global_true(tmp_path: Path) -> None:
+    """The global probe must work even without a workspace — that's the
+    whole point of the startup health check. A global codegraph entry
+    must return True regardless of `workspace` being passed."""
+    home = tmp_path / "home"
+    _write_json(home / ".claude.json", {"mcpServers": {"codegraph": {}}})
+    assert _codegraph_mcp_registered("claude", workspace=None, home=home) is True
+
+
+# --- _check_codegraph_setup (startup three-state diagnosis) ---------------
+
+
+def test_check_codegraph_setup_not_installed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No `codegraph` binary on PATH → "not-installed" — the silent
+    state for users who don't have CodeGraph and don't want to be
+    nagged. Parameterless because the binary check happens before any
+    config probe, so per-CLI behaviour is identical."""
+    monkeypatch.setattr(_mod.shutil, "which", _only_installed())
+    for cli in ("claude", "codex", "gemini"):
+        assert _check_codegraph_setup(cli) == "not-installed"
+
+
+def test_check_codegraph_setup_binary_only_when_no_mcp_entry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Binary on PATH but no config file at any standard global path →
+    "binary-only". This is the toast-worthy state: the user installed
+    the binary (e.g. `npm i -g`) but skipped `codegraph install`. The
+    one-shot warning at startup catches it before they hit Enter on
+    a PR and discover the gap mid-review."""
+    monkeypatch.setattr(_mod.shutil, "which", _only_installed("codegraph"))
+    empty_home = tmp_path / "home"
+    empty_home.mkdir()
+    for cli in ("claude", "codex", "gemini"):
+        assert _check_codegraph_setup(cli, home=empty_home) == "binary-only"
+
+
+def test_check_codegraph_setup_binary_only_when_other_cli_wired(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """User wired CodeGraph for claude but toggled cc-reviewer to
+    codex via `c`. Setup for codex is "binary-only" — and the toast
+    re-emit in `action_toggle_cli` relies on this distinction so the
+    user learns about the gap immediately instead of at launch time."""
+    monkeypatch.setattr(_mod.shutil, "which", _only_installed("codegraph"))
+    home = tmp_path / "home"
+    _write_json(home / ".claude.json", {"mcpServers": {"codegraph": {}}})
+    assert _check_codegraph_setup("claude", home=home) == "wired"
+    assert _check_codegraph_setup("codex", home=home) == "binary-only"
+    assert _check_codegraph_setup("gemini", home=home) == "binary-only"
+
+
+def test_check_codegraph_setup_wired_per_cli(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Binary present AND global MCP entry exists for the queried CLI
+    → "wired" — the happy path, no toast. Test each CLI independently
+    so a wiring for one doesn't accidentally short-circuit the check
+    for another (per-CLI isolation, mirroring the equivalent
+    `_codegraph_mcp_registered` test)."""
+    monkeypatch.setattr(_mod.shutil, "which", _only_installed("codegraph"))
+    home = tmp_path / "home"
+    # Claude wired via canonical install.
+    _write_json(home / ".claude.json", {"mcpServers": {"codegraph": {}}})
+    # Codex wired via TOML section header.
+    (home / ".codex").mkdir(parents=True, exist_ok=True)
+    (home / ".codex" / "config.toml").write_text(
+        '[mcp_servers.codegraph]\ncommand = "codegraph"\n', encoding="utf-8"
+    )
+    # Gemini wired via hand-written settings.
+    _write_json(home / ".gemini" / "settings.json", {"mcpServers": {"codegraph": {}}})
+    for cli in ("claude", "codex", "gemini"):
+        assert _check_codegraph_setup(cli, home=home) == "wired"
+
+
+def test_check_codegraph_setup_folds_undetectable_into_binary_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`_codegraph_mcp_registered` returns None when a config is
+    unreadable/malformed. The startup check collapses both False and
+    None into "binary-only" — at startup the precise reason doesn't
+    matter, only "are tools going to be available for this CLI". A
+    corrupt config and a missing config both produce the same
+    actionable toast: run `codegraph install`."""
+    monkeypatch.setattr(_mod.shutil, "which", _only_installed("codegraph"))
+    home = tmp_path / "home"
+    (home).mkdir()
+    # Corrupt JSON at the global config path → mcp probe returns None.
+    (home / ".claude.json").write_text("{not valid", encoding="utf-8")
+    assert _check_codegraph_setup("claude", home=home) == "binary-only"
 
 
 # --- Skill-based prompt (codex / gemini share this) ------------------------
