@@ -41,6 +41,7 @@ from cc_pr_reviewer import (
     InProgressHolder,
     ReviewInProgressError,
     _build_cli_command,
+    _check_codegraph_setup,
     _cleanup_skills,
     _codegraph_mcp_registered,
     _first_available_cli,
@@ -1051,6 +1052,245 @@ def test_mcp_registered_per_cli_isolation(tmp_path: Path) -> None:
     assert _codegraph_mcp_registered("claude", workspace, home=home) is True
     assert _codegraph_mcp_registered("codex", workspace, home=home) is False
     assert _codegraph_mcp_registered("gemini", workspace, home=home) is False
+
+
+# --- workspace=None (startup) path for _codegraph_mcp_registered ----------
+
+
+def test_mcp_registered_workspace_none_skips_project_local_probes(tmp_path: Path) -> None:
+    """Passing `workspace=None` (the startup path — no PR selected yet)
+    must skip workspace-local config probes. Locks the contract by
+    creating an actively-positive `<workspace>/.mcp.json` and verifying
+    the same call returns True with `workspace=workspace_path` but
+    False with `workspace=None` — a future refactor that accidentally
+    treated `None` as `Path(".")`, `home`, or `workspace_path` would
+    flip the None-branch to True and fail this test loudly. The bare
+    "asserts return values" version this replaces would have passed
+    such a refactor silently."""
+    home = tmp_path / "home"
+    home.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    # Global config WITHOUT codegraph → without workspace probe, this
+    # is the determinate False result.
+    _write_json(home / ".claude.json", {"mcpServers": {"other": {}}})
+    # Workspace-local config WITH codegraph — this is the positive
+    # entry that workspace=None must NOT see.
+    _write_json(
+        workspace / ".mcp.json",
+        {"mcpServers": {"codegraph": {"command": "codegraph"}}},
+    )
+    # With workspace passed, the project-local entry resolves the probe.
+    assert _codegraph_mcp_registered("claude", workspace=workspace, home=home) is True
+    # With workspace=None, the same call must skip the project-local file
+    # and fall through to False on the global config alone.
+    assert _codegraph_mcp_registered("claude", workspace=None, home=home) is False
+    # Gemini path follows the same contract — project-local entry must
+    # not be visible without an explicit workspace.
+    _write_json(
+        workspace / ".gemini" / "settings.json",
+        {"mcpServers": {"codegraph": {"command": "codegraph"}}},
+    )
+    assert _codegraph_mcp_registered("gemini", workspace=workspace, home=home) is True
+    assert _codegraph_mcp_registered("gemini", workspace=None, home=home) is None
+
+
+def test_mcp_registered_workspace_none_still_resolves_global_true(tmp_path: Path) -> None:
+    """The global probe must work even without a workspace — that's the
+    whole point of the startup health check. A global codegraph entry
+    must return True regardless of `workspace` being passed."""
+    home = tmp_path / "home"
+    _write_json(home / ".claude.json", {"mcpServers": {"codegraph": {}}})
+    assert _codegraph_mcp_registered("claude", workspace=None, home=home) is True
+
+
+# --- _check_codegraph_setup (startup three-state diagnosis) ---------------
+
+
+def test_check_codegraph_setup_not_installed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No `codegraph` binary on PATH → "not-installed" — the silent
+    state for users who don't have CodeGraph and don't want to be
+    nagged. Parameterless because the binary check happens before any
+    config probe, so per-CLI behaviour is identical."""
+    monkeypatch.setattr(_mod.shutil, "which", _only_installed())
+    for cli in ("claude", "codex", "gemini"):
+        assert _check_codegraph_setup(cli) == "not-installed"
+
+
+def test_check_codegraph_setup_binary_only_when_no_mcp_entry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Binary on PATH but no config file at any standard global path →
+    "binary-only". This is the toast-worthy state: the user installed
+    the binary (e.g. `npm i -g`) but skipped `codegraph install`. The
+    one-shot warning at startup catches it before they hit Enter on
+    a PR and discover the gap mid-review."""
+    monkeypatch.setattr(_mod.shutil, "which", _only_installed("codegraph"))
+    empty_home = tmp_path / "home"
+    empty_home.mkdir()
+    for cli in ("claude", "codex", "gemini"):
+        assert _check_codegraph_setup(cli, home=empty_home) == "binary-only"
+
+
+def test_check_codegraph_setup_binary_only_when_other_cli_wired(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """User wired CodeGraph for claude but toggled cc-reviewer to
+    codex via `c`. Setup for codex is "binary-only" — and the toast
+    re-emit in `action_toggle_cli` relies on this distinction so the
+    user learns about the gap immediately instead of at launch time."""
+    monkeypatch.setattr(_mod.shutil, "which", _only_installed("codegraph"))
+    home = tmp_path / "home"
+    _write_json(home / ".claude.json", {"mcpServers": {"codegraph": {}}})
+    assert _check_codegraph_setup("claude", home=home) == "wired"
+    assert _check_codegraph_setup("codex", home=home) == "binary-only"
+    assert _check_codegraph_setup("gemini", home=home) == "binary-only"
+
+
+def test_check_codegraph_setup_wired_per_cli(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Binary present AND global MCP entry exists for the queried CLI
+    → "wired" — the happy path, no toast. Test each CLI independently
+    so a wiring for one doesn't accidentally short-circuit the check
+    for another (per-CLI isolation, mirroring the equivalent
+    `_codegraph_mcp_registered` test)."""
+    monkeypatch.setattr(_mod.shutil, "which", _only_installed("codegraph"))
+    home = tmp_path / "home"
+    # Claude wired via canonical install.
+    _write_json(home / ".claude.json", {"mcpServers": {"codegraph": {}}})
+    # Codex wired via TOML section header.
+    (home / ".codex").mkdir(parents=True, exist_ok=True)
+    (home / ".codex" / "config.toml").write_text(
+        '[mcp_servers.codegraph]\ncommand = "codegraph"\n', encoding="utf-8"
+    )
+    # Gemini wired via hand-written settings.
+    _write_json(home / ".gemini" / "settings.json", {"mcpServers": {"codegraph": {}}})
+    for cli in ("claude", "codex", "gemini"):
+        assert _check_codegraph_setup(cli, home=home) == "wired"
+
+
+def test_check_codegraph_setup_folds_undetectable_into_binary_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`_codegraph_mcp_registered` returns None when a config is
+    unreadable/malformed. The startup check collapses both False and
+    None into "binary-only" — at startup the precise reason doesn't
+    matter, only "are tools going to be available for this CLI". A
+    corrupt config and a missing config both produce the same
+    actionable toast: run `codegraph install`."""
+    monkeypatch.setattr(_mod.shutil, "which", _only_installed("codegraph"))
+    home = tmp_path / "home"
+    (home).mkdir()
+    # Corrupt JSON at the global config path → mcp probe returns None.
+    (home / ".claude.json").write_text("{not valid", encoding="utf-8")
+    assert _check_codegraph_setup("claude", home=home) == "binary-only"
+
+
+# --- _maybe_notify_codegraph_setup (App-method behaviour, stub-driven) ----
+
+
+class _NotifyRecorder:
+    """Lightweight stand-in for `PRReviewer` that captures `notify` calls.
+
+    Avoids spinning a Textual `Pilot` for what's fundamentally a small
+    decision tree: `_check_codegraph_setup` → branch on three values.
+    Mirrors only the attributes the method actually reads (`self.cli`)
+    and the one method it calls (`self.notify`)."""
+
+    def __init__(self, cli: str = "claude") -> None:
+        self.cli = cli
+        self.notify_calls: list[tuple[str, dict[str, Any]]] = []
+
+    def notify(self, msg: str, **kwargs: Any) -> None:
+        self.notify_calls.append((msg, kwargs))
+
+
+def test_maybe_notify_codegraph_setup_fires_for_binary_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`binary-only` is the only state that should produce a toast.
+    Locks the sign of the comparison — a refactor that flipped it
+    ("toast on wired") would invert the user-visible behaviour
+    (nag the happy path, stay silent on the real problem)."""
+    monkeypatch.setattr(_mod, "_check_codegraph_setup", lambda *_a, **_kw: "binary-only")
+    recorder = _NotifyRecorder(cli="claude")
+    _mod.PRReviewer._maybe_notify_codegraph_setup(recorder)
+    assert len(recorder.notify_calls) == 1
+    msg, kwargs = recorder.notify_calls[0]
+    assert "Claude Code" in msg
+    assert kwargs.get("severity") == "warning"
+
+
+@pytest.mark.parametrize("state", ["wired", "not-installed"])
+def test_maybe_notify_codegraph_setup_silent_for_non_binary_only(
+    monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    """`wired` (happy path) and `not-installed` (user doesn't have
+    CodeGraph) must both stay silent. Tested as separate parameter
+    cases so a regression that nags one but not the other is named."""
+    monkeypatch.setattr(_mod, "_check_codegraph_setup", lambda *_a, **_kw: state)
+    recorder = _NotifyRecorder(cli="claude")
+    _mod.PRReviewer._maybe_notify_codegraph_setup(recorder)
+    assert recorder.notify_calls == []
+
+
+def test_maybe_notify_codegraph_setup_swallows_probe_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The surface guard is what keeps `on_mount` / `action_toggle_cli`
+    from crashing if a future refactor reintroduces an unguarded raise
+    path (e.g. a new filesystem probe inside `_check_codegraph_setup`).
+    A best-effort early-warning that takes down startup is worse than
+    no warning at all."""
+
+    def boom(*_a: Any, **_kw: Any) -> str:
+        raise PermissionError("simulated EACCES on ~/.codex")
+
+    monkeypatch.setattr(_mod, "_check_codegraph_setup", boom)
+    recorder = _NotifyRecorder(cli="codex")
+    # Must NOT raise; must NOT toast.
+    _mod.PRReviewer._maybe_notify_codegraph_setup(recorder)
+    assert recorder.notify_calls == []
+
+
+def test_maybe_notify_codegraph_setup_uses_active_cli(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The toast prose pulls from `_CODEGRAPH_INSTALL_HINT[self.cli]`.
+    Verifies the gemini branch is reachable here (relevant because the
+    gemini install hint diverges from claude/codex — codegraph's
+    installer has no `--target=gemini`, so the gemini toast must point
+    at the manual-setup path)."""
+    monkeypatch.setattr(_mod, "_check_codegraph_setup", lambda *_a, **_kw: "binary-only")
+    recorder = _NotifyRecorder(cli="gemini")
+    _mod.PRReviewer._maybe_notify_codegraph_setup(recorder)
+    assert len(recorder.notify_calls) == 1
+    msg, _ = recorder.notify_calls[0]
+    assert "Gemini" in msg
+    # Gemini-specific install hint: manual edit of `~/.gemini/settings.json`
+    # (codegraph's installer doesn't accept `--target=gemini`). The hint
+    # prose explains this negation, so we don't substring-check the
+    # `--target=gemini` literal — `settings.json` is the load-bearing
+    # piece that proves the toast picked the gemini branch.
+    assert "settings.json" in msg
+    # The recommended action shouldn't be the installer command —
+    # check that "codegraph install" doesn't appear as a directive
+    # (it does NOT in the gemini hint; only the claude/codex hints
+    # use the installer command).
+    assert "codegraph install" not in msg
+
+
+def test_codegraph_install_hint_covers_every_cli() -> None:
+    """Lockstep invariant: every `CliChoice` listed in `_CLI_CYCLE` must
+    have a matching `_CODEGRAPH_INSTALL_HINT` entry. A 4th CLI added to
+    the cycle without a hint would `KeyError` in
+    `_maybe_notify_codegraph_setup`'s toast (line under
+    `_CODEGRAPH_INSTALL_HINT[self.cli]`) the first time a user toggles
+    to it AND the new CLI lacks an MCP entry — a latent crash hidden
+    behind a multi-step user action. Catching it at import time via
+    this test is essentially free."""
+    assert set(_mod._CODEGRAPH_INSTALL_HINT) == set(_mod._CLI_CYCLE)
 
 
 # --- Skill-based prompt (codex / gemini share this) ------------------------
