@@ -4,6 +4,58 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.2] — 2026-05-26
+
+### Fixed
+- **Tier 1 hint suffix now verifies the codegraph MCP server is
+  actually registered with the CLI we're about to launch.** Closes
+  the last remaining "tools weren't registered in this session"
+  failure mode that the binary-on-PATH gate from 0.13.1 didn't catch
+  — specifically the `npm i -g @colbymchenry/codegraph` installs that
+  never ran `codegraph install`, the CLI-toggle-via-`c` to a CLI the
+  user hadn't wired up, and the workspace-local install for a
+  different workspace than the one being reviewed. New
+  `_codegraph_mcp_registered(cli, workspace)` helper probes the
+  canonical per-CLI MCP config locations:
+  - claude: `~/.claude.json` (global) + `<workspace>/.mcp.json` (project-local)
+  - codex: `~/.codex/config.toml` (global-only — codex has no project-local MCP path)
+  - gemini: `~/.gemini/settings.json` (global) + `<workspace>/.gemini/settings.json`
+  Returns True/False/None — None being distinct from False so the
+  launch banner's warning prose can differentiate "no config at any
+  standard path" from "config exists but lacks the entry". Reads JSON
+  configs natively and regex-matches the canonical
+  `[mcp_servers.codegraph]` section header in codex's TOML
+  (sidesteps the Python 3.10 lack of stdlib `tomllib`). When binary
+  and index are both present but MCP isn't wired, prints a per-CLI
+  remediation hint pointing at `codegraph install --target=<cli>`
+  for claude/codex, or at the manual `~/.gemini/settings.json` wire
+  for gemini (which codegraph's installer doesn't support as a
+  `--target`, verified against v0.9.5).
+- **Malformed configs are now classified as undetectable, not
+  "confirmed-not-registered".** A JSON config that parses but whose
+  shape is off (top-level not a dict; `mcpServers` present but not a
+  dict — `[]`, `"x"`, `null`, primitive), or a path slot that exists
+  but isn't a regular file (`mkdir ~/.claude.json`, dangling symlink),
+  previously fell through to `False` and routed the user to
+  `codegraph install` — which won't fix a structurally broken config.
+  Now bucketed into the parse-error path so the helper returns `None`
+  and the launch banner reads "couldn't find or parse a {cli} config".
+  Tightened the `mcpServers` lookup from `data.get(...)` to explicit
+  `"mcpServers" not in data` so `{}` (valid "no entry") and
+  `{"mcpServers": null}` (malformed) no longer collapse into the same
+  state. The `isinstance(mcp, dict)` guard is now load-bearing for a
+  second reason: it prevents substring-membership false-positives
+  (`"codegraph" in "codegraph"` and `"codegraph" in ["codegraph"]`
+  are both truthy in Python).
+- **Multi-candidate accumulation no longer short-circuits on the
+  first failure.** Claude and gemini both have global + workspace-
+  local config candidates; a corrupt global config previously
+  returned `None` immediately, suppressing the suffix even when the
+  workspace-local config validly contained the codegraph entry.
+  Refactored to a `had_parse_error` flag that accumulates across
+  candidates; the loop only resolves to None at the end, so a valid
+  later candidate wins over an earlier malformed one.
+
 ## [0.13.1] — 2026-05-26
 
 ### Fixed
