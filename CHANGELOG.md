@@ -4,6 +4,85 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] — 2026-05-27
+
+### Added
+- **Per-launch agent selection in the confirm modal.** Six checkboxes
+  (one per review agent — Code Reviewer, Silent Failure Hunter, Type
+  Design Analyzer, PR Test Analyzer, Comment Analyzer, Code
+  Simplifier) appear between the post-inline toggle and the CLI line.
+  All six are checked by default; Tab moves focus through them and
+  Space toggles. `Ctrl+A` (while a checkbox has focus — non-priority
+  so TextArea keeps select-all when typing the extra prompt) flips
+  every checkbox at once. Confirming with zero selected is refused
+  with a toast nudging `Tab + Ctrl+A` to re-enable. Motivating use
+  case: doc-only PRs that don't benefit from Code Reviewer or PR Test
+  Analyzer — dropping irrelevant agents saves tokens and shortens
+  review turnaround. The chosen subset threads through
+  `ConfirmResult.selected_agents` → `_launch_claude` → both
+  `build_review_prompt` (drops unselected agents from the Claude
+  enumeration / codex+gemini `$mention` list) AND `_materialise_skills`
+  (writes only the chosen `SKILL.md` files to `.agents/skills/`, so
+  codex/gemini's auto-discovery can't implicitly activate an
+  unchecked skill). Two parallel guards keep the new module-level
+  maps in lockstep with `REVIEW_SKILLS` — `test_review_skill_labels_cover_every_skill`
+  and `test_skill_coverage_covers_every_skill` — and
+  `_materialise_skills` rejects typo'd subset names with `ValueError`
+  before any disk I/O so a bad-input bug isn't misclassified as a
+  disk-full / perms / read-only-FS environment failure. Launch banner
+  surfaces the subset (`agents: Code Reviewer, Code Simplifier` for
+  ≤ 3, `agents: 4/6` for larger, `agents: none (generic review)` for
+  empty) only when it differs from the default — compared as SETS so
+  a reordered-but-full subset doesn't trip the gate (the prompt
+  builder normalises order internally, so the banner should match).
+- **CodeGraph setup verification at TUI startup and on `c` toggle.**
+  Surfaces the "binary on PATH but MCP not wired for the active CLI"
+  state at startup rather than at launch time when the user has
+  already committed to reviewing a specific PR. New
+  `_check_codegraph_setup(cli, home=None) -> CodegraphSetupState`
+  returns one of three states — `"not-installed"`, `"wired"`,
+  `"binary-only"` — folding the underlying
+  `_codegraph_mcp_registered` `False` (config exists, no entry) and
+  `None` (undetectable) results into the same `"binary-only"` bucket;
+  at startup the precise reason doesn't matter, only whether MCP
+  tools will be available. Wired into `PRReviewer.on_mount` via
+  `_maybe_notify_codegraph_setup` which emits a `warning` toast only
+  for `"binary-only"` (silent for `"not-installed"` so users without
+  CodeGraph aren't nagged, and silent for `"wired"` since that's the
+  happy path). Re-emitted from `action_toggle_cli` so toggling to a
+  CLI the user hadn't wired up immediately surfaces the same warning
+  with no internal dedup (the re-toast on `c` is intentional and the
+  authoritative early-warning signal). The toast's remediation
+  pointer picks the per-CLI hint from `_CODEGRAPH_INSTALL_HINT`
+  (`codegraph install --target=<cli>` for claude/codex, manual
+  `~/.gemini/settings.json` wire for gemini); a lockstep test asserts
+  `set(_CODEGRAPH_INSTALL_HINT) == set(_CLI_CYCLE)` so a future 4th
+  CLI added to the cycle without a matching install hint would
+  KeyError at import time rather than mid-toast. The per-launch
+  verification in `_launch_claude` stays untouched — the startup
+  check is an early-warning surface, not a replacement, since the
+  per-launch path still needs the workspace it doesn't have at boot.
+
+### Fixed
+- **Unreadable config ancestor dirs no longer crash startup or
+  launch.** `_codegraph_mcp_registered`'s `path.exists()` /
+  `path.is_file()` calls sat OUTSIDE the existing `read_text` try
+  blocks. EACCES is NOT in pathlib's ignored-errno set, so a
+  `chmod 000 ~`, `chmod 000 ~/.codex`, or `chmod 000 ~/.gemini`
+  re-raised `PermissionError` out of those stat-level calls — which
+  pre-fix crashed `_launch_claude` post-`suspend()` (half-restored
+  terminal with a traceback) AND would have crashed the new startup
+  / `c`-toggle path the rest of this release adds. Both probe failures
+  now bucket into `had_parse_error`, so the helper resolves to `None`
+  and the per-launch banner / startup toast print honest
+  "couldn't find or parse" prose instead of taking the TUI down.
+  `_maybe_notify_codegraph_setup` also wraps its `_check_codegraph_setup`
+  call in a top-level `try/except Exception: return` as a
+  belt-and-suspenders safety net so a future refactor that
+  reintroduces an unguarded raise path inside the helper can't bring
+  down `on_mount` or `action_toggle_cli` — a best-effort early-warning
+  that takes down startup is worse than no warning at all.
+
 ## [0.13.2] — 2026-05-26
 
 ### Fixed
