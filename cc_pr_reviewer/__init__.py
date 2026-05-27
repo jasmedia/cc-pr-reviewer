@@ -59,6 +59,7 @@ from textual.content import Content
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import (
+    Checkbox,
     DataTable,
     Footer,
     Header,
@@ -86,17 +87,6 @@ REVIEW_DB_PATH = WORKSPACE / ".review_state.db"
 # stale sweep (which compares `hostname == socket.gethostname()` afresh).
 _APP_HOSTNAME = socket.gethostname()
 
-# The prompt we hand Claude Code when it starts up in the PR's working tree.
-# The PR Review Toolkit plugin will pick up on these cues and route to the
-# right sub-agents.
-REVIEW_PROMPT_CLAUDE = (
-    "Please perform a comprehensive review of the current PR using the "
-    "PR Review Toolkit. Run the relevant agents — Comment Analyzer, PR Test "
-    "Analyzer, Silent Failure Hunter, Type Design Analyzer, Code Reviewer, "
-    "and Code Simplifier — and give me a prioritised summary of findings "
-    "with file:line references and suggested fixes."
-)
-
 # Codex and Gemini don't have a plugin marketplace, but both natively
 # auto-discover skills at `<workspace>/.agents/skills/<name>/SKILL.md`. The
 # six toolkit agents ship as bundled SKILL.md files (see
@@ -120,6 +110,32 @@ REVIEW_SKILLS: tuple[str, ...] = (
     "code-simplifier",
 )
 
+# Friendly labels for each skill — used in the ConfirmScreen agent
+# checkboxes AND in the Claude base prompt's "Run the relevant agents — …"
+# enumeration. Mirrors the upstream PR Review Toolkit plugin's agent names
+# (so prompts read naturally and match how those agents announce themselves).
+REVIEW_SKILL_LABELS: dict[str, str] = {
+    "code-reviewer": "Code Reviewer",
+    "silent-failure-hunter": "Silent Failure Hunter",
+    "type-design-analyzer": "Type Design Analyzer",
+    "pr-test-analyzer": "PR Test Analyzer",
+    "comment-analyzer": "Comment Analyzer",
+    "code-simplifier": "Code Simplifier",
+}
+
+# Topic phrase per skill — assembled into the skill-based prompt's "they
+# cover …" clause. Keeping it per-skill (rather than the previous fixed
+# six-way enumeration) means an unchecked agent drops both its `$mention`
+# AND its coverage phrase, so the prompt stays coherent for any subset.
+_SKILL_COVERAGE: dict[str, str] = {
+    "code-reviewer": "project-guideline compliance",
+    "silent-failure-hunter": "silent failures",
+    "type-design-analyzer": "type design",
+    "pr-test-analyzer": "test coverage",
+    "comment-analyzer": "comments",
+    "code-simplifier": "code simplification",
+}
+
 SKILL_FILE_NAME = "SKILL.md"
 
 
@@ -136,7 +152,54 @@ def _skills_dir() -> Path:
     return Path(__file__).parent / "skills"
 
 
-def _build_skill_based_prompt() -> str:
+def _join_agents(items: list[str]) -> str:
+    """Oxford-style enumeration: "A", "A and B", "A, B, and C"."""
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return ", ".join(items[:-1]) + f", and {items[-1]}"
+
+
+# Cardinal words for small counts, used in "the {N} review skills available
+# in this workspace" — reads more naturally than a digit for ≤ 10.
+_COUNT_WORDS: dict[int, str] = {
+    1: "one",
+    2: "two",
+    3: "three",
+    4: "four",
+    5: "five",
+    6: "six",
+}
+
+
+def _build_claude_prompt(selected: tuple[str, ...] = REVIEW_SKILLS) -> str:
+    """Compose the review prompt for Claude (uses the PR Review Toolkit plugin).
+
+    When `selected` is empty the prompt asks for a generic toolkit review with
+    no agent-name pinning — useful for doc-only PRs where the user opted out of
+    every targeted agent but still wants the plugin to run. Otherwise the named
+    agents are spelled out so the plugin's router picks exactly those.
+    """
+    if not selected:
+        return (
+            "Please perform a comprehensive review of the current PR using the "
+            "PR Review Toolkit and give me a prioritised summary of findings "
+            "with file:line references and suggested fixes."
+        )
+    labels = [REVIEW_SKILL_LABELS[name] for name in selected]
+    return (
+        "Please perform a comprehensive review of the current PR using the "
+        f"PR Review Toolkit. Run the relevant agents — {_join_agents(labels)} — "
+        "and give me a prioritised summary of findings with file:line "
+        "references and suggested fixes."
+    )
+
+
+REVIEW_PROMPT_CLAUDE = _build_claude_prompt()
+
+
+def _build_skill_based_prompt(selected: tuple[str, ...] = REVIEW_SKILLS) -> str:
     """Compose the review prompt for the skill-based CLIs (codex, gemini).
 
     Codex and Gemini are *documented* to auto-discover skills at
@@ -151,20 +214,36 @@ def _build_skill_based_prompt() -> str:
     `check_prereqs` catches a corrupted *install*, but not an upstream
     CLI behaviour change.
 
-    `$<name>` mentions force explicit activation — we want every review
-    dimension to run, not have the model implicitly pick a subset.
+    `$<name>` mentions force explicit activation — we want every
+    *selected* review dimension to run, not have the model implicitly
+    pick a subset.
 
     Identical for codex and gemini — they share both the prompt and the
     `.agents/skills/` interop convention, and differ only in how they're
-    launched.
+    launched. `selected` accepts a subset so the user can drop agents
+    that don't apply (e.g. test/code-review skills on a doc-only PR);
+    when empty, the prompt degrades to a generic review with no skill
+    mentions so the agent doesn't fail-search for skills we didn't
+    materialise.
     """
-    mentions = ", ".join(f"${name}" for name in REVIEW_SKILLS)
+    if not selected:
+        return (
+            "Please perform a comprehensive review of the current PR and "
+            "give me a prioritised summary of findings with file:line "
+            "references and suggested fixes."
+        )
+    mentions = ", ".join(f"${name}" for name in selected)
+    coverage = _join_agents([_SKILL_COVERAGE[name] for name in selected])
+    n = len(selected)
+    count = _COUNT_WORDS.get(n, str(n))
+    skill_word = "skill" if n == 1 else "skills"
+    activation = (
+        "Activate the skill — it covers" if n == 1 else "Activate each skill in turn — they cover"
+    )
     return (
         "Please perform a comprehensive review of the current PR using the "
-        f"six review skills available in this workspace: {mentions}. "
-        "Activate each skill in turn — they cover project-guideline "
-        "compliance, silent failures, type design, test coverage, comments, "
-        "and code simplification — then give me a prioritised summary of "
+        f"{count} review {skill_word} available in this workspace: {mentions}. "
+        f"{activation} {coverage} — then give me a prioritised summary of "
         "findings with file:line references and suggested fixes."
     )
 
@@ -203,18 +282,43 @@ class _MaterialisedSkills:
     agents_dir_existed: bool
 
 
-def _materialise_skills(workspace: Path) -> _MaterialisedSkills:
+def _materialise_skills(
+    workspace: Path, selected: tuple[str, ...] | None = None
+) -> _MaterialisedSkills:
     """Copy each bundled SKILL.md into `<workspace>/.agents/skills/<name>/SKILL.md`.
 
     Codex and Gemini auto-discover skills under `.agents/skills/`. We
-    write the six bundled skills there so they're picked up by the CLI
-    at session start. Pre-existing content at every target path
-    (SKILL.md bytes, parent-dir presence) is snapshotted into the
-    returned `_MaterialisedSkills` manifest BEFORE the write, so
-    `_cleanup_skills` can restore the worktree exactly — including the
-    rare case where a reviewed repo ships its own competing skill of
-    the same name.
+    write the bundled skills there so they're picked up by the CLI at
+    session start. Pre-existing content at every target path (SKILL.md
+    bytes, parent-dir presence) is snapshotted into the returned
+    `_MaterialisedSkills` manifest BEFORE the write, so `_cleanup_skills`
+    can restore the worktree exactly — including the rare case where a
+    reviewed repo ships its own competing skill of the same name.
+
+    `selected` defaults to all of `REVIEW_SKILLS`. When the caller passes a
+    subset (e.g. ConfirmScreen lets the reviewer skip the code-review and
+    test agents for a doc-only PR), only those skills are materialised so
+    codex/gemini's auto-discovery doesn't even see the unselected ones —
+    that's stronger than just omitting them from the prompt mentions, since
+    those CLIs can implicitly activate any skill present in `.agents/skills/`.
+
+    Unknown names are rejected up-front with `ValueError`. The `shutil.copy2`
+    block below catches `OSError` (disk full, perms, read-only FS) and
+    re-raises it as a `RuntimeError("failed to materialise skill …")`; without
+    this guard, a typo'd skill name would surface as that same RuntimeError
+    via `FileNotFoundError` on the bundled source, misclassifying a bad-input
+    bug as an environment failure.
     """
+    if selected is None:
+        selected = REVIEW_SKILLS
+    else:
+        unknown = [name for name in selected if name not in REVIEW_SKILL_LABELS]
+        if unknown:
+            raise ValueError(
+                f"unknown skill name(s) in selected: {unknown!r}; "
+                f"expected subset of {list(REVIEW_SKILLS)!r}"
+            )
+
     skills_root = workspace / ".agents" / "skills"
     agents_dir = workspace / ".agents"
 
@@ -224,7 +328,7 @@ def _materialise_skills(workspace: Path) -> _MaterialisedSkills:
     snapshots: dict[str, _SkillSnapshot] = {}
     src_dir = _skills_dir()
 
-    for name in REVIEW_SKILLS:
+    for name in selected:
         skill_dir = skills_root / name
         skill_md = skill_dir / SKILL_FILE_NAME
 
@@ -1432,6 +1536,7 @@ def build_review_prompt(
     cli: CliChoice = DEFAULT_CLI,
     codegraph_present: bool = False,
     codegraph_affected_tests: str = "",
+    selected_agents: tuple[str, ...] | None = None,
 ) -> BuiltPrompt:
     """Assemble the user message for the selected coding-agent CLI. Pure — no I/O.
 
@@ -1494,6 +1599,16 @@ def build_review_prompt(
             "build_review_prompt: fetch_ok=False with non-empty existing is contradictory"
         )
 
+    # Normalise the agent subset against REVIEW_SKILLS so the prompt's
+    # agent enumeration order is stable regardless of the order/shape the
+    # caller passed (set, list, tuple, mismatched case). `None` is the
+    # back-compat default = all six.
+    if selected_agents is None:
+        normalised_agents: tuple[str, ...] = REVIEW_SKILLS
+    else:
+        wanted = set(selected_agents)
+        normalised_agents = tuple(name for name in REVIEW_SKILLS if name in wanted)
+
     existing_block, shown = format_existing_comments(existing)
 
     # Compute against the raw `existing` list, not against `existing_block` —
@@ -1509,7 +1624,15 @@ def build_review_prompt(
     # but drop the auto-approve instruction.
     rereview_can_approve = rereview and author_login != my_login
 
-    base = REVIEW_PROMPT_CLAUDE if cli == "claude" else REVIEW_PROMPT_SKILL_BASED
+    # Default subset → use the precomputed all-six constants (also what the
+    # public `REVIEW_PROMPT_*` symbols document); any non-default subset
+    # rebuilds from the same builders so the wording stays consistent.
+    if normalised_agents == REVIEW_SKILLS:
+        base = REVIEW_PROMPT_CLAUDE if cli == "claude" else REVIEW_PROMPT_SKILL_BASED
+    elif cli == "claude":
+        base = _build_claude_prompt(normalised_agents)
+    else:
+        base = _build_skill_based_prompt(normalised_agents)
     sections = [base]
     # Strip defensively — the current ConfirmResult dataclass already strips,
     # but `build_review_prompt` is now an API boundary and a future caller
@@ -2181,6 +2304,17 @@ class ConfirmResult:
     post_inline: bool
     extra_prompt: str = ""
     cli: CliChoice = DEFAULT_CLI
+    # Subset of REVIEW_SKILLS the reviewer wants to run for this launch.
+    # Default = all six; the ConfirmScreen lets the user uncheck individual
+    # agents (e.g. drop code-reviewer + pr-test-analyzer for a doc-only PR).
+    # Order isn't load-bearing: `build_review_prompt` re-iterates
+    # `REVIEW_SKILLS` and filters by membership so the prompt enumeration
+    # is stable; `_materialise_skills` doesn't care about order (it just
+    # writes one dir per name) but does reject unknown names up-front with
+    # `ValueError`. Today every caller produces a canonical-order subset
+    # (`ConfirmScreen._selected_agents` iterates `REVIEW_SKILLS`), but the
+    # downstream contract doesn't depend on that.
+    selected_agents: tuple[str, ...] = REVIEW_SKILLS
 
     def __post_init__(self) -> None:
         # `frozen=True` blocks attribute assignment; bypass via __setattr__
@@ -2245,6 +2379,15 @@ class ConfirmScreen(ModalScreen[ConfirmResult | None]):
         Binding("ctrl+n", "cancel", "Cancel", priority=True, show=False),
         Binding("ctrl+t", "toggle_post_inline", "Toggle post-inline", priority=True),
         Binding("ctrl+l", "cycle_cli", "Cycle CLI", priority=True),
+        # `ctrl+a` is intentionally NOT `priority=True`: TextArea binds it
+        # to select-all, and a reviewer mid-typing who hits Ctrl+A almost
+        # always means "select the prompt I just typed", not "flip every
+        # agent off". With the binding scoped non-priority, focused
+        # widgets get first refusal — TextArea consumes it for select-all,
+        # and Checkbox (which doesn't bind Ctrl+A) lets it bubble up to
+        # `action_toggle_all_agents`. The hint reflects this: Tab off the
+        # textarea onto an agent checkbox first, then Ctrl+A flips them all.
+        Binding("ctrl+a", "toggle_all_agents", "Toggle all agents"),
     ]
 
     def __init__(self, prompt: str, default_cli: CliChoice = DEFAULT_CLI):
@@ -2256,18 +2399,48 @@ class ConfirmScreen(ModalScreen[ConfirmResult | None]):
     def compose(self) -> ComposeResult:
         hint = (
             "[b]Enter[/] / [b]Ctrl+Y[/] confirm • [b]Esc[/] / [b]Ctrl+N[/] cancel "
-            "• [b]Ctrl+T[/] toggle post-inline • [b]Ctrl+L[/] cycle CLI "
+            "• [b]Ctrl+T[/] post-inline • [b]Ctrl+L[/] cycle CLI "
+            "• [b]Tab[/]/[b]Space[/] agents • [b]Ctrl+A[/] (on agents) toggle all "
             "• [b]Shift+Enter[/] newline"
         )
+        # Agent checkboxes: one per REVIEW_SKILLS entry, all checked by
+        # default. Tab moves focus through them and Space toggles; bound
+        # `Ctrl+A` flips them all at once. Numeric / single-letter keys
+        # weren't an option because they collide with typing into the
+        # auto-focused extra-prompt textarea — Checkbox widgets are the
+        # idiomatic Textual way to expose per-item toggles without that
+        # priority-binding conflict.
+        agent_checkboxes = [
+            Checkbox(
+                REVIEW_SKILL_LABELS[name],
+                value=True,
+                id=self._agent_checkbox_id(name),
+                classes="confirm-agent",
+            )
+            for name in REVIEW_SKILLS
+        ]
         yield Vertical(
             Label(self.prompt, id="confirm-title", markup=False),
             Label(self._checkbox_text(), id="confirm-checkbox", markup=False),
+            Label("Review agents:", id="confirm-agents-label"),
+            *agent_checkboxes,
             Label(self._cli_text(), id="confirm-cli", markup=False),
             Label("Extra prompt (optional):", id="confirm-extra-label"),
             ExtraPromptTextArea(id="confirm-extra"),
             Label(hint, id="confirm-hint"),
             id="confirm-container",
         )
+
+    @staticmethod
+    def _agent_checkbox_id(name: str) -> str:
+        # Prefix to namespace these ids alongside the modal's other named
+        # widgets (`confirm-title`, `confirm-cli`, `confirm-extra`, …). The
+        # raw `REVIEW_SKILLS` name is already a valid Textual id on its own
+        # (letters / digits / `-` / `_`, no leading digit), but pairing it
+        # with a sibling `confirm-*` cohort under a single `agent-*` prefix
+        # keeps `query_one("#agent-…")` lookups unambiguous and makes the
+        # ids self-describing in DOM dumps.
+        return f"agent-{name}"
 
     def _checkbox_text(self) -> str:
         mark = "[x]" if self.post_inline else "[ ]"
@@ -2276,9 +2449,39 @@ class ConfirmScreen(ModalScreen[ConfirmResult | None]):
     def _cli_text(self) -> str:
         return f"CLI: {_CLI_DISPLAY[self.cli]}"
 
+    def _selected_agents(self) -> tuple[str, ...]:
+        """Read current Checkbox state into a stable REVIEW_SKILLS-ordered tuple."""
+        return tuple(
+            name
+            for name in REVIEW_SKILLS
+            if self.query_one(f"#{self._agent_checkbox_id(name)}", Checkbox).value
+        )
+
     def action_confirm(self) -> None:
+        selected = self._selected_agents()
+        if not selected:
+            # Confirming with no agents would degrade to a generic "review
+            # the PR" prompt — possibly fine, but more likely the user
+            # ticked them all off by accident. Refuse to dismiss and nudge
+            # them; if they really want a no-agent review, the prompts
+            # builder handles that branch and the user can opt back via
+            # Ctrl+A.
+            self.app.notify(
+                "Select at least one review agent "
+                "(Tab onto a checkbox and press Ctrl+A to re-enable all).",
+                severity="warning",
+                timeout=4,
+            )
+            return
         text = self.query_one("#confirm-extra", TextArea).text
-        self.dismiss(ConfirmResult(post_inline=self.post_inline, extra_prompt=text, cli=self.cli))
+        self.dismiss(
+            ConfirmResult(
+                post_inline=self.post_inline,
+                extra_prompt=text,
+                cli=self.cli,
+                selected_agents=selected,
+            )
+        )
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -2290,6 +2493,20 @@ class ConfirmScreen(ModalScreen[ConfirmResult | None]):
     def action_cycle_cli(self) -> None:
         self.cli = _CLI_CYCLE[self.cli]
         self.query_one("#confirm-cli", Label).update(self._cli_text())
+
+    def action_toggle_all_agents(self) -> None:
+        # If any checkbox is off, turn everything on (the "I changed my
+        # mind, give me everything" recovery); otherwise turn everything
+        # off (the "quick wipe before re-selecting just one or two"
+        # shortcut). One key handles both directions because guessing
+        # intent from a partial state is what the user just did with
+        # Tab+Space — we don't need to second-guess it.
+        checkboxes = [
+            self.query_one(f"#{self._agent_checkbox_id(name)}", Checkbox) for name in REVIEW_SKILLS
+        ]
+        target = any(not cb.value for cb in checkboxes)
+        for cb in checkboxes:
+            cb.value = target
 
 
 # --- In-progress warning modal ---------------------------------------------
@@ -2589,6 +2806,19 @@ class PRReviewer(App):
     #confirm-extra-label {
         margin-top: 1;
         color: $text-muted;
+    }
+    #confirm-agents-label {
+        margin-top: 1;
+        color: $text-muted;
+    }
+    .confirm-agent {
+        height: 1;
+        padding: 0 0 0 2;
+        background: transparent;
+        border: none;
+    }
+    .confirm-agent:focus {
+        background: $boost;
     }
     #confirm-extra {
         height: 5;
@@ -3142,6 +3372,7 @@ class PRReviewer(App):
                         result.post_inline,
                         result.extra_prompt,
                         cli=result.cli,
+                        selected_agents=result.selected_agents,
                         expected_holder=expected_holder,
                     )
 
@@ -3398,6 +3629,7 @@ class PRReviewer(App):
         post_inline: bool,
         extra_prompt: str,
         cli: CliChoice = DEFAULT_CLI,
+        selected_agents: tuple[str, ...] = REVIEW_SKILLS,
         expected_holder: InProgressHolder | None = None,
     ) -> None:
         repo_full = pr["repository"]["nameWithOwner"]
@@ -3629,7 +3861,7 @@ class PRReviewer(App):
                 # byte-identical to its pre-launch state.
                 if cli in _SKILL_BASED_CLIS:
                     print(f"Materialising review skills under {local_path}/.agents/skills/…")
-                    skills_manifest = _materialise_skills(local_path)
+                    skills_manifest = _materialise_skills(local_path, selected=selected_agents)
 
                 print("Fetching existing review comments…")
                 existing, fetch_ok = fetch_existing_review_comments(repo_full, number)
@@ -3695,6 +3927,7 @@ class PRReviewer(App):
                     cli=cli,
                     codegraph_present=codegraph_tools_available,
                     codegraph_affected_tests=codegraph_affected_block,
+                    selected_agents=selected_agents,
                 )
 
                 if not fetch_ok:
@@ -3712,6 +3945,24 @@ class PRReviewer(App):
                 elif post_inline and my_login is None:
                     post_inline_desc += ", rereview-detection-unavailable"
                 parts = [f"post-inline: {post_inline_desc}", existing_desc]
+                # Only call out the agent subset when it diverges from the
+                # default — the banner is already crowded, and "agents: all"
+                # would be noise on every default-shape launch. Compare as
+                # SETS rather than tuples: `build_review_prompt` normalises
+                # order before assembling, so a reordered-but-full subset
+                # produces the default prompt and shouldn't trip this gate.
+                # The friendly labels mirror what the user just saw on the
+                # modal checkboxes — raw kebab-case ids would diverge from
+                # the modal's label text.
+                if set(selected_agents) != set(REVIEW_SKILLS):
+                    if not selected_agents:
+                        parts.append("agents: none (generic review)")
+                    elif len(selected_agents) <= 3:
+                        parts.append(
+                            "agents: " + ", ".join(REVIEW_SKILL_LABELS[n] for n in selected_agents)
+                        )
+                    else:
+                        parts.append(f"agents: {len(selected_agents)}/{len(REVIEW_SKILLS)}")
                 if extra_prompt:
                     # `!r` keeps newlines/control chars visible so a misclick paste
                     # (e.g. a secret) is spottable before the CLI consumes it. The

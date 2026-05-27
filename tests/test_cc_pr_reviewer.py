@@ -22,6 +22,7 @@ import pytest
 import cc_pr_reviewer as _mod
 from cc_pr_reviewer import (
     _APP_HOSTNAME,
+    _SKILL_COVERAGE,
     CODEGRAPH_AFFECTED_TESTS_CAP,
     CODEGRAPH_HINT_SUFFIX,
     EXISTING_COMMENT_BODY_CAP,
@@ -35,6 +36,7 @@ from cc_pr_reviewer import (
     PROMPT_SECTION_SEP,
     REVIEW_PROMPT_CLAUDE,
     REVIEW_PROMPT_SKILL_BASED,
+    REVIEW_SKILL_LABELS,
     REVIEW_SKILLS,
     SKILL_FILE_NAME,
     InProgressHolder,
@@ -46,6 +48,7 @@ from cc_pr_reviewer import (
     _first_available_cli,
     _in_progress_age_str,
     _is_newer,
+    _join_agents,
     _load_in_progress,
     _materialise_skills,
     _open_review_db,
@@ -296,6 +299,268 @@ def test_my_login_none_never_triggers_rereview() -> None:
     assert POST_INLINE_REREVIEW_SUFFIX not in built.text
     assert POST_INLINE_REREVIEW_APPROVE_SUFFIX not in built.text
     assert POST_INLINE_REREVIEW_RESOLVE_SUFFIX not in built.text
+
+
+# --- selected_agents subset (ConfirmScreen → build_review_prompt) ----------
+
+
+def test_selected_agents_default_none_matches_default_constant() -> None:
+    """`selected_agents=None` is the back-compat default, and must produce
+    the same base prompt as the documented `REVIEW_PROMPT_CLAUDE` constant
+    — otherwise any caller that hasn't migrated would see a silent
+    prompt-shape drift on first launch after upgrade."""
+    built = build_review_prompt(
+        post_inline=False,
+        extra_prompt="",
+        existing=[],
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+        cli="claude",
+        selected_agents=None,
+    )
+    assert built.text == REVIEW_PROMPT_CLAUDE
+
+
+def test_selected_agents_full_set_equals_default_constant() -> None:
+    """Passing the full REVIEW_SKILLS tuple must be byte-identical to the
+    default (None) — guards against the builder branching on subset vs
+    default and producing two near-identical prompts that differ only
+    in word choice."""
+    built_default = build_review_prompt(
+        post_inline=False,
+        extra_prompt="",
+        existing=[],
+        fetch_ok=True,
+        my_login=None,
+        author_login=None,
+        cli="claude",
+    )
+    built_full = build_review_prompt(
+        post_inline=False,
+        extra_prompt="",
+        existing=[],
+        fetch_ok=True,
+        my_login=None,
+        author_login=None,
+        cli="claude",
+        selected_agents=REVIEW_SKILLS,
+    )
+    assert built_default.text == built_full.text
+
+
+def test_selected_agents_subset_drops_unselected_from_claude_prompt() -> None:
+    """For Claude: the unselected agent's friendly label must NOT appear
+    in the base prompt, and the selected ones MUST. Doc-only PRs are
+    the motivating use case — dropping Code Reviewer + PR Test Analyzer
+    so the plugin doesn't spend tokens on irrelevant dimensions."""
+    selected = ("comment-analyzer", "code-simplifier")
+    built = build_review_prompt(
+        post_inline=False,
+        extra_prompt="",
+        existing=[],
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+        cli="claude",
+        selected_agents=selected,
+    )
+    for name in selected:
+        assert REVIEW_SKILL_LABELS[name] in built.text
+    dropped = tuple(n for n in REVIEW_SKILLS if n not in selected)
+    for name in dropped:
+        assert REVIEW_SKILL_LABELS[name] not in built.text
+
+
+@pytest.mark.parametrize("cli", ["codex", "gemini"])
+def test_selected_agents_subset_drops_unselected_from_skill_prompt(cli: str) -> None:
+    """For codex/gemini: only the selected skills must appear as `$mentions`.
+    Unselected skills must NOT — `_materialise_skills` doesn't write them
+    to `.agents/skills/`, so a leftover `$name` mention in the prompt
+    would tell the agent to activate a skill that isn't there."""
+    selected = ("comment-analyzer", "code-simplifier")
+    built = build_review_prompt(
+        post_inline=False,
+        extra_prompt="",
+        existing=[],
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+        cli=cli,
+        selected_agents=selected,
+    )
+    for name in selected:
+        assert f"${name}" in built.text
+    dropped = tuple(n for n in REVIEW_SKILLS if n not in selected)
+    for name in dropped:
+        assert f"${name}" not in built.text
+
+
+def test_selected_agents_normalised_to_review_skills_order() -> None:
+    """The builder must re-order any caller-supplied subset against
+    REVIEW_SKILLS so the prompt's enumeration is deterministic — a
+    future test or cache that compares prompt bytes shouldn't depend
+    on the modal's checkbox-iteration order, and order-sensitive
+    output also hurts prompt-cache reuse upstream."""
+    # Pass in reverse REVIEW_SKILLS order; the prompt should still
+    # enumerate in REVIEW_SKILLS order.
+    reversed_subset = tuple(reversed(REVIEW_SKILLS))
+    built_reversed = build_review_prompt(
+        post_inline=False,
+        extra_prompt="",
+        existing=[],
+        fetch_ok=True,
+        my_login=None,
+        author_login=None,
+        cli="claude",
+        selected_agents=reversed_subset,
+    )
+    built_natural = build_review_prompt(
+        post_inline=False,
+        extra_prompt="",
+        existing=[],
+        fetch_ok=True,
+        my_login=None,
+        author_login=None,
+        cli="claude",
+        selected_agents=REVIEW_SKILLS,
+    )
+    assert built_reversed.text == built_natural.text
+
+
+def test_selected_agents_empty_set_produces_generic_review_prompt() -> None:
+    """All-six-unchecked is a legitimate state (the user clicked through
+    Ctrl+A by accident — refused at the ConfirmScreen — but a caller
+    can still pass it directly to the builder). The prompt must degrade
+    to a generic "review this PR" form with no skill / agent mentions,
+    so codex/gemini don't fail-search for unmaterialised skills."""
+    for cli in ("claude", "codex", "gemini"):
+        built = build_review_prompt(
+            post_inline=False,
+            extra_prompt="",
+            existing=[],
+            fetch_ok=True,
+            my_login=None,
+            author_login=None,
+            cli=cli,
+            selected_agents=(),
+        )
+        # No `$<name>` mentions, no friendly labels.
+        for name in REVIEW_SKILLS:
+            assert f"${name}" not in built.text, f"cli={cli}: dropped skill leaked"
+            assert REVIEW_SKILL_LABELS[name] not in built.text, (
+                f"cli={cli}: dropped friendly label leaked"
+            )
+        # And for Claude specifically, the toolkit reference still stands
+        # — we're just asking for a generic toolkit review with no agent
+        # pinning. Codex/gemini omit the toolkit entirely.
+        if cli == "claude":
+            assert "PR Review Toolkit" in built.text
+        else:
+            assert "PR Review Toolkit" not in built.text
+
+
+def test_selected_agents_singleton_grammar_for_skill_prompt() -> None:
+    """Single-skill grammar matters: "one review skill" + the singular
+    coverage clause. A naive f-string that hard-codes "six review
+    skills" would silently lie to the agent in the singleton case."""
+    built = build_review_prompt(
+        post_inline=False,
+        extra_prompt="",
+        existing=[],
+        fetch_ok=True,
+        my_login=None,
+        author_login=None,
+        cli="codex",
+        selected_agents=("code-reviewer",),
+    )
+    assert "one review skill" in built.text
+    assert "$code-reviewer" in built.text
+    # No leftover plural agent count from a stale f-string.
+    assert "six review skills" not in built.text
+
+
+def test_selected_agents_materialise_writes_only_subset(tmp_path: Any) -> None:
+    """`_materialise_skills(selected=...)` must drop SKILL.md files only
+    for the selected names — not all six. Otherwise codex/gemini's
+    auto-discovery would still see the unselected skills' metadata and
+    might implicitly activate them, defeating the unchecking."""
+    selected = ("comment-analyzer", "code-simplifier")
+    _materialise_skills(tmp_path, selected=selected)
+    for name in selected:
+        assert (tmp_path / ".agents" / "skills" / name / SKILL_FILE_NAME).is_file()
+    for name in REVIEW_SKILLS:
+        if name not in selected:
+            assert not (tmp_path / ".agents" / "skills" / name).exists(), (
+                f"unselected skill {name!r} was materialised — auto-discovery would still see it"
+            )
+
+
+def test_selected_agents_materialise_default_writes_all_six(tmp_path: Any) -> None:
+    """Back-compat: callers that don't pass `selected=` (every existing
+    call site before this change) must still materialise every skill,
+    matching the historical behaviour."""
+    _materialise_skills(tmp_path)
+    for name in REVIEW_SKILLS:
+        assert (tmp_path / ".agents" / "skills" / name / SKILL_FILE_NAME).is_file()
+
+
+def test_selected_agents_materialise_rejects_unknown_name(tmp_path: Any) -> None:
+    """A typo'd skill name must surface as `ValueError` BEFORE any disk
+    I/O — not as the `RuntimeError("failed to materialise skill …")`
+    that the copy-block raises for environment failures (disk full,
+    perms, read-only FS). Misclassifying a bad-input bug as an
+    environment error would send a future debugger looking at the
+    filesystem when the actual fault is a stale REVIEW_SKILLS reference.
+    The error message must name the unknown key(s) so the caller can
+    locate the typo."""
+    with pytest.raises(ValueError, match="unknown skill name"):
+        _materialise_skills(tmp_path, selected=("code-reviewer", "typo-skill"))
+    # Nothing should have been written — validation runs before any
+    # `mkdir` / `copy2`, so the workspace stays pristine.
+    assert not (tmp_path / ".agents").exists()
+
+
+def test_review_skill_labels_cover_every_skill() -> None:
+    """Every REVIEW_SKILLS entry must have a friendly label — the Claude
+    prompt builder and the ConfirmScreen checkboxes both index this
+    dict by skill name. A missing entry would crash the prompt build
+    at launch (KeyError) instead of surfacing as a clean test failure."""
+    for name in REVIEW_SKILLS:
+        assert name in REVIEW_SKILL_LABELS, f"REVIEW_SKILL_LABELS missing entry for {name!r}"
+
+
+def test_skill_coverage_covers_every_skill() -> None:
+    """Sibling guard for `_SKILL_COVERAGE`, indexed the same way by
+    `_build_skill_based_prompt`. Without this, adding a 7th entry to
+    REVIEW_SKILLS + REVIEW_SKILL_LABELS but forgetting `_SKILL_COVERAGE`
+    would pass the labels test, then KeyError at codex/gemini prompt
+    build — at import time for the full set, at launch time for any
+    subset that happens to include the missing key."""
+    for name in REVIEW_SKILLS:
+        assert name in _SKILL_COVERAGE, f"_SKILL_COVERAGE missing entry for {name!r}"
+
+
+# --- _join_agents (Oxford-comma helper) ------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("items", "expected"),
+    [
+        (["A"], "A"),
+        (["A", "B"], "A and B"),
+        (["A", "B", "C"], "A, B, and C"),
+        (["A", "B", "C", "D"], "A, B, C, and D"),
+    ],
+)
+def test_join_agents_oxford_grammar(items: list[str], expected: str) -> None:
+    """Lock the exact wording each branch produces. The helper is only
+    exercised transitively by subset tests that assert `$name in / not in`
+    — a regression to "A B", a dropped Oxford comma, or the wrong
+    separator in the 2-item branch would slip through those silently
+    while the prompt still 'works'. The Oxford comma is the whole reason
+    this helper exists; this test is what guarantees it stays."""
+    assert _join_agents(items) == expected
 
 
 # --- CodeGraph hint suffix (gated on `.codegraph/` presence) ---------------
