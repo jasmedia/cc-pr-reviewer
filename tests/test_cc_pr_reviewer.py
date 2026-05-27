@@ -22,6 +22,7 @@ import pytest
 import cc_pr_reviewer as _mod
 from cc_pr_reviewer import (
     _APP_HOSTNAME,
+    _SKILL_COVERAGE,
     CODEGRAPH_AFFECTED_TESTS_CAP,
     CODEGRAPH_HINT_SUFFIX,
     EXISTING_COMMENT_BODY_CAP,
@@ -47,6 +48,7 @@ from cc_pr_reviewer import (
     _first_available_cli,
     _in_progress_age_str,
     _is_newer,
+    _join_agents,
     _load_in_progress,
     _materialise_skills,
     _open_review_db,
@@ -503,6 +505,22 @@ def test_selected_agents_materialise_default_writes_all_six(tmp_path: Any) -> No
         assert (tmp_path / ".agents" / "skills" / name / SKILL_FILE_NAME).is_file()
 
 
+def test_selected_agents_materialise_rejects_unknown_name(tmp_path: Any) -> None:
+    """A typo'd skill name must surface as `ValueError` BEFORE any disk
+    I/O — not as the `RuntimeError("failed to materialise skill …")`
+    that the copy-block raises for environment failures (disk full,
+    perms, read-only FS). Misclassifying a bad-input bug as an
+    environment error would send a future debugger looking at the
+    filesystem when the actual fault is a stale REVIEW_SKILLS reference.
+    The error message must name the unknown key(s) so the caller can
+    locate the typo."""
+    with pytest.raises(ValueError, match="unknown skill name"):
+        _materialise_skills(tmp_path, selected=("code-reviewer", "typo-skill"))
+    # Nothing should have been written — validation runs before any
+    # `mkdir` / `copy2`, so the workspace stays pristine.
+    assert not (tmp_path / ".agents").exists()
+
+
 def test_review_skill_labels_cover_every_skill() -> None:
     """Every REVIEW_SKILLS entry must have a friendly label — the Claude
     prompt builder and the ConfirmScreen checkboxes both index this
@@ -510,6 +528,39 @@ def test_review_skill_labels_cover_every_skill() -> None:
     at launch (KeyError) instead of surfacing as a clean test failure."""
     for name in REVIEW_SKILLS:
         assert name in REVIEW_SKILL_LABELS, f"REVIEW_SKILL_LABELS missing entry for {name!r}"
+
+
+def test_skill_coverage_covers_every_skill() -> None:
+    """Sibling guard for `_SKILL_COVERAGE`, indexed the same way by
+    `_build_skill_based_prompt`. Without this, adding a 7th entry to
+    REVIEW_SKILLS + REVIEW_SKILL_LABELS but forgetting `_SKILL_COVERAGE`
+    would pass the labels test, then KeyError at codex/gemini prompt
+    build — at import time for the full set, at launch time for any
+    subset that happens to include the missing key."""
+    for name in REVIEW_SKILLS:
+        assert name in _SKILL_COVERAGE, f"_SKILL_COVERAGE missing entry for {name!r}"
+
+
+# --- _join_agents (Oxford-comma helper) ------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("items", "expected"),
+    [
+        (["A"], "A"),
+        (["A", "B"], "A and B"),
+        (["A", "B", "C"], "A, B, and C"),
+        (["A", "B", "C", "D"], "A, B, C, and D"),
+    ],
+)
+def test_join_agents_oxford_grammar(items: list[str], expected: str) -> None:
+    """Lock the exact wording each branch produces. The helper is only
+    exercised transitively by subset tests that assert `$name in / not in`
+    — a regression to "A B", a dropped Oxford comma, or the wrong
+    separator in the 2-item branch would slip through those silently
+    while the prompt still 'works'. The Oxford comma is the whole reason
+    this helper exists; this test is what guarantees it stays."""
+    assert _join_agents(items) == expected
 
 
 # --- CodeGraph hint suffix (gated on `.codegraph/` presence) ---------------

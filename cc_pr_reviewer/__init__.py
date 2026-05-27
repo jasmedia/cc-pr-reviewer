@@ -301,9 +301,23 @@ def _materialise_skills(
     codex/gemini's auto-discovery doesn't even see the unselected ones —
     that's stronger than just omitting them from the prompt mentions, since
     those CLIs can implicitly activate any skill present in `.agents/skills/`.
+
+    Unknown names are rejected up-front with `ValueError`. The `shutil.copy2`
+    block below catches `OSError` (disk full, perms, read-only FS) and
+    re-raises it as a `RuntimeError("failed to materialise skill …")`; without
+    this guard, a typo'd skill name would surface as that same RuntimeError
+    via `FileNotFoundError` on the bundled source, misclassifying a bad-input
+    bug as an environment failure.
     """
     if selected is None:
         selected = REVIEW_SKILLS
+    else:
+        unknown = [name for name in selected if name not in REVIEW_SKILL_LABELS]
+        if unknown:
+            raise ValueError(
+                f"unknown skill name(s) in selected: {unknown!r}; "
+                f"expected subset of {list(REVIEW_SKILLS)!r}"
+            )
 
     skills_root = workspace / ".agents" / "skills"
     agents_dir = workspace / ".agents"
@@ -2293,9 +2307,13 @@ class ConfirmResult:
     # Subset of REVIEW_SKILLS the reviewer wants to run for this launch.
     # Default = all six; the ConfirmScreen lets the user uncheck individual
     # agents (e.g. drop code-reviewer + pr-test-analyzer for a doc-only PR).
-    # Order doesn't matter at construction — `build_review_prompt` and
-    # `_materialise_skills` both re-iterate `REVIEW_SKILLS` to keep the
-    # output stable.
+    # Order isn't load-bearing: `build_review_prompt` re-iterates
+    # `REVIEW_SKILLS` and filters by membership so the prompt enumeration
+    # is stable; `_materialise_skills` doesn't care about order (it just
+    # writes one dir per name) but does reject unknown names up-front with
+    # `ValueError`. Today every caller produces a canonical-order subset
+    # (`ConfirmScreen._selected_agents` iterates `REVIEW_SKILLS`), but the
+    # downstream contract doesn't depend on that.
     selected_agents: tuple[str, ...] = REVIEW_SKILLS
 
     def __post_init__(self) -> None:
@@ -2361,7 +2379,15 @@ class ConfirmScreen(ModalScreen[ConfirmResult | None]):
         Binding("ctrl+n", "cancel", "Cancel", priority=True, show=False),
         Binding("ctrl+t", "toggle_post_inline", "Toggle post-inline", priority=True),
         Binding("ctrl+l", "cycle_cli", "Cycle CLI", priority=True),
-        Binding("ctrl+a", "toggle_all_agents", "Toggle all agents", priority=True),
+        # `ctrl+a` is intentionally NOT `priority=True`: TextArea binds it
+        # to select-all, and a reviewer mid-typing who hits Ctrl+A almost
+        # always means "select the prompt I just typed", not "flip every
+        # agent off". With the binding scoped non-priority, focused
+        # widgets get first refusal — TextArea consumes it for select-all,
+        # and Checkbox (which doesn't bind Ctrl+A) lets it bubble up to
+        # `action_toggle_all_agents`. The hint reflects this: Tab off the
+        # textarea onto an agent checkbox first, then Ctrl+A flips them all.
+        Binding("ctrl+a", "toggle_all_agents", "Toggle all agents"),
     ]
 
     def __init__(self, prompt: str, default_cli: CliChoice = DEFAULT_CLI):
@@ -2374,7 +2400,7 @@ class ConfirmScreen(ModalScreen[ConfirmResult | None]):
         hint = (
             "[b]Enter[/] / [b]Ctrl+Y[/] confirm • [b]Esc[/] / [b]Ctrl+N[/] cancel "
             "• [b]Ctrl+T[/] post-inline • [b]Ctrl+L[/] cycle CLI "
-            "• [b]Tab[/]/[b]Space[/] agents • [b]Ctrl+A[/] toggle all "
+            "• [b]Tab[/]/[b]Space[/] agents • [b]Ctrl+A[/] (on agents) toggle all "
             "• [b]Shift+Enter[/] newline"
         )
         # Agent checkboxes: one per REVIEW_SKILLS entry, all checked by
@@ -2407,9 +2433,13 @@ class ConfirmScreen(ModalScreen[ConfirmResult | None]):
 
     @staticmethod
     def _agent_checkbox_id(name: str) -> str:
-        # Textual widget ids can't contain `-` followed by lowercase letters
-        # that look like CSS pseudo-classes — keeping them simple by
-        # prefixing each REVIEW_SKILLS name (which is already kebab-case).
+        # Prefix to namespace these ids alongside the modal's other named
+        # widgets (`confirm-title`, `confirm-cli`, `confirm-extra`, …). The
+        # raw `REVIEW_SKILLS` name is already a valid Textual id on its own
+        # (letters / digits / `-` / `_`, no leading digit), but pairing it
+        # with a sibling `confirm-*` cohort under a single `agent-*` prefix
+        # keeps `query_one("#agent-…")` lookups unambiguous and makes the
+        # ids self-describing in DOM dumps.
         return f"agent-{name}"
 
     def _checkbox_text(self) -> str:
@@ -2437,7 +2467,8 @@ class ConfirmScreen(ModalScreen[ConfirmResult | None]):
             # builder handles that branch and the user can opt back via
             # Ctrl+A.
             self.app.notify(
-                "Select at least one review agent (or press Ctrl+A to re-enable all).",
+                "Select at least one review agent "
+                "(Tab onto a checkbox and press Ctrl+A to re-enable all).",
                 severity="warning",
                 timeout=4,
             )
@@ -3916,12 +3947,20 @@ class PRReviewer(App):
                 parts = [f"post-inline: {post_inline_desc}", existing_desc]
                 # Only call out the agent subset when it diverges from the
                 # default — the banner is already crowded, and "agents: all"
-                # would be noise on every default-shape launch.
-                if tuple(selected_agents) != REVIEW_SKILLS:
+                # would be noise on every default-shape launch. Compare as
+                # SETS rather than tuples: `build_review_prompt` normalises
+                # order before assembling, so a reordered-but-full subset
+                # produces the default prompt and shouldn't trip this gate.
+                # The friendly labels mirror what the user just saw on the
+                # modal checkboxes — raw kebab-case ids would diverge from
+                # the modal's label text.
+                if set(selected_agents) != set(REVIEW_SKILLS):
                     if not selected_agents:
                         parts.append("agents: none (generic review)")
                     elif len(selected_agents) <= 3:
-                        parts.append("agents: " + ", ".join(selected_agents))
+                        parts.append(
+                            "agents: " + ", ".join(REVIEW_SKILL_LABELS[n] for n in selected_agents)
+                        )
                     else:
                         parts.append(f"agents: {len(selected_agents)}/{len(REVIEW_SKILLS)}")
                 if extra_prompt:
