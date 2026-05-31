@@ -4,6 +4,51 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.1] — 2026-05-31
+
+### Added
+- **Per-launch review telemetry.** New append-only `review_telemetry`
+  SQLite table records one row per CLI launch — on success **and** on
+  abort/crash (`rc != 0`) — so the CodeGraph token thesis can be checked
+  against data instead of guessed at. Each row captures only the
+  cost-and-outcome side cc-reviewer controls *before* the subprocess
+  boundary: `cli`, `codegraph_tools`, `affected_paths`,
+  `existing_in_prompt`, `post_inline`, `rereview`, `approx_prompt_tokens`,
+  `duration_seconds`, and `exit_code`. It deliberately **cannot** see the
+  agent's in-session grep-vs-`codegraph_*` tool calls or real token usage
+  — those live in the CLI's own transcript, which cc-reviewer never reads.
+  Written best-effort by `_record_launch_telemetry` (loud-but-non-fatal,
+  with a rollback so a failed INSERT can't disrupt the shared connection's
+  next writer) and recorded *before* `_record_review` so a failure in that
+  UPSERT can't drop the telemetry row. The table is created idempotently
+  via `CREATE TABLE IF NOT EXISTS`, so existing state DBs gain it on next
+  open with no migration step. Data is local to the workspace DB and never
+  leaves the machine. `_approx_tokens` (a ~4-chars/token heuristic for
+  trend-spotting, not a billing figure) is surfaced as a computed
+  `BuiltPrompt.approx_tokens` property so it can't desync from the prompt
+  text.
+
+### Changed
+- **Trimmed the per-launch review prompt to reduce token cost.** The
+  CodeGraph integration previously paid its prompt costs unconditionally
+  while banking savings only speculatively, and answered "what's the blast
+  radius?" twice. Three reductions:
+  - Split the per-symbol `codegraph_impact` nudge out of
+    `CODEGRAPH_HINT_SUFFIX` into a separate `CODEGRAPH_IMPACT_NUDGE`,
+    appended **only** when no precomputed `codegraph affected` block is
+    present — when the block is present it already scopes the blast
+    radius, so re-asking the agent to run `codegraph_impact` on every
+    touched symbol only spent tokens and provoked a fan-out of tool calls
+    that re-bloat its context. `codegraph_impact` still appears in the
+    hint's tool-list parenthetical, so it stays discoverable.
+  - `EXISTING_COMMENT_BODY_CAP` 200 → 120 (the largest variable block;
+    the body is a dedup anchor, not the full comment).
+  - `CODEGRAPH_AFFECTED_TESTS_CAP` 50 → 30.
+  `POST_INLINE_REREVIEW_RESOLVE_SUFFIX` — the single biggest block — was
+  left untouched: its GraphQL guardrails are incident-derived, and
+  lazy-loading them would trade guaranteed correctness for tokens on a
+  GitHub-mutating path.
+
 ## [0.14.0] — 2026-05-27
 
 ### Added
