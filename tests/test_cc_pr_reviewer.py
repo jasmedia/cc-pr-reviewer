@@ -25,6 +25,7 @@ from cc_pr_reviewer import (
     _SKILL_COVERAGE,
     CODEGRAPH_AFFECTED_TESTS_CAP,
     CODEGRAPH_HINT_SUFFIX,
+    CODEGRAPH_IMPACT_NUDGE,
     EXISTING_COMMENT_BODY_CAP,
     EXISTING_COMMENT_LIST_CAP,
     POST_INLINE_DEDUP_SUFFIX,
@@ -41,6 +42,7 @@ from cc_pr_reviewer import (
     SKILL_FILE_NAME,
     InProgressHolder,
     ReviewInProgressError,
+    _approx_tokens,
     _build_cli_command,
     _check_codegraph_setup,
     _cleanup_skills,
@@ -54,6 +56,7 @@ from cc_pr_reviewer import (
     _open_review_db,
     _parse_semver,
     _pid_alive,
+    _record_launch_telemetry,
     _release_in_progress,
     _reserve_in_progress,
     _review_cell,
@@ -624,7 +627,9 @@ def test_codegraph_suffix_placed_after_extra_prompt_before_existing() -> None:
         [
             REVIEW_PROMPT_CLAUDE,
             "Additional instructions from reviewer:\nfocus on the auth changes",
-            CODEGRAPH_HINT_SUFFIX,
+            # No precomputed affected block here, so the per-symbol impact
+            # nudge rides along with the hint as one section.
+            f"{CODEGRAPH_HINT_SUFFIX} {CODEGRAPH_IMPACT_NUDGE}",
             format_existing_comments(existing)[0],
             POST_INLINE_PROMPT + POST_INLINE_DEDUP_SUFFIX,
         ]
@@ -646,6 +651,67 @@ def test_codegraph_suffix_mentions_core_mcp_tools() -> None:
         "codegraph_search",
     ):
         assert tool in CODEGRAPH_HINT_SUFFIX, f"hint missing `{tool}` mention"
+
+
+def test_impact_nudge_dropped_when_affected_block_present() -> None:
+    """The per-symbol `codegraph_impact` nudge is redundant once we've
+    injected a precomputed `codegraph affected` block — the block already
+    scopes the blast radius. Dropping it saves prompt tokens and avoids the
+    agent re-deriving the same answer via a fan-out of per-symbol impact
+    calls. Conversely, with no block the nudge must stay (it's the only
+    blast-radius scoping signal). Lock both halves so a refactor can't
+    silently always-include or always-drop it."""
+    kwargs = dict(
+        post_inline=False,
+        extra_prompt="",
+        existing=[],
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+        cli="claude",
+        codegraph_present=True,
+    )
+    with_block = build_review_prompt(
+        **kwargs, codegraph_affected_tests=format_codegraph_affected_tests(["tests/a.py"])
+    )
+    without_block = build_review_prompt(**kwargs, codegraph_affected_tests="")
+    assert CODEGRAPH_IMPACT_NUDGE not in with_block.text
+    assert CODEGRAPH_IMPACT_NUDGE in without_block.text
+    # The base hint itself is present in both cases either way.
+    assert CODEGRAPH_HINT_SUFFIX in with_block.text
+    assert CODEGRAPH_HINT_SUFFIX in without_block.text
+
+
+# --- approx_tokens / telemetry cost-side --------------------------------------
+
+
+def test_approx_tokens_is_chars_over_four() -> None:
+    """The estimate is a deliberate ~4-chars/token heuristic, not a real
+    tokenizer. Lock the contract so a refactor doesn't silently swap in a
+    different divisor (which would make historical telemetry rows
+    incomparable to new ones)."""
+    assert _approx_tokens("") == 0
+    assert _approx_tokens("abc") == 0
+    assert _approx_tokens("abcd") == 1
+    assert _approx_tokens("x" * 400) == 100
+
+
+def test_built_prompt_exposes_approx_tokens() -> None:
+    """`build_review_prompt` must populate `approx_tokens` from the final
+    assembled text so the launch path can log prompt size without
+    re-deriving it (and so the figure always matches the bytes actually
+    sent to the CLI)."""
+    built = build_review_prompt(
+        post_inline=False,
+        extra_prompt="",
+        existing=[],
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+        cli="claude",
+    )
+    assert built.approx_tokens == _approx_tokens(built.text)
+    assert built.approx_tokens > 0
 
 
 # --- format_codegraph_affected_tests ---------------------------------------
@@ -783,7 +849,9 @@ def test_affected_tests_block_absent_when_kwarg_empty() -> None:
         codegraph_present=True,
         codegraph_affected_tests="",
     )
-    assert built.text == PROMPT_SECTION_SEP.join([REVIEW_PROMPT_CLAUDE, CODEGRAPH_HINT_SUFFIX])
+    assert built.text == PROMPT_SECTION_SEP.join(
+        [REVIEW_PROMPT_CLAUDE, f"{CODEGRAPH_HINT_SUFFIX} {CODEGRAPH_IMPACT_NUDGE}"]
+    )
 
 
 def test_affected_tests_block_can_render_without_codegraph_hint() -> None:
@@ -1935,6 +2003,85 @@ def _insert_holder(
         (pr_key, pid, hostname, started_at),
     )
     conn.commit()
+
+
+def test_record_launch_telemetry_inserts_row(review_db) -> None:
+    """A launch appends exactly one fully-populated row, with bool flags
+    coerced to 0/1 integers. This is the cost+outcome record the codegraph
+    token thesis gets checked against, so the column values must round-trip
+    faithfully."""
+    _record_launch_telemetry(
+        review_db,
+        pr_key="o/r#7",
+        cli="codex",
+        codegraph_tools=True,
+        affected_paths=12,
+        existing_in_prompt=3,
+        post_inline=True,
+        rereview=False,
+        approx_prompt_tokens=842,
+        duration_seconds=4.5,
+        exit_code=0,
+    )
+    rows = review_db.execute("SELECT * FROM review_telemetry").fetchall()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["pr_key"] == "o/r#7"
+    assert row["cli"] == "codex"
+    assert row["codegraph_tools"] == 1  # bool coerced to int
+    assert row["affected_paths"] == 12
+    assert row["existing_in_prompt"] == 3
+    assert row["post_inline"] == 1
+    assert row["rereview"] == 0
+    assert row["approx_prompt_tokens"] == 842
+    assert row["duration_seconds"] == 4.5
+    assert row["exit_code"] == 0
+    assert row["recorded_at"].endswith("Z")
+
+
+def test_record_launch_telemetry_records_nonzero_exit(review_db) -> None:
+    """Aborts/crashes (rc != 0) must still land a row — otherwise the data
+    over-represents clean runs and hides how often launches are
+    interrupted. Two launches → two rows."""
+    for rc in (0, 130):
+        _record_launch_telemetry(
+            review_db,
+            pr_key="o/r#9",
+            cli="claude",
+            codegraph_tools=False,
+            affected_paths=0,
+            existing_in_prompt=0,
+            post_inline=False,
+            rereview=False,
+            approx_prompt_tokens=100,
+            duration_seconds=1.0,
+            exit_code=rc,
+        )
+    exits = [r["exit_code"] for r in review_db.execute("SELECT exit_code FROM review_telemetry")]
+    assert sorted(exits) == [0, 130]
+
+
+def test_record_launch_telemetry_is_best_effort_on_db_error(capsys) -> None:
+    """A telemetry insert failure must NOT raise — it runs after the review
+    subprocess already finished, often inside the launch path's `finally`,
+    so a propagated error would mask the real outcome. It must still be
+    loud (a warning), not silent."""
+    closed = sqlite3.connect(":memory:")
+    closed.close()  # force "Cannot operate on a closed database"
+    _record_launch_telemetry(
+        closed,
+        pr_key="o/r#1",
+        cli="claude",
+        codegraph_tools=False,
+        affected_paths=0,
+        existing_in_prompt=0,
+        post_inline=False,
+        rereview=False,
+        approx_prompt_tokens=1,
+        duration_seconds=0.1,
+        exit_code=0,
+    )
+    assert "failed to record launch telemetry for o/r#1" in capsys.readouterr().out
 
 
 def test_pid_alive_for_self_returns_true() -> None:

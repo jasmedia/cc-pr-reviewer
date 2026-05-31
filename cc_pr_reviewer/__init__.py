@@ -39,6 +39,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import time
 import urllib.request
 import webbrowser
 from collections.abc import Callable
@@ -568,26 +569,42 @@ CODEGRAPH_HINT_SUFFIX = (
     "tools (`codegraph_context`, `codegraph_impact`, `codegraph_callers`, "
     "`codegraph_callees`, `codegraph_trace`, `codegraph_search`) over "
     "grep+Read loops — they answer from the pre-built index in one call "
-    "instead of fanning out across the codebase. Run `codegraph_impact` on "
-    "each symbol touched by the diff to scope blast radius before "
-    "commenting. Reach for raw grep/Read only to confirm a specific detail "
-    "CodeGraph didn't cover."
+    "instead of fanning out across the codebase. Reach for raw grep/Read "
+    "only to confirm a specific detail CodeGraph didn't cover."
+)
+
+# The per-symbol blast-radius nudge, split out of CODEGRAPH_HINT_SUFFIX so
+# it's appended ONLY when we didn't precompute an affected-files block. When
+# the `codegraph affected` block IS present it already answers "what does the
+# diff reach", so re-asking the agent to run `codegraph_impact` on every
+# touched symbol is doubly wasteful: it spends prompt tokens AND provokes a
+# fan-out of tool calls whose results re-bloat the agent's context — the exact
+# memorization cost the index was meant to avoid. `codegraph_impact` still
+# appears in the hint's tool-list parenthetical above, so the tool stays
+# discoverable for ad-hoc use either way.
+CODEGRAPH_IMPACT_NUDGE = (
+    "Run `codegraph_impact` on each symbol touched by the diff to scope "
+    "blast radius before commenting."
 )
 
 # Cap on how many affected-test paths we'll inline into the prompt. Codegraph
-# can return hundreds on PRs touching widely-imported files; past ~50 the
+# can return hundreds on PRs touching widely-imported files; past ~30 the
 # list stops being a useful scoping hint and starts crowding out other
-# context. The block annotates the overflow so the agent knows the list
-# was truncated, not authoritative.
-CODEGRAPH_AFFECTED_TESTS_CAP = 50
+# context (and the agent can always query `codegraph affected`/`codegraph_impact`
+# itself for the long tail). The block annotates the overflow so the agent
+# knows the list was truncated, not authoritative.
+CODEGRAPH_AFFECTED_TESTS_CAP = 30
 
 # Prompt sections are joined with this separator so multi-line blocks (e.g.
 # the existing-comments list) don't get smashed into neighboring prose.
 PROMPT_SECTION_SEP = "\n\n"
 
 # Caps for the existing-comments block injected into the prompt. Bound prompt
-# size on PRs with lots of prior review activity.
-EXISTING_COMMENT_BODY_CAP = 200
+# size on PRs with lots of prior review activity. The body cap is a dedup
+# anchor, not the full comment — ~120 chars is enough to identify a finding's
+# gist for the "don't repost duplicates" check, and trims up to ~40% off this
+# block (the largest variable section) on heavily-reviewed PRs.
+EXISTING_COMMENT_BODY_CAP = 120
 EXISTING_COMMENT_LIST_CAP = 50
 
 # Cap for the reviewer-supplied extra prompt echoed in the launch banner.
@@ -1515,6 +1532,18 @@ def format_existing_comments(comments: list[dict[str, Any]]) -> tuple[str, int]:
     return "\n".join(lines), len(shown)
 
 
+def _approx_tokens(text: str) -> int:
+    """Rough token estimate (~4 chars/token) for launch telemetry.
+
+    Deliberately a cheap heuristic, not a real tokenizer: we never ship a
+    tokenizer dependency, and the only consumer is *relative* comparison
+    across launches (e.g. codegraph-present vs grep-only prompts), where a
+    consistent 4-chars/token proxy is enough to spot trends. Absolute
+    accuracy against any specific model's BPE is explicitly a non-goal.
+    """
+    return len(text) // 4
+
+
 @dataclass(frozen=True)
 class BuiltPrompt:
     """Result of `build_review_prompt` — prompt text plus banner metadata."""
@@ -1523,6 +1552,10 @@ class BuiltPrompt:
     rereview: bool
     existing_shown: int
     existing_total: int
+    # ~4-chars/token estimate of `text`, surfaced so the launch path can
+    # log prompt size into `review_telemetry` without re-deriving it. A
+    # heuristic for trend-spotting, not a billing figure (see _approx_tokens).
+    approx_tokens: int
 
 
 def build_review_prompt(
@@ -1650,7 +1683,15 @@ def build_review_prompt(
     # block follows the hint so the agent reads both CodeGraph sections
     # contiguously.
     if codegraph_present:
-        sections.append(CODEGRAPH_HINT_SUFFIX)
+        hint = CODEGRAPH_HINT_SUFFIX
+        if not codegraph_affected_tests:
+            # No precomputed affected-files block, so keep the per-symbol
+            # impact nudge. When the block IS present it already scopes the
+            # blast radius, so drop the redundant nudge — saves prompt tokens
+            # and avoids the agent re-deriving it via a fan-out of per-symbol
+            # codegraph_impact calls whose results would re-bloat its context.
+            hint = f"{hint} {CODEGRAPH_IMPACT_NUDGE}"
+        sections.append(hint)
     if codegraph_affected_tests:
         sections.append(codegraph_affected_tests)
     if existing_block:
@@ -1668,11 +1709,13 @@ def build_review_prompt(
                 post += POST_INLINE_REREVIEW_RESOLVE_SUFFIX
         sections.append(post)
 
+    text = PROMPT_SECTION_SEP.join(sections)
     return BuiltPrompt(
-        text=PROMPT_SECTION_SEP.join(sections),
+        text=text,
         rereview=rereview,
         existing_shown=shown,
         existing_total=len(existing),
+        approx_tokens=_approx_tokens(text),
     )
 
 
@@ -1765,6 +1808,38 @@ def _open_review_db() -> sqlite3.Connection:
         )
         """
     )
+    # Append-only per-launch telemetry — one row per CLI launch (success,
+    # abort, AND crash), unlike `reviews` which is a durable per-PR UPSERT
+    # audit record. It exists to answer cost/benefit questions about the
+    # prompt we ship — e.g. "does a codegraph-present launch carry a smaller
+    # prompt or run faster than a grep+Read one?" — so the codegraph token
+    # thesis can be checked against data instead of guessed at.
+    #
+    # It captures ONLY what we control on this side of the subprocess
+    # boundary: the prompt we built (size + composition) and the launch
+    # outcome (exit code + wall-clock). It deliberately does NOT — and
+    # cannot from here — record the agent's in-session tool calls (grep vs
+    # `codegraph_*`) or its real token usage; those live in the CLI's own
+    # transcript, which we never read. Data is local to this workspace DB
+    # and never leaves the machine.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS review_telemetry (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            recorded_at TEXT NOT NULL,
+            pr_key TEXT NOT NULL,
+            cli TEXT NOT NULL,
+            codegraph_tools INTEGER NOT NULL,
+            affected_paths INTEGER NOT NULL,
+            existing_in_prompt INTEGER NOT NULL,
+            post_inline INTEGER NOT NULL,
+            rereview INTEGER NOT NULL,
+            approx_prompt_tokens INTEGER NOT NULL,
+            duration_seconds REAL NOT NULL,
+            exit_code INTEGER NOT NULL
+        )
+        """
+    )
     conn.commit()
     return conn
 
@@ -1812,6 +1887,59 @@ def _record_review(
     conn.commit()
     row = conn.execute("SELECT * FROM reviews WHERE pr_key = ?", (pr_key,)).fetchone()
     return dict(row)
+
+
+def _record_launch_telemetry(
+    conn: sqlite3.Connection,
+    *,
+    pr_key: str,
+    cli: str,
+    codegraph_tools: bool,
+    affected_paths: int,
+    existing_in_prompt: int,
+    post_inline: bool,
+    rereview: bool,
+    approx_prompt_tokens: int,
+    duration_seconds: float,
+    exit_code: int,
+) -> None:
+    """Append one best-effort row to `review_telemetry` (schema in `_open_review_db`).
+
+    "Best-effort" means it never lets telemetry break a review: by the time
+    this runs the CLI subprocess has already finished and recording the
+    outcome is strictly a side-benefit, so a failed INSERT is caught and
+    logged rather than propagated up through the launch path's `finally`.
+    Per the project's no-silent-failure rule it is NOT swallowed silently —
+    a dropped row prints a diagnostic — but it must not abort the launch or
+    mask an in-flight exception.
+    """
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    try:
+        conn.execute(
+            """
+            INSERT INTO review_telemetry (
+                recorded_at, pr_key, cli, codegraph_tools, affected_paths,
+                existing_in_prompt, post_inline, rereview, approx_prompt_tokens,
+                duration_seconds, exit_code
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                now,
+                pr_key,
+                cli,
+                int(codegraph_tools),
+                affected_paths,
+                existing_in_prompt,
+                int(post_inline),
+                int(rereview),
+                approx_prompt_tokens,
+                duration_seconds,
+                exit_code,
+            ),
+        )
+        conn.commit()
+    except sqlite3.Error as e:
+        print(f"warning: failed to record launch telemetry for {pr_key}: {e}")
 
 
 # --- In-progress reservations (cross-instance lock) ------------------------
@@ -3838,10 +3966,12 @@ class PRReviewer(App):
                 # binary-on-PATH) precondition as sync — without both, the
                 # affected-tests query can't run.
                 codegraph_affected_block = ""
+                affected_count = 0  # paths injected into the prompt; for telemetry
                 if codegraph_present and codegraph_on_path:
                     print("Querying CodeGraph for tests affected by this PR's diff…")
                     affected = _collect_codegraph_affected(local_path, repo_full, number)
                     codegraph_affected_block = format_codegraph_affected_tests(affected)
+                    affected_count = len(affected)
                     if codegraph_affected_block:
                         # Visible count: `_collect_codegraph_affected` now
                         # returns dedup'd output, so `len(affected)` matches
@@ -3978,7 +4108,9 @@ class PRReviewer(App):
                     f"\nLaunching {_CLI_DISPLAY[cli]} ({', '.join(parts)})"
                     " — exit the CLI when you're done.\n"
                 )
+                launch_start = time.monotonic()
                 rc = subprocess.call(cmd, cwd=local_path)
+                launch_duration = time.monotonic() - launch_start
 
                 # Only count this as a review if the CLI exited cleanly.
                 # Ctrl-C, crashes, or a failed launch leave rc != 0;
@@ -3997,6 +4129,25 @@ class PRReviewer(App):
                         f"\n{_CLI_DISPLAY[cli]} exited with status {rc}; "
                         "not recording this as a review."
                     )
+
+                # Append-only launch telemetry, recorded for EVERY exit
+                # (including the rc != 0 paths above) so aborts/crashes stay
+                # visible in the data. Best-effort: `_record_launch_telemetry`
+                # logs and swallows its own DB errors so it can't break the
+                # launch or mask an exception unwinding through `finally`.
+                _record_launch_telemetry(
+                    self.review_db,
+                    pr_key=key,
+                    cli=cli,
+                    codegraph_tools=codegraph_tools_available,
+                    affected_paths=affected_count,
+                    existing_in_prompt=built.existing_shown,
+                    post_inline=post_inline,
+                    rereview=built.rereview,
+                    approx_prompt_tokens=built.approx_tokens,
+                    duration_seconds=launch_duration,
+                    exit_code=rc,
+                )
 
                 input(
                     f"\n── {_CLI_DISPLAY[cli]} session ended. Press Enter to return to the TUI ──"
