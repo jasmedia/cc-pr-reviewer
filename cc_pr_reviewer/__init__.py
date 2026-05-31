@@ -1552,10 +1552,16 @@ class BuiltPrompt:
     rereview: bool
     existing_shown: int
     existing_total: int
-    # ~4-chars/token estimate of `text`, surfaced so the launch path can
-    # log prompt size into `review_telemetry` without re-deriving it. A
-    # heuristic for trend-spotting, not a billing figure (see _approx_tokens).
-    approx_tokens: int
+
+    @property
+    def approx_tokens(self) -> int:
+        """~4-chars/token estimate of `text` for `review_telemetry`.
+
+        A computed property rather than a stored field so it can never
+        desync from `text`. A heuristic for trend-spotting, not a billing
+        figure (see `_approx_tokens`).
+        """
+        return _approx_tokens(self.text)
 
 
 def build_review_prompt(
@@ -1709,13 +1715,11 @@ def build_review_prompt(
                 post += POST_INLINE_REREVIEW_RESOLVE_SUFFIX
         sections.append(post)
 
-    text = PROMPT_SECTION_SEP.join(sections)
     return BuiltPrompt(
-        text=text,
+        text=PROMPT_SECTION_SEP.join(sections),
         rereview=rereview,
         existing_shown=shown,
         existing_total=len(existing),
-        approx_tokens=_approx_tokens(text),
     )
 
 
@@ -1865,13 +1869,23 @@ def _load_review_state(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
     return {r["pr_key"]: dict(r) for r in rows}
 
 
+def _utc_now_iso() -> str:
+    """Current UTC time as an ISO-8601 string with a `Z` suffix.
+
+    Centralises the `datetime.now(timezone.utc).isoformat().replace(...)`
+    idiom used by the review/telemetry/in-progress writers so the stored
+    timestamp format stays identical across all three tables.
+    """
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def _record_review(
     conn: sqlite3.Connection,
     pr_key: str,
     pr_updated_at: str,
     head_sha: str,
 ) -> dict[str, Any]:
-    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    now = _utc_now_iso()
     conn.execute(
         """
         INSERT INTO reviews (pr_key, count, last_reviewed_at, last_pr_updated_at, last_head_sha)
@@ -1893,7 +1907,7 @@ def _record_launch_telemetry(
     conn: sqlite3.Connection,
     *,
     pr_key: str,
-    cli: str,
+    cli: CliChoice,
     codegraph_tools: bool,
     affected_paths: int,
     existing_in_prompt: int,
@@ -1905,15 +1919,17 @@ def _record_launch_telemetry(
 ) -> None:
     """Append one best-effort row to `review_telemetry` (schema in `_open_review_db`).
 
-    "Best-effort" means it never lets telemetry break a review: by the time
-    this runs the CLI subprocess has already finished and recording the
-    outcome is strictly a side-benefit, so a failed INSERT is caught and
-    logged rather than propagated up through the launch path's `finally`.
-    Per the project's no-silent-failure rule it is NOT swallowed silently —
-    a dropped row prints a diagnostic — but it must not abort the launch or
-    mask an in-flight exception.
+    "Best-effort" means it never lets telemetry break a review: it runs after
+    the CLI subprocess has already returned, so recording the outcome is
+    strictly a side-benefit — a failed INSERT is caught and logged rather
+    than propagated, so it can't crash the launch handler. Per the project's
+    no-silent-failure rule the failure is NOT swallowed silently — a dropped
+    row prints a diagnostic. On error we also roll back, because `conn` is the
+    long-lived `self.review_db` shared with `_release_in_progress` (which
+    writes next): leaving a half-open failed transaction could disrupt that
+    follow-up write.
     """
-    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    now = _utc_now_iso()
     try:
         conn.execute(
             """
@@ -1939,6 +1955,10 @@ def _record_launch_telemetry(
         )
         conn.commit()
     except sqlite3.Error as e:
+        # Best-effort rollback so a failed INSERT doesn't leave a half-open
+        # transaction on the shared connection for the next writer.
+        with contextlib.suppress(sqlite3.Error):
+            conn.rollback()
         print(f"warning: failed to record launch telemetry for {pr_key}: {e}")
 
 
@@ -2094,7 +2114,7 @@ def _reserve_in_progress(
     """
     me_host = _APP_HOSTNAME
     me_pid = os.getpid()
-    started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    started_at = _utc_now_iso()
     me = InProgressHolder(pr_key=pr_key, pid=me_pid, hostname=me_host, started_at=started_at)
 
     def _do_insert() -> None:
@@ -3966,12 +3986,18 @@ class PRReviewer(App):
                 # binary-on-PATH) precondition as sync — without both, the
                 # affected-tests query can't run.
                 codegraph_affected_block = ""
-                affected_count = 0  # paths injected into the prompt; for telemetry
+                affected_count = 0  # paths actually injected into the prompt; for telemetry
                 if codegraph_present and codegraph_on_path:
                     print("Querying CodeGraph for tests affected by this PR's diff…")
                     affected = _collect_codegraph_affected(local_path, repo_full, number)
                     codegraph_affected_block = format_codegraph_affected_tests(affected)
-                    affected_count = len(affected)
+                    # Record what the agent actually saw, not the raw query
+                    # count: `format_codegraph_affected_tests` caps the block at
+                    # CODEGRAPH_AFFECTED_TESTS_CAP, so storing the uncapped
+                    # `len(affected)` would let `affected_paths` keep climbing
+                    # while `approx_prompt_tokens` plateaus — a spurious
+                    # decorrelation in the very cost analysis this column feeds.
+                    affected_count = min(len(affected), CODEGRAPH_AFFECTED_TESTS_CAP)
                     if codegraph_affected_block:
                         # Visible count: `_collect_codegraph_affected` now
                         # returns dedup'd output, so `len(affected)` matches
@@ -4112,6 +4138,26 @@ class PRReviewer(App):
                 rc = subprocess.call(cmd, cwd=local_path)
                 launch_duration = time.monotonic() - launch_start
 
+                # Append-only launch telemetry, recorded for EVERY exit
+                # (success AND rc != 0) so aborts/crashes stay visible in the
+                # data. Recorded BEFORE `_record_review` so that a failure in
+                # that UPSERT (which has no try/except of its own) can't drop
+                # this row. Best-effort: `_record_launch_telemetry` logs and
+                # swallows its own DB errors so it can't break the launch.
+                _record_launch_telemetry(
+                    self.review_db,
+                    pr_key=key,
+                    cli=cli,
+                    codegraph_tools=codegraph_tools_available,
+                    affected_paths=affected_count,
+                    existing_in_prompt=built.existing_shown,
+                    post_inline=post_inline,
+                    rereview=built.rereview,
+                    approx_prompt_tokens=built.approx_tokens,
+                    duration_seconds=launch_duration,
+                    exit_code=rc,
+                )
+
                 # Only count this as a review if the CLI exited cleanly.
                 # Ctrl-C, crashes, or a failed launch leave rc != 0;
                 # recording those would inflate the "Reviews" count and
@@ -4129,25 +4175,6 @@ class PRReviewer(App):
                         f"\n{_CLI_DISPLAY[cli]} exited with status {rc}; "
                         "not recording this as a review."
                     )
-
-                # Append-only launch telemetry, recorded for EVERY exit
-                # (including the rc != 0 paths above) so aborts/crashes stay
-                # visible in the data. Best-effort: `_record_launch_telemetry`
-                # logs and swallows its own DB errors so it can't break the
-                # launch or mask an exception unwinding through `finally`.
-                _record_launch_telemetry(
-                    self.review_db,
-                    pr_key=key,
-                    cli=cli,
-                    codegraph_tools=codegraph_tools_available,
-                    affected_paths=affected_count,
-                    existing_in_prompt=built.existing_shown,
-                    post_inline=post_inline,
-                    rereview=built.rereview,
-                    approx_prompt_tokens=built.approx_tokens,
-                    duration_seconds=launch_duration,
-                    exit_code=rc,
-                )
 
                 input(
                     f"\n── {_CLI_DISPLAY[cli]} session ended. Press Enter to return to the TUI ──"
