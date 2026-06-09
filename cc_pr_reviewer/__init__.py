@@ -410,19 +410,24 @@ def _cleanup_skills(manifest: _MaterialisedSkills) -> None:
 def _build_cli_command(cli: CliChoice, prompt_text: str) -> list[str]:
     """Build the subprocess argv for handing control to the selected CLI.
 
-    Flag picks mirror Claude's `--permission-mode acceptEdits` posture as
-    closely as each CLI permits — no approval prompts, edits allowed
-    inside the cloned PR workspace, but no broader host access:
+    Flag picks minimise manual permission prompts so the review runs
+    end-to-end with little intervention, while keeping edits scoped to the
+    cloned PR workspace and no broader host access:
 
-    * `claude --permission-mode acceptEdits` (unchanged).
+    * `claude --permission-mode auto`. Auto mode lets Claude Code's
+      classifier auto-approve the actions a review needs — edits plus the
+      `git`/`gh api …` bash calls the post-inline path runs — while still
+      gating genuinely risky operations. This is broader than the older
+      `acceptEdits` (which auto-approved edits but still prompted on every
+      bash command), so the reviewer isn't interrupted mid-run.
     * `codex --ask-for-approval never --sandbox workspace-write`. Picking
       `never` + `workspace-write` keeps the sandbox guard while skipping
       approval prompts. `--yolo` / `--dangerously-bypass-approvals-and-sandbox`
       is rejected because it also removes the sandbox — a behaviour shift
       vs the existing Claude flow.
     * `gemini --approval-mode auto_edit`. The `auto_edit` value is the
-      documented analogue of Claude's `acceptEdits` (auto-approve edits,
-      still gate risky operations). The older `--yolo` / `-y` flag is
+      documented analogue of auto-approving edits while still gating
+      risky operations. The older `--yolo` / `-y` flag is
       deprecated upstream in favour of `--approval-mode=yolo`.
 
     Only this function knows the flag surface — every other launch-path
@@ -430,7 +435,7 @@ def _build_cli_command(cli: CliChoice, prompt_text: str) -> list[str]:
     is a one-function change.
     """
     if cli == "claude":
-        return ["claude", "--permission-mode", "acceptEdits", prompt_text]
+        return ["claude", "--permission-mode", "auto", prompt_text]
     if cli == "codex":
         # `-c sandbox_workspace_write.network_access=true` keeps the
         # filesystem sandbox (writes scoped to the workspace) but
