@@ -48,6 +48,7 @@ from cc_pr_reviewer import (
     _cleanup_skills,
     _codegraph_mcp_registered,
     _first_available_cli,
+    _get_setting,
     _in_progress_age_str,
     _is_newer,
     _join_agents,
@@ -61,9 +62,12 @@ from cc_pr_reviewer import (
     _release_in_progress,
     _reserve_in_progress,
     _review_cell,
+    _set_setting,
     _skills_dir,
     build_review_prompt,
+    build_slack_payload,
     check_prereqs,
+    fetch_my_latest_review,
     format_codegraph_affected_tests,
     format_existing_comments,
     new_review_pr_keys,
@@ -2520,3 +2524,288 @@ def test_maybe_notify_ignores_mine_only_additions() -> None:
     assert fake.notifies == []
     # `_mine` rows are excluded from the baseline too.
     assert fake._seen_review_keys == {"o/r#1"}
+
+
+# --- Slack review notifications --------------------------------------------
+
+
+def test_build_slack_payload_approved_uses_handles_and_url() -> None:
+    payload = build_slack_payload(
+        repo="o/r",
+        number=7,
+        title="Add widget",
+        url="https://github.com/o/r/pull/7",
+        author_login="alice",
+        reviewer_login="bob",
+        state="APPROVED",
+    )
+    text = payload["text"]
+    assert "@bob" in text and "approved" in text
+    assert "o/r#7: Add widget" in text
+    assert "@alice" in text
+    assert "https://github.com/o/r/pull/7" in text
+
+
+@pytest.mark.parametrize(
+    ("state", "phrase"),
+    [
+        ("APPROVED", "approved"),
+        ("CHANGES_REQUESTED", "requested changes on"),
+        ("COMMENTED", "left comments on"),
+    ],
+)
+def test_build_slack_payload_verdict_phrasing(state: str, phrase: str) -> None:
+    payload = build_slack_payload(
+        repo="o/r",
+        number=1,
+        title="t",
+        url="u",
+        author_login="a",
+        reviewer_login="b",
+        state=state,
+    )
+    assert phrase in payload["text"]
+
+
+def test_build_slack_payload_unknown_state_still_notifies() -> None:
+    payload = build_slack_payload(
+        repo="o/r",
+        number=1,
+        title="t",
+        url="u",
+        author_login="a",
+        reviewer_login="b",
+        state="DISMISSED",
+    )
+    # Unknown states fall back to a generic line rather than being dropped.
+    assert "reviewed (dismissed)" in payload["text"]
+
+
+def test_build_slack_payload_missing_logins_degrade_gracefully() -> None:
+    payload = build_slack_payload(
+        repo="o/r",
+        number=1,
+        title="t",
+        url="u",
+        author_login=None,
+        reviewer_login=None,
+        state="APPROVED",
+    )
+    text = payload["text"]
+    assert "A reviewer" in text
+    assert "the author" in text
+    assert "@" not in text
+
+
+def test_slack_webhook_setting_round_trips_and_defaults_empty(review_db) -> None:
+    # Unset → empty (feature off).
+    assert _get_setting(review_db, "slack_webhook_url", "") == ""
+    url = "https://hooks.slack.com/services/T/B/x"
+    _set_setting(review_db, "slack_webhook_url", url)
+    assert _get_setting(review_db, "slack_webhook_url", "") == url
+    # Clearing it turns the feature back off.
+    _set_setting(review_db, "slack_webhook_url", "")
+    assert _get_setting(review_db, "slack_webhook_url", "") == ""
+
+
+def test_build_slack_payload_escapes_mrkdwn_special_chars_in_title() -> None:
+    payload = build_slack_payload(
+        repo="o/r",
+        number=1,
+        title="Fix <Foo> & <Bar>",
+        url="u",
+        author_login="a",
+        reviewer_login="b",
+        state="APPROVED",
+    )
+    text = payload["text"]
+    assert "Fix &lt;Foo&gt; &amp; &lt;Bar&gt;" in text
+    # The raw forms must not survive.
+    assert "<Foo>" not in text and " & " not in text
+
+
+class _RunReviews:
+    """Stub `cc_pr_reviewer.run` result carrying a crafted reviews payload."""
+
+    def __init__(self, *, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _reviews_json(*rows: dict[str, Any]) -> str:
+    return json.dumps(list(rows))
+
+
+def test_fetch_my_latest_review_selects_last_matching_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _reviews_json(
+        {"id": 1, "user": {"login": "me"}, "state": "COMMENTED", "submitted_at": "t1"},
+        {"id": 2, "user": {"login": "other"}, "state": "APPROVED", "submitted_at": "t2"},
+        {"id": 3, "user": {"login": "me"}, "state": "APPROVED", "submitted_at": "t3"},
+    )
+    monkeypatch.setattr(_mod, "run", lambda _cmd, **_kw: _RunReviews(stdout=payload))
+    got, ok = fetch_my_latest_review("o/r", 7, "me")
+    # Last chronological row authored by "me" wins; "other" is excluded.
+    assert ok is True
+    assert got == {"id": 3, "state": "APPROVED", "submitted_at": "t3"}
+
+
+def test_fetch_my_latest_review_ignores_non_verdict_states(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _reviews_json(
+        {"id": 1, "user": {"login": "me"}, "state": "COMMENTED", "submitted_at": "t1"},
+        {"id": 2, "user": {"login": "me"}, "state": "DISMISSED", "submitted_at": "t2"},
+        {"id": 3, "user": {"login": "me"}, "state": "PENDING", "submitted_at": "t3"},
+    )
+    monkeypatch.setattr(_mod, "run", lambda _cmd, **_kw: _RunReviews(stdout=payload))
+    got, ok = fetch_my_latest_review("o/r", 7, "me")
+    # DISMISSED/PENDING are skipped, so the COMMENTED row remains latest.
+    assert ok is True
+    assert got is not None and got["id"] == 1
+
+
+def test_fetch_my_latest_review_no_match_is_ok_with_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _reviews_json(
+        {"id": 1, "user": {"login": "other"}, "state": "APPROVED", "submitted_at": "t1"},
+    )
+    monkeypatch.setattr(_mod, "run", lambda _cmd, **_kw: _RunReviews(stdout=payload))
+    # Clean fetch, no review by us: ok=True so the caller treats it as a real
+    # "no prior review" baseline, not "couldn't tell".
+    assert fetch_my_latest_review("o/r", 7, "me") == (None, True)
+
+
+def test_fetch_my_latest_review_empty_login_is_not_ok(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _boom(_cmd: Any, **_kw: Any) -> Any:
+        raise AssertionError("run() should not be called for an empty login")
+
+    monkeypatch.setattr(_mod, "run", _boom)
+    assert fetch_my_latest_review("o/r", 7, "") == (None, False)
+
+
+def test_fetch_my_latest_review_api_failure_is_not_ok(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_mod, "run", lambda _cmd, **_kw: _RunReviews(returncode=1, stderr="boom"))
+    assert fetch_my_latest_review("o/r", 7, "me") == (None, False)
+
+
+def test_fetch_my_latest_review_non_list_payload_is_not_ok(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        _mod, "run", lambda _cmd, **_kw: _RunReviews(stdout='{"message": "Not Found"}')
+    )
+    assert fetch_my_latest_review("o/r", 7, "me") == (None, False)
+
+
+def _notify(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    post: dict[str, Any] | None,
+    post_ok: bool = True,
+    pre_review: dict[str, Any] | None,
+    pre_review_ok: bool = True,
+) -> list[tuple[str, dict[str, Any]]]:
+    """Invoke `_notify_review_to_slack` with stubbed I/O; return posted calls.
+
+    `post`/`post_ok` are what the (stubbed) post-session `fetch_my_latest_review`
+    returns; `pre_review`/`pre_review_ok` are the baseline passed in by the
+    caller.
+    """
+    posted: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(_mod, "fetch_my_latest_review", lambda *_a, **_k: (post, post_ok))
+    monkeypatch.setattr(
+        _mod, "_post_slack_webhook", lambda url, payload: posted.append((url, payload))
+    )
+    pr = {"title": "t", "url": "u", "author": {"login": "alice"}}
+    # The method touches no instance state, so a bare object stands in for self.
+    _mod.PRReviewer._notify_review_to_slack(
+        object(),
+        webhook_url="https://hook",
+        pr=pr,
+        repo="o/r",
+        number=7,
+        reviewer_login="me",
+        pre_review=pre_review,
+        pre_review_ok=pre_review_ok,
+    )
+    return posted
+
+
+def test_notify_posts_when_new_review_id_appears(monkeypatch: pytest.MonkeyPatch) -> None:
+    posted = _notify(
+        monkeypatch,
+        post={"id": 2, "state": "APPROVED", "submitted_at": "t2"},
+        pre_review={"id": 1, "state": "COMMENTED", "submitted_at": "t1"},
+    )
+    assert len(posted) == 1
+    assert "approved" in posted[0][1]["text"]
+
+
+def test_notify_posts_when_no_prior_review(monkeypatch: pytest.MonkeyPatch) -> None:
+    posted = _notify(
+        monkeypatch,
+        post={"id": 5, "state": "CHANGES_REQUESTED", "submitted_at": "t5"},
+        pre_review=None,
+    )
+    assert len(posted) == 1
+
+
+def test_notify_stays_quiet_when_id_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    posted = _notify(
+        monkeypatch,
+        post={"id": 1, "state": "APPROVED", "submitted_at": "t1"},
+        pre_review={"id": 1, "state": "APPROVED", "submitted_at": "t1"},
+    )
+    assert posted == []
+
+
+def test_notify_stays_quiet_when_no_review_found(monkeypatch: pytest.MonkeyPatch) -> None:
+    posted = _notify(monkeypatch, post=None, pre_review=None)
+    assert posted == []
+
+
+def test_notify_stays_quiet_when_post_lookup_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Post-session lookup failed (post_ok=False): we can't confirm a verdict,
+    # so nothing is announced even though a stale dict might be present.
+    posted = _notify(
+        monkeypatch,
+        post=None,
+        post_ok=False,
+        pre_review=None,
+    )
+    assert posted == []
+
+
+def test_notify_stays_quiet_when_baseline_unreliable(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The pre-session baseline couldn't be established (pre_review_ok=False),
+    # e.g. a transient API blip. Even though a pre-existing review is found
+    # post-session, we must NOT announce it as new.
+    posted = _notify(
+        monkeypatch,
+        post={"id": 99, "state": "APPROVED", "submitted_at": "t99"},
+        pre_review=None,
+        pre_review_ok=False,
+    )
+    assert posted == []
+
+
+def test_notify_stays_quiet_on_dismiss_revealing_older_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Baseline was the newest verdict (id=10, t10). It gets dismissed mid-session,
+    # so an older surviving review (id=5, t5) becomes "latest" — different id but
+    # an earlier timestamp, which must NOT trigger a spurious notification.
+    posted = _notify(
+        monkeypatch,
+        post={"id": 5, "state": "COMMENTED", "submitted_at": "t05"},
+        pre_review={"id": 10, "state": "APPROVED", "submitted_at": "t10"},
+    )
+    assert posted == []

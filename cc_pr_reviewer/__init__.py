@@ -65,6 +65,7 @@ from textual.widgets import (
     DataTable,
     Footer,
     Header,
+    Input,
     Label,
     Link,
     OptionList,
@@ -1048,6 +1049,142 @@ def _current_gh_login() -> str | None:
     login = r.stdout.strip() or None
     _GH_LOGIN = login
     return login
+
+
+def fetch_my_latest_review(
+    repo: str, number: int, login: str
+) -> tuple[dict[str, Any] | None, bool]:
+    """Most recent review *submitted by `login`* on PR `repo#number`.
+
+    Returns `(review, ok)`. `ok=False` (with a printed warning) means the
+    lookup couldn't be performed — empty login, non-zero exit, parse error, or
+    a non-list payload; `review` is `None` in that case. `ok=True` with
+    `review=None` means a clean fetch that found no submitted review by
+    `login`. `ok=True` with a dict gives `id`/`state`/`submitted_at` for the
+    latest submitted review (state ∈ {APPROVED, CHANGES_REQUESTED, COMMENTED};
+    PENDING/DISMISSED rows are skipped as non-verdicts).
+
+    The `ok` flag exists so a caller can distinguish "no prior review" from
+    "couldn't tell" — collapsing them (as an earlier version did) let a
+    transient pre-session API blip be read as "no baseline", which could then
+    fire a spurious notification for a pre-existing review. Mirrors
+    `fetch_existing_review_comments`'s `(value, ok)` shape.
+
+    Single page (`per_page=100`, GitHub's max) mirrors
+    `fetch_existing_review_comments` — a PR with >100 reviews by one user is
+    not a case worth paginating for, and `gh api --paginate` over an array
+    endpoint emits concatenated arrays that aren't valid JSON.
+    """
+    if not login:
+        # No `gh` login means we can't identify our own reviews at all — treat
+        # as "couldn't tell", not "no review", so the caller stays quiet.
+        print(f"warning: no gh login to match reviews for {repo}#{number} (Slack notify skipped)")
+        return None, False
+    r = run(["gh", "api", f"repos/{repo}/pulls/{number}/reviews?per_page=100"])
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout).strip() or f"exit {r.returncode}"
+        print(f"warning: couldn't fetch reviews for {repo}#{number} (Slack notify skipped): {err}")
+        return None, False
+    try:
+        reviews = json.loads(r.stdout)
+    except json.JSONDecodeError as e:
+        print(f"warning: couldn't parse reviews for {repo}#{number} (Slack notify skipped): {e}")
+        return None, False
+    if not isinstance(reviews, list):
+        print(f"warning: unexpected reviews payload for {repo}#{number} (Slack notify skipped)")
+        return None, False
+    latest: dict[str, Any] | None = None
+    for rv in reviews:
+        if not isinstance(rv, dict):
+            continue
+        if (rv.get("user") or {}).get("login") != login:
+            continue
+        if rv.get("state") not in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED"):
+            continue
+        # Reviews come back in chronological order, so the last match wins.
+        latest = {
+            "id": rv.get("id"),
+            "state": rv.get("state"),
+            "submitted_at": rv.get("submitted_at"),
+        }
+    return latest, True
+
+
+# Maps a GitHub review `state` to (emoji, human verdict) for the Slack message.
+# Falls back to a generic line for any unexpected state so the notification is
+# still sent rather than silently dropped.
+_REVIEW_STATE_VERDICT: dict[str, tuple[str, str]] = {
+    "APPROVED": ("✅", "approved"),
+    "CHANGES_REQUESTED": ("📝", "requested changes on"),
+    "COMMENTED": ("💬", "left comments on"),
+}
+
+
+def _slack_escape(s: str) -> str:
+    """Escape the three characters Slack treats specially in mrkdwn `text`.
+
+    Slack's incoming-webhook docs require `&`, `<`, `>` to be HTML-escaped so a
+    PR title like `Fix <Foo> & bar` renders verbatim instead of being parsed as
+    (or mangling) Slack markup. `&` must go first or the later replacements'
+    ampersands would be double-escaped.
+    """
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def build_slack_payload(
+    *,
+    repo: str,
+    number: int,
+    title: str,
+    url: str,
+    author_login: str | None,
+    reviewer_login: str | None,
+    state: str,
+) -> dict[str, Any]:
+    """Build the Slack incoming-webhook JSON body for a completed review.
+
+    Pure (no I/O) so the message wording is unit-testable. Posts plain text
+    to a shared channel: GitHub handles are rendered as `@handle` literal
+    text — NOT Slack `<@id>` mentions, which would need a login→Slack-id map
+    we deliberately don't maintain (issue #51 scoped this to plain text). The
+    user-controlled `title` is mrkdwn-escaped; the other fields are
+    structurally constrained (logins, `owner/name`, a GitHub URL) and need no
+    escaping.
+    """
+    emoji, verdict = _REVIEW_STATE_VERDICT.get(state, ("🔔", f"reviewed ({state.lower()})"))
+    reviewer = f"@{reviewer_login}" if reviewer_login else "A reviewer"
+    author = f"@{author_login}" if author_login else "the author"
+    safe_title = _slack_escape(title)
+    text = f"{emoji} {reviewer} {verdict} {repo}#{number}: {safe_title}\nAuthor: {author} — {url}"
+    return {"text": text}
+
+
+def _post_slack_webhook(webhook_url: str, payload: dict[str, Any]) -> None:
+    """POST `payload` as JSON to a Slack incoming webhook. Best-effort but loud.
+
+    A configured webhook that fails (network error, HTTP error, malformed URL)
+    prints a warning and returns — the notification is a side-benefit recorded
+    after the review subprocess already returned, so it must never crash the
+    launch handler. Reaching this function means the caller already confirmed a
+    non-empty URL, so a failure here is a real, surfaced error rather than the
+    intentional off-switch (which is an empty URL the caller never posts).
+
+    The `except (OSError, ValueError)` clause is what actually surfaces non-2xx
+    responses: `urlopen` follows 3xx and raises `HTTPError` (an `OSError`
+    subclass, like `URLError`) for 4xx/5xx, so the in-context status check is
+    just defensive belt-and-suspenders and rarely fires. `ValueError` covers a
+    malformed URL string.
+    """
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        webhook_url, data=data, headers={"Content-Type": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
+            if not (200 <= resp.status < 300):
+                print(f"warning: Slack webhook returned HTTP {resp.status}")
+    except (OSError, ValueError) as e:
+        print(f"warning: Slack notification failed: {e}")
 
 
 def fetch_existing_review_comments(repo: str, number: int) -> tuple[list[dict[str, Any]], bool]:
@@ -2886,6 +3023,64 @@ class FilterScreen(ModalScreen[FilterChoice | None]):
         self._refreshing = False
 
 
+@dataclass(frozen=True)
+class SettingsResult:
+    """Outcome of a saved SettingsScreen — distinct from cancel (None).
+
+    A dataclass rather than a bare string so the screen can grow more
+    settings without changing its dismiss contract. `slack_webhook_url` is
+    normalised to a stripped string; empty means "notifications off".
+    """
+
+    slack_webhook_url: str
+
+
+class SettingsScreen(ModalScreen[SettingsResult | None]):
+    """Edit persisted app settings.
+
+    Currently a single field: the Slack incoming-webhook URL used to announce
+    completed reviews to a shared channel. Dismisses with a SettingsResult on
+    save (Enter) or None on cancel (Esc).
+    """
+
+    AUTO_FOCUS = "#settings-slack"
+
+    BINDINGS = [
+        # `priority=True` so Enter/Esc win over the focused Input widget,
+        # which would otherwise consume Enter (Input.Submitted) before our
+        # save action runs.
+        Binding("enter", "save", "Save", priority=True),
+        Binding("escape", "cancel", "Cancel", priority=True),
+    ]
+
+    def __init__(self, slack_webhook_url: str):
+        super().__init__()
+        self.slack_webhook_url = slack_webhook_url
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(
+            Label("Settings", id="settings-title"),
+            Label(
+                "Slack webhook URL for review notifications (blank = off):",
+                id="settings-slack-label",
+            ),
+            Input(
+                value=self.slack_webhook_url,
+                placeholder="https://hooks.slack.com/services/…",
+                id="settings-slack",
+            ),
+            Label("[b]Enter[/] save • [b]Esc[/] cancel", id="settings-hint"),
+            id="settings-container",
+        )
+
+    def action_save(self) -> None:
+        value = self.query_one("#settings-slack", Input).value.strip()
+        self.dismiss(SettingsResult(slack_webhook_url=value))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 # --- Main app --------------------------------------------------------------
 
 
@@ -2983,7 +3178,8 @@ class PRReviewer(App):
     #diff-body {
         height: auto;
     }
-    #confirm-container, #filter-container, #inprogress-container {
+    #confirm-container, #filter-container, #inprogress-container,
+    #settings-container {
         border: round $primary;
         padding: 1 2;
         margin: 4 8;
@@ -2993,9 +3189,16 @@ class PRReviewer(App):
     #inprogress-container {
         border: round $warning;
     }
-    #confirm-title, #filter-title, #inprogress-title {
+    #confirm-title, #filter-title, #inprogress-title, #settings-title {
         text-style: bold;
         margin-bottom: 1;
+    }
+    #settings-slack-label {
+        color: $text-muted;
+    }
+    #settings-hint {
+        margin-top: 1;
+        color: $text-muted;
     }
     #inprogress-title {
         color: $warning;
@@ -3061,6 +3264,7 @@ class PRReviewer(App):
         Binding("c", "toggle_cli", "CLI"),
         Binding("x", "toggle_codegraph", "CodeGraph"),
         Binding("a", "cycle_refresh", "Auto-refresh"),
+        Binding("comma", "settings", "Settings"),
         Binding("u", "upgrade", "Upgrade"),
         Binding("q", "quit", "Quit"),
     ]
@@ -3095,6 +3299,11 @@ class PRReviewer(App):
         # both gate on existence regardless. Lives in `settings` so a user
         # who flips it on stays in helper mode across sessions.
         self.codegraph_assist: bool = _get_setting(self.review_db, "codegraph_assist", "0") == "1"
+        # Slack incoming-webhook URL for review-complete notifications. Empty
+        # means the feature is off — `_launch_claude` skips all Slack work
+        # (no extra `gh api` calls, no POST) when this is blank. Editable via
+        # the Settings modal (`,`).
+        self.slack_webhook_url: str = _get_setting(self.review_db, "slack_webhook_url", "")
         stored_cli = _get_setting(self.review_db, "cli", DEFAULT_CLI)
         persisted: CliChoice = stored_cli if stored_cli in _CLI_CYCLE else DEFAULT_CLI
         # If the persisted CLI isn't on PATH, fall back to whatever IS
@@ -3975,6 +4184,82 @@ class PRReviewer(App):
         self.repo_filter = value
         return True
 
+    def action_settings(self) -> None:
+        def _apply(result: SettingsResult | None) -> None:
+            if result is None:
+                return
+            # Persist first so session and disk can't diverge on a write
+            # failure; keep the prior value and warn if it fails.
+            try:
+                _set_setting(self.review_db, "slack_webhook_url", result.slack_webhook_url)
+            except sqlite3.Error as e:
+                self.notify(f"Couldn't save settings: {e}", severity="warning")
+                return
+            self.slack_webhook_url = result.slack_webhook_url
+            state = "on" if result.slack_webhook_url else "off"
+            self.notify(f"Slack review notifications {state}.", timeout=3)
+
+        self.push_screen(SettingsScreen(self.slack_webhook_url), _apply)
+
+    def _notify_review_to_slack(
+        self,
+        *,
+        webhook_url: str,
+        pr: dict[str, Any],
+        repo: str,
+        number: int,
+        reviewer_login: str | None,
+        pre_review: dict[str, Any] | None,
+        pre_review_ok: bool,
+    ) -> None:
+        """Announce a just-completed review to the configured Slack channel.
+
+        Called only on a clean exit with a webhook configured. Re-queries the
+        PR's reviews and notifies only when a *new* review (an id different
+        from the pre-session baseline) was submitted by the reviewer this
+        session — so quitting the agent without submitting anything, or a
+        re-review that added no new verdict, stays quiet. The whole path is
+        best-effort/loud: every step that can fail prints a warning and
+        returns without disturbing the launch flow.
+
+        `pre_review_ok` is the baseline's reliability flag from the pre-session
+        `fetch_my_latest_review`. When it's False the baseline couldn't be
+        established (a transient API blip or unknown login), so we can't prove
+        a review is *new* — we stay quiet rather than risk announcing a
+        pre-existing review. Worst case is one missed notification after a
+        transient failure, which is the safer direction than a false "reviewed".
+        """
+        if not pre_review_ok:
+            return
+        post, post_ok = fetch_my_latest_review(repo, number, reviewer_login or "")
+        if not post_ok or post is None:
+            # No review submitted by us this session, or the lookup failed
+            # (already warned). Either way there's nothing to announce.
+            return
+        if pre_review is not None:
+            if post.get("id") == pre_review.get("id"):
+                # Same review that existed before the session — no new verdict.
+                return
+            # Guard the dismiss edge: `fetch_my_latest_review` hides DISMISSED
+            # rows, so dismissing this session's newest verdict can make an
+            # *older* surviving review become "latest" with a different id —
+            # which the id check alone would mistake for a new submission. A
+            # genuinely new review must also be newer in time. (ISO-8601 `Z`
+            # timestamps compare correctly as plain strings.)
+            pre_ts, post_ts = pre_review.get("submitted_at"), post.get("submitted_at")
+            if pre_ts and post_ts and post_ts <= pre_ts:
+                return
+        payload = build_slack_payload(
+            repo=repo,
+            number=number,
+            title=pr.get("title", ""),
+            url=pr.get("url", ""),
+            author_login=(pr.get("author") or {}).get("login"),
+            reviewer_login=reviewer_login,
+            state=post.get("state", ""),
+        )
+        _post_slack_webhook(webhook_url, payload)
+
     # --- launching claude ---
 
     def _launch_claude(
@@ -4243,6 +4528,22 @@ class PRReviewer(App):
                 # `_current_gh_login` warning may have scrolled past during clone
                 # or checkout output.
                 my_login = _current_gh_login()
+
+                # Slack review-notification baseline: when a webhook is
+                # configured, snapshot our latest existing review (id +
+                # timestamp) BEFORE handing off so we can tell afterwards
+                # whether THIS session actually submitted a new review (vs a
+                # no-op exit or a re-review that changed nothing). Skipped
+                # entirely when no webhook is set, so the off case costs no
+                # extra `gh api` call.
+                slack_webhook = self.slack_webhook_url.strip()
+                pre_review: dict[str, Any] | None = None
+                pre_review_ok = False
+                if slack_webhook:
+                    pre_review, pre_review_ok = fetch_my_latest_review(
+                        repo_full, number, my_login or ""
+                    )
+
                 # Compose every signal the agent's session actually needs
                 # before promising MCP tools in the prompt suffix:
                 #   1. `.codegraph/` index exists in the workspace
@@ -4384,6 +4685,20 @@ class PRReviewer(App):
                         pr.get("updatedAt", ""),
                         head_sha,
                     )
+                    # Announce to Slack only after a clean exit, and only if a
+                    # webhook is configured. Runs here (still suspended) so any
+                    # warning prints to the session terminal; it's best-effort
+                    # and never blocks the return to the TUI.
+                    if slack_webhook:
+                        self._notify_review_to_slack(
+                            webhook_url=slack_webhook,
+                            pr=pr,
+                            repo=repo_full,
+                            number=number,
+                            reviewer_login=my_login,
+                            pre_review=pre_review,
+                            pre_review_ok=pre_review_ok,
+                        )
                 else:
                     print(
                         f"\n{_CLI_DISPLAY[cli]} exited with status {rc}; "
