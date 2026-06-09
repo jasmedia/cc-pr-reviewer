@@ -3829,10 +3829,20 @@ class PRReviewer(App):
         # `r` refresh stays available regardless.
         if self.screen is not self.screen_stack[0]:
             return
-        # `_load_prs` is `exclusive=True`, so a tick landing while a manual
-        # refresh is in flight is harmless. `auto=True` keeps the fetch
-        # silent (no status churn / error toast) and drives the new-PR
-        # notification + cursor preservation in `_populate`.
+        # Skip if a `_load_prs` is already in flight. It shares the
+        # `exclusive=True` group, so spawning here would CANCEL that worker
+        # — and `action_refresh` sets its "Refreshing…"/"…" placeholders
+        # *before* spawning, so cancelling a manual refresh whose auto
+        # replacement then fails (`auto=True` returns silently) would strand
+        # the UI on those placeholders until the next tick. Skipping is
+        # safe: the running load already refreshes the list. (`is_finished`
+        # is True for SUCCESS/ERROR/CANCELLED, so `not is_finished` matches
+        # only PENDING/RUNNING.)
+        if any(w.name == "_load_prs" and not w.is_finished for w in self.workers):
+            return
+        # `auto=True` keeps the fetch silent (no status churn / error toast)
+        # and drives the new-PR notification + cursor preservation in
+        # `_populate`.
         self._load_prs(auto=True)
 
     def _maybe_notify_codegraph_setup(self) -> None:
