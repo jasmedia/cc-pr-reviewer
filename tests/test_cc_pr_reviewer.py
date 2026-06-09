@@ -2435,3 +2435,88 @@ def test_parse_refresh_interval_honours_custom_default() -> None:
 )
 def test_refresh_interval_label(secs: int, label: str) -> None:
     assert _refresh_interval_label(secs) == label
+
+
+class _NotifyFake:
+    """Minimal stand-in for `PRReviewer` exercising `_maybe_notify_new_prs`
+    without any widget access — mirrors the dummy-harness pattern used by
+    `test_handle_poll_error_preserves_snapshot_and_dedupes_toast`."""
+
+    def __init__(self, seen: set[str] | None = None, first_load_done: bool = False) -> None:
+        self._seen_review_keys: set[str] = seen if seen is not None else set()
+        self._first_load_done = first_load_done
+        self.notifies: list[str] = []
+        self.bells = 0
+
+    def notify(self, message: str, **_kw: Any) -> None:
+        self.notifies.append(message)
+
+    def bell(self) -> None:
+        self.bells += 1
+
+
+def _maybe_notify(fake: _NotifyFake, data: list[dict[str, Any]], auto: bool) -> bool:
+    from cc_pr_reviewer import PRReviewer
+
+    return PRReviewer._maybe_notify_new_prs(fake, data, auto)  # type: ignore[arg-type]
+
+
+def test_maybe_notify_first_load_suppresses_and_seeds_baseline() -> None:
+    """First populate never toasts (every PR would look new) but must seed
+    the snapshot so the *next* tick has a baseline to diff against."""
+    fake = _NotifyFake(first_load_done=False)
+    data = [_pr("o/r", 1, "2025-01-01T00:00:00Z"), _pr("o/r", 2, "2025-01-02T00:00:00Z")]
+    fired = _maybe_notify(fake, data, auto=True)
+    assert fired is False
+    assert fake.notifies == []
+    assert fake.bells == 0
+    assert fake._seen_review_keys == {"o/r#1", "o/r#2"}
+    assert fake._first_load_done is True
+
+
+def test_maybe_notify_auto_tick_fires_once_for_new_pr() -> None:
+    fake = _NotifyFake(seen={"o/r#1"}, first_load_done=True)
+    data = [_pr("o/r", 1, "2025-01-01T00:00:00Z"), _pr("o/r", 2, "2025-01-02T00:00:00Z")]
+    fired = _maybe_notify(fake, data, auto=True)
+    assert fired is True
+    assert fake.notifies == ["1 new PR awaiting your review"]
+    assert fake.bells == 1
+    # Baseline now includes the freshly-seen PR…
+    assert fake._seen_review_keys == {"o/r#1", "o/r#2"}
+    # …so a steady-state re-tick with the same data is silent.
+    fake.notifies.clear()
+    fake.bells = 0
+    assert _maybe_notify(fake, data, auto=True) is False
+    assert fake.notifies == []
+    assert fake.bells == 0
+
+
+def test_maybe_notify_pluralises_multiple_new_prs() -> None:
+    fake = _NotifyFake(seen=set(), first_load_done=True)
+    data = [_pr("o/r", 1, "2025-01-01T00:00:00Z"), _pr("o/r", 2, "2025-01-02T00:00:00Z")]
+    assert _maybe_notify(fake, data, auto=True) is True
+    assert fake.notifies == ["2 new PRs awaiting your review"]
+
+
+def test_maybe_notify_manual_populate_is_silent_but_rebaselines() -> None:
+    """A non-auto populate (manual `r`, `m`/filter toggle) never toasts, but
+    still refreshes the snapshot so a later auto tick diffs against it."""
+    fake = _NotifyFake(seen={"o/r#1"}, first_load_done=True)
+    data = [_pr("o/r", 1, "2025-01-01T00:00:00Z"), _pr("o/r", 2, "2025-01-02T00:00:00Z")]
+    fired = _maybe_notify(fake, data, auto=False)
+    assert fired is False
+    assert fake.notifies == []
+    assert fake.bells == 0
+    assert fake._seen_review_keys == {"o/r#1", "o/r#2"}
+
+
+def test_maybe_notify_ignores_mine_only_additions() -> None:
+    fake = _NotifyFake(seen={"o/r#1"}, first_load_done=True)
+    mine = _pr("o/r", 9, "2025-01-03T00:00:00Z")
+    mine["_mine"] = True
+    data = [_pr("o/r", 1, "2025-01-01T00:00:00Z"), mine]
+    fired = _maybe_notify(fake, data, auto=True)
+    assert fired is False
+    assert fake.notifies == []
+    # `_mine` rows are excluded from the baseline too.
+    assert fake._seen_review_keys == {"o/r#1"}

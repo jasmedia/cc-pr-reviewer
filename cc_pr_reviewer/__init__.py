@@ -1768,9 +1768,9 @@ def new_review_pr_keys(previous: set[str], current_prs: list[dict[str, Any]]) ->
 
     `_mine=True` rows are excluded — only PRs actually requesting *your*
     review count as "new" for the auto-refresh notification, so flipping
-    the `m` toggle can never manufacture a phantom new-PR alert. Diffing
-    against a cumulative seen-set (rather than the immediately-prior tick)
-    means a PR already shown never re-notifies.
+    the `m` toggle can never manufacture a phantom new-PR alert. `previous`
+    is the last-fetched snapshot of review-PR keys, so a PR that is closed
+    and later re-requested legitimately re-notifies (it's a fresh request).
     """
     current = {_pr_key(p) for p in current_prs if not p.get("_mine")}
     return current - previous
@@ -3324,7 +3324,7 @@ class PRReviewer(App):
         # An auto tick populates quietly (suppress incidental warning
         # re-toasts) but still fires the explicit new-PR notification and
         # preserves the cursor — both keyed off `auto` in `_populate`.
-        self.call_from_thread(self._populate, data, mine_error, mine_warning, auto, auto)
+        self.call_from_thread(self._populate, data, mine_error, mine_warning, quiet=auto, auto=auto)
 
     def _filter_desc(self) -> str:
         return f" [repo={self.repo_filter}]" if self.repo_filter else ""
@@ -3348,22 +3348,10 @@ class PRReviewer(App):
         # the cursor back at row 0 mid-navigation. Read while `self.prs` /
         # `_row_to_pr_idx` still hold the OLD table state.
         prev_cursor_key = self._cursor_pr_key() if auto else None
-        # New-PR detection (issue #49): diff the current review-requested
-        # set against everything seen so far. Runs on every populate to keep
-        # the baseline current, but only an auto tick after the first load
-        # notifies — manual `r`, the `m`/filter toggles, and the very first
-        # load all re-baseline silently.
-        new_keys = new_review_pr_keys(self._seen_review_keys, data)
-        if auto and self._first_load_done and new_keys:
-            n = len(new_keys)
-            self.notify(
-                f"{n} new PR{'s' if n != 1 else ''} awaiting your review",
-                title="New review requests",
-                timeout=10,
-            )
-            self.bell()
-        self._seen_review_keys = {_pr_key(p) for p in data if not p.get("_mine")}
-        self._first_load_done = True
+        # New-PR detection + notification gating (issue #49). Extracted into
+        # `_maybe_notify_new_prs` so the gating predicate is unit-testable
+        # without driving the full widget-heavy `_populate`.
+        self._maybe_notify_new_prs(data, auto)
         self.prs = data
         # Count review-requested PRs separately from `_mine=True` rows so the
         # primary number reflects what the user actually has to act on. Append
@@ -3530,13 +3518,40 @@ class PRReviewer(App):
         if prev_cursor_key is not None:
             self._move_cursor_to_pr(prev_cursor_key)
 
+    def _maybe_notify_new_prs(self, data: list[dict[str, Any]], auto: bool) -> bool:
+        """Diff `data`'s review-requested PRs against the last-fetched
+        snapshot, toast + bell for any genuinely-new ones, then refresh the
+        snapshot. Notifies only on an auto tick after the first load — so
+        manual `r`, the `m`/filter toggles, and the very first load all
+        re-baseline silently (the first load would otherwise flag every PR
+        as new). Returns whether a notification fired. No widget access, so
+        it's exercisable with a light fake in tests.
+        """
+        new_keys = new_review_pr_keys(self._seen_review_keys, data)
+        fire = auto and self._first_load_done and bool(new_keys)
+        if fire:
+            n = len(new_keys)
+            self.notify(
+                f"{n} new PR{'s' if n != 1 else ''} awaiting your review",
+                title="New review requests",
+                timeout=10,
+            )
+            self.bell()
+        self._seen_review_keys = {_pr_key(p) for p in data if not p.get("_mine")}
+        self._first_load_done = True
+        return fire
+
     def _cursor_pr_key(self) -> tuple[str, int] | None:
         """Identity (repo, number) of the PR under the cursor, or None when
         the cursor is on a group header or the table is empty. Reads the
         current `self.prs` / `_row_to_pr_idx`, so call it BEFORE a rebuild."""
         table = self.query_one("#pr-table", DataTable)
-        if table.row_count and 0 <= (table.cursor_row or 0) < len(self._row_to_pr_idx):
-            idx = self._row_to_pr_idx[table.cursor_row]
+        # `cursor_row` can be None even with rows present (see `_selected`),
+        # so guard it explicitly rather than via `or 0` — the latter would
+        # pass the bounds check and then `_row_to_pr_idx[None]` would raise.
+        cursor_row = table.cursor_row
+        if cursor_row is not None and 0 <= cursor_row < len(self._row_to_pr_idx):
+            idx = self._row_to_pr_idx[cursor_row]
             if idx is not None:
                 p = self.prs[idx]
                 return (p["repository"]["nameWithOwner"], p["number"])
@@ -4014,11 +4029,6 @@ class PRReviewer(App):
                 )
 
         # Suspend the TUI so the coding-agent CLI can take over stdin/stdout.
-        # Pause auto-refresh for the duration of the suspended session so a
-        # background tick can't rebuild the table while the agent owns the
-        # TTY. Reset on every exit path below (reserve-abort return + the
-        # main finally).
-        self._suspended_for_review = True
         with self.suspend():
             WORKSPACE.mkdir(parents=True, exist_ok=True)
             print(f"\n── Reviewing {repo_full}#{number} with {_CLI_DISPLAY[cli]} ──\n")
@@ -4041,7 +4051,6 @@ class PRReviewer(App):
                     "override the new holder.\n"
                 )
                 input("Press Enter to return to the TUI…")
-                self._suspended_for_review = False
                 return
 
             # Captured here so the `finally` block can call `_cleanup_skills`
@@ -4050,6 +4059,14 @@ class PRReviewer(App):
             # restore.
             skills_manifest: _MaterialisedSkills | None = None
             try:
+                # Pause auto-refresh for the suspended session so a background
+                # tick can't rebuild the table while the agent owns the TTY.
+                # Set as the FIRST statement of this try so the `finally`
+                # below unconditionally clears it — keeping the flag scoped
+                # to a finally-guarded block is what prevents a permanent
+                # leak (a `mkdir`/`reserve` failure above never sets it, so
+                # auto-refresh can't silently die for the session).
+                self._suspended_for_review = True
                 if not local_path.exists():
                     print(f"Cloning {repo_full} → {local_path}…")
                     if subprocess.call(["gh", "repo", "clone", repo_full, str(local_path)]) != 0:
