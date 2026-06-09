@@ -1634,11 +1634,13 @@ def test_check_prereqs_flags_malformed_skill_md(
 # --- _build_cli_command ----------------------------------------------------
 
 
-def test_build_cli_command_claude_uses_accept_edits() -> None:
-    """The Claude flag set is unchanged from the original launcher — keep
-    the test explicit so a future flag rename doesn't slip through."""
+def test_build_cli_command_claude_uses_auto_permission_mode() -> None:
+    """Claude launches in `--permission-mode auto` so its classifier
+    auto-approves the edits and `git`/`gh api …` bash the review needs,
+    minimising mid-run permission prompts. Keep the test explicit so a
+    future flag rename doesn't slip through."""
     cmd = _build_cli_command("claude", "prompt body")
-    assert cmd == ["claude", "--permission-mode", "acceptEdits", "prompt body"]
+    assert cmd == ["claude", "--permission-mode", "auto", "prompt body"]
 
 
 def test_build_cli_command_codex_uses_sandbox_workspace_write() -> None:
@@ -1662,8 +1664,9 @@ def test_build_cli_command_codex_uses_sandbox_workspace_write() -> None:
 
 def test_build_cli_command_gemini_uses_auto_edit_approval_mode() -> None:
     """Gemini's `--approval-mode auto_edit` is the documented analogue of
-    Claude's `acceptEdits`. The deprecated `--yolo` / `-y` flag is
-    intentionally avoided in favour of the modern equivalent."""
+    auto-approving edits while still gating risky operations. The
+    deprecated `--yolo` / `-y` flag is intentionally avoided in favour of
+    the modern equivalent."""
     cmd = _build_cli_command("gemini", "prompt body")
     assert cmd == ["gemini", "--approval-mode", "auto_edit", "prompt body"]
 

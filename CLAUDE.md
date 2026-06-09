@@ -42,11 +42,11 @@ Three coding-agent CLIs are supported and switchable from the TUI: `claude` (Cla
 
 | CLI    | argv                                                                                                                       |
 | ------ | -------------------------------------------------------------------------------------------------------------------------- |
-| claude | `claude --permission-mode acceptEdits "<prompt>"`                                                                          |
+| claude | `claude --permission-mode auto "<prompt>"`                                                                                 |
 | codex  | `codex --ask-for-approval never --sandbox workspace-write -c sandbox_workspace_write.network_access=true "<prompt>"`       |
 | gemini | `gemini --approval-mode auto_edit "<prompt>"`                                                                              |
 
-All three auto-approve edits inside the workspace. For codex, `--yolo` is **rejected** because it removes the filesystem sandbox too; instead we override `sandbox_workspace_write.network_access=true` to restore network (the post-inline review path needs `gh api …`, which codex's workspace-write sandbox blocks by default). For gemini, the older `--yolo`/`-y` is **rejected** in favour of the modern `--approval-mode=yolo` (and we pick `auto_edit`, the documented analogue of Claude's `acceptEdits`).
+All three minimise manual permission prompts while keeping edits scoped to the workspace. Claude runs in `--permission-mode auto`: its classifier auto-approves the edits and `git`/`gh api …` bash a review needs (broader than the old `acceptEdits`, which auto-approved edits but still prompted on every bash command) while still gating genuinely risky operations. For codex, `--yolo` is **rejected** because it removes the filesystem sandbox too; instead we override `sandbox_workspace_write.network_access=true` to restore network (the post-inline review path needs `gh api …`, which codex's workspace-write sandbox blocks by default). For gemini, the older `--yolo`/`-y` is **rejected** in favour of the modern `--approval-mode=yolo` (and we pick `auto_edit`, the documented analogue of auto-approving edits).
 
 ### Things to know when editing
 
