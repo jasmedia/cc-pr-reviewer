@@ -2646,8 +2646,9 @@ def test_fetch_my_latest_review_selects_last_matching_verdict(
         {"id": 3, "user": {"login": "me"}, "state": "APPROVED", "submitted_at": "t3"},
     )
     monkeypatch.setattr(_mod, "run", lambda _cmd, **_kw: _RunReviews(stdout=payload))
-    got = fetch_my_latest_review("o/r", 7, "me")
+    got, ok = fetch_my_latest_review("o/r", 7, "me")
     # Last chronological row authored by "me" wins; "other" is excluded.
+    assert ok is True
     assert got == {"id": 3, "state": "APPROVED", "submitted_at": "t3"}
 
 
@@ -2660,56 +2661,66 @@ def test_fetch_my_latest_review_ignores_non_verdict_states(
         {"id": 3, "user": {"login": "me"}, "state": "PENDING", "submitted_at": "t3"},
     )
     monkeypatch.setattr(_mod, "run", lambda _cmd, **_kw: _RunReviews(stdout=payload))
-    got = fetch_my_latest_review("o/r", 7, "me")
+    got, ok = fetch_my_latest_review("o/r", 7, "me")
     # DISMISSED/PENDING are skipped, so the COMMENTED row remains latest.
+    assert ok is True
     assert got is not None and got["id"] == 1
 
 
-def test_fetch_my_latest_review_no_match_returns_none(
+def test_fetch_my_latest_review_no_match_is_ok_with_none(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     payload = _reviews_json(
         {"id": 1, "user": {"login": "other"}, "state": "APPROVED", "submitted_at": "t1"},
     )
     monkeypatch.setattr(_mod, "run", lambda _cmd, **_kw: _RunReviews(stdout=payload))
-    assert fetch_my_latest_review("o/r", 7, "me") is None
+    # Clean fetch, no review by us: ok=True so the caller treats it as a real
+    # "no prior review" baseline, not "couldn't tell".
+    assert fetch_my_latest_review("o/r", 7, "me") == (None, True)
 
 
-def test_fetch_my_latest_review_empty_login_skips_query(
+def test_fetch_my_latest_review_empty_login_is_not_ok(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def _boom(_cmd: Any, **_kw: Any) -> Any:
         raise AssertionError("run() should not be called for an empty login")
 
     monkeypatch.setattr(_mod, "run", _boom)
-    assert fetch_my_latest_review("o/r", 7, "") is None
+    assert fetch_my_latest_review("o/r", 7, "") == (None, False)
 
 
-def test_fetch_my_latest_review_api_failure_returns_none(
+def test_fetch_my_latest_review_api_failure_is_not_ok(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(_mod, "run", lambda _cmd, **_kw: _RunReviews(returncode=1, stderr="boom"))
-    assert fetch_my_latest_review("o/r", 7, "me") is None
+    assert fetch_my_latest_review("o/r", 7, "me") == (None, False)
 
 
-def test_fetch_my_latest_review_non_list_payload_returns_none(
+def test_fetch_my_latest_review_non_list_payload_is_not_ok(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
         _mod, "run", lambda _cmd, **_kw: _RunReviews(stdout='{"message": "Not Found"}')
     )
-    assert fetch_my_latest_review("o/r", 7, "me") is None
+    assert fetch_my_latest_review("o/r", 7, "me") == (None, False)
 
 
 def _notify(
     monkeypatch: pytest.MonkeyPatch,
     *,
     post: dict[str, Any] | None,
+    post_ok: bool = True,
     pre_review: dict[str, Any] | None,
+    pre_review_ok: bool = True,
 ) -> list[tuple[str, dict[str, Any]]]:
-    """Invoke `_notify_review_to_slack` with stubbed I/O; return posted calls."""
+    """Invoke `_notify_review_to_slack` with stubbed I/O; return posted calls.
+
+    `post`/`post_ok` are what the (stubbed) post-session `fetch_my_latest_review`
+    returns; `pre_review`/`pre_review_ok` are the baseline passed in by the
+    caller.
+    """
     posted: list[tuple[str, dict[str, Any]]] = []
-    monkeypatch.setattr(_mod, "fetch_my_latest_review", lambda *_a, **_k: post)
+    monkeypatch.setattr(_mod, "fetch_my_latest_review", lambda *_a, **_k: (post, post_ok))
     monkeypatch.setattr(
         _mod, "_post_slack_webhook", lambda url, payload: posted.append((url, payload))
     )
@@ -2723,6 +2734,7 @@ def _notify(
         number=7,
         reviewer_login="me",
         pre_review=pre_review,
+        pre_review_ok=pre_review_ok,
     )
     return posted
 
@@ -2757,6 +2769,31 @@ def test_notify_stays_quiet_when_id_unchanged(monkeypatch: pytest.MonkeyPatch) -
 
 def test_notify_stays_quiet_when_no_review_found(monkeypatch: pytest.MonkeyPatch) -> None:
     posted = _notify(monkeypatch, post=None, pre_review=None)
+    assert posted == []
+
+
+def test_notify_stays_quiet_when_post_lookup_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Post-session lookup failed (post_ok=False): we can't confirm a verdict,
+    # so nothing is announced even though a stale dict might be present.
+    posted = _notify(
+        monkeypatch,
+        post=None,
+        post_ok=False,
+        pre_review=None,
+    )
+    assert posted == []
+
+
+def test_notify_stays_quiet_when_baseline_unreliable(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The pre-session baseline couldn't be established (pre_review_ok=False),
+    # e.g. a transient API blip. Even though a pre-existing review is found
+    # post-session, we must NOT announce it as new.
+    posted = _notify(
+        monkeypatch,
+        post={"id": 99, "state": "APPROVED", "submitted_at": "t99"},
+        pre_review=None,
+        pre_review_ok=False,
+    )
     assert posted == []
 
 

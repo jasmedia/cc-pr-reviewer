@@ -1051,16 +1051,24 @@ def _current_gh_login() -> str | None:
     return login
 
 
-def fetch_my_latest_review(repo: str, number: int, login: str) -> dict[str, Any] | None:
-    """Most recent review *submitted by `login`* on PR `repo#number`, or None.
+def fetch_my_latest_review(
+    repo: str, number: int, login: str
+) -> tuple[dict[str, Any] | None, bool]:
+    """Most recent review *submitted by `login`* on PR `repo#number`.
 
-    Returns a dict with `id`/`state`/`submitted_at` for the latest submitted
-    review authored by `login` (state ∈ {APPROVED, CHANGES_REQUESTED,
-    COMMENTED}); PENDING/DISMISSED rows are ignored because they don't
-    represent a delivered verdict. None means "no such review" OR a lookup
-    failure — the two are deliberately collapsed because both lead the caller
-    to the same decision (no Slack notification). A failure is NOT silent: it
-    prints a warning, per the no-silent-failure rule.
+    Returns `(review, ok)`. `ok=False` (with a printed warning) means the
+    lookup couldn't be performed — empty login, non-zero exit, parse error, or
+    a non-list payload; `review` is `None` in that case. `ok=True` with
+    `review=None` means a clean fetch that found no submitted review by
+    `login`. `ok=True` with a dict gives `id`/`state`/`submitted_at` for the
+    latest submitted review (state ∈ {APPROVED, CHANGES_REQUESTED, COMMENTED};
+    PENDING/DISMISSED rows are skipped as non-verdicts).
+
+    The `ok` flag exists so a caller can distinguish "no prior review" from
+    "couldn't tell" — collapsing them (as an earlier version did) let a
+    transient pre-session API blip be read as "no baseline", which could then
+    fire a spurious notification for a pre-existing review. Mirrors
+    `fetch_existing_review_comments`'s `(value, ok)` shape.
 
     Single page (`per_page=100`, GitHub's max) mirrors
     `fetch_existing_review_comments` — a PR with >100 reviews by one user is
@@ -1068,20 +1076,23 @@ def fetch_my_latest_review(repo: str, number: int, login: str) -> dict[str, Any]
     endpoint emits concatenated arrays that aren't valid JSON.
     """
     if not login:
-        return None
+        # No `gh` login means we can't identify our own reviews at all — treat
+        # as "couldn't tell", not "no review", so the caller stays quiet.
+        print(f"warning: no gh login to match reviews for {repo}#{number} (Slack notify skipped)")
+        return None, False
     r = run(["gh", "api", f"repos/{repo}/pulls/{number}/reviews?per_page=100"])
     if r.returncode != 0:
         err = (r.stderr or r.stdout).strip() or f"exit {r.returncode}"
         print(f"warning: couldn't fetch reviews for {repo}#{number} (Slack notify skipped): {err}")
-        return None
+        return None, False
     try:
         reviews = json.loads(r.stdout)
     except json.JSONDecodeError as e:
         print(f"warning: couldn't parse reviews for {repo}#{number} (Slack notify skipped): {e}")
-        return None
+        return None, False
     if not isinstance(reviews, list):
         print(f"warning: unexpected reviews payload for {repo}#{number} (Slack notify skipped)")
-        return None
+        return None, False
     latest: dict[str, Any] | None = None
     for rv in reviews:
         if not isinstance(rv, dict):
@@ -1096,7 +1107,7 @@ def fetch_my_latest_review(repo: str, number: int, login: str) -> dict[str, Any]
             "state": rv.get("state"),
             "submitted_at": rv.get("submitted_at"),
         }
-    return latest
+    return latest, True
 
 
 # Maps a GitHub review `state` to (emoji, human verdict) for the Slack message.
@@ -1160,9 +1171,9 @@ def _post_slack_webhook(webhook_url: str, payload: dict[str, Any]) -> None:
 
     The `except (OSError, ValueError)` clause is what actually surfaces non-2xx
     responses: `urlopen` follows 3xx and raises `HTTPError` (an `OSError`
-    subclass, like `URLError`) for 4xx/5xx, so the in-context `status >= 300`
-    branch is just defensive belt-and-suspenders and rarely fires. `ValueError`
-    covers a malformed URL string.
+    subclass, like `URLError`) for 4xx/5xx, so the in-context status check is
+    just defensive belt-and-suspenders and rarely fires. `ValueError` covers a
+    malformed URL string.
     """
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
@@ -1170,7 +1181,7 @@ def _post_slack_webhook(webhook_url: str, payload: dict[str, Any]) -> None:
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
-            if resp.status >= 300:
+            if not (200 <= resp.status < 300):
                 print(f"warning: Slack webhook returned HTTP {resp.status}")
     except (OSError, ValueError) as e:
         print(f"warning: Slack notification failed: {e}")
@@ -4199,6 +4210,7 @@ class PRReviewer(App):
         number: int,
         reviewer_login: str | None,
         pre_review: dict[str, Any] | None,
+        pre_review_ok: bool,
     ) -> None:
         """Announce a just-completed review to the configured Slack channel.
 
@@ -4209,9 +4221,18 @@ class PRReviewer(App):
         re-review that added no new verdict, stays quiet. The whole path is
         best-effort/loud: every step that can fail prints a warning and
         returns without disturbing the launch flow.
+
+        `pre_review_ok` is the baseline's reliability flag from the pre-session
+        `fetch_my_latest_review`. When it's False the baseline couldn't be
+        established (a transient API blip or unknown login), so we can't prove
+        a review is *new* — we stay quiet rather than risk announcing a
+        pre-existing review. Worst case is one missed notification after a
+        transient failure, which is the safer direction than a false "reviewed".
         """
-        post = fetch_my_latest_review(repo, number, reviewer_login or "")
-        if post is None:
+        if not pre_review_ok:
+            return
+        post, post_ok = fetch_my_latest_review(repo, number, reviewer_login or "")
+        if not post_ok or post is None:
             # No review submitted by us this session, or the lookup failed
             # (already warned). Either way there's nothing to announce.
             return
@@ -4517,8 +4538,11 @@ class PRReviewer(App):
                 # extra `gh api` call.
                 slack_webhook = self.slack_webhook_url.strip()
                 pre_review: dict[str, Any] | None = None
+                pre_review_ok = False
                 if slack_webhook:
-                    pre_review = fetch_my_latest_review(repo_full, number, my_login or "")
+                    pre_review, pre_review_ok = fetch_my_latest_review(
+                        repo_full, number, my_login or ""
+                    )
 
                 # Compose every signal the agent's session actually needs
                 # before promising MCP tools in the prompt suffix:
@@ -4673,6 +4697,7 @@ class PRReviewer(App):
                             number=number,
                             reviewer_login=my_login,
                             pre_review=pre_review,
+                            pre_review_ok=pre_review_ok,
                         )
                 else:
                     print(
