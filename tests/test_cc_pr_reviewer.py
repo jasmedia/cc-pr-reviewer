@@ -57,6 +57,7 @@ from cc_pr_reviewer import (
     _parse_semver,
     _pid_alive,
     _record_launch_telemetry,
+    _refresh_interval_label,
     _release_in_progress,
     _reserve_in_progress,
     _review_cell,
@@ -65,6 +66,8 @@ from cc_pr_reviewer import (
     check_prereqs,
     format_codegraph_affected_tests,
     format_existing_comments,
+    new_review_pr_keys,
+    parse_refresh_interval,
 )
 
 # --- build_review_prompt ---------------------------------------------------
@@ -2359,3 +2362,76 @@ def test_handle_poll_error_preserves_snapshot_and_dedupes_toast() -> None:
     # Toast fired exactly once thanks to the dedupe latch.
     assert d.notifies == ["In-progress poll failed: boom"]
     assert d._poll_error_shown is True
+
+
+# --- auto-refresh (issue #49) ----------------------------------------------
+
+
+def test_new_review_pr_keys_empty_previous_reports_all() -> None:
+    """First-load scenario: with nothing seen yet, every review PR is 'new'.
+    (The caller suppresses the toast on first load; the helper still reports
+    them so the baseline can be seeded.)"""
+    prs = [_pr("o/r", 1, "2025-01-01T00:00:00Z"), _pr("o/r", 2, "2025-01-02T00:00:00Z")]
+    assert new_review_pr_keys(set(), prs) == {"o/r#1", "o/r#2"}
+
+
+def test_new_review_pr_keys_steady_state_reports_none() -> None:
+    """A tick that surfaces only already-seen PRs returns nothing — no
+    re-notify spam every interval."""
+    prs = [_pr("o/r", 1, "2025-01-01T00:00:00Z"), _pr("o/r", 2, "2025-01-02T00:00:00Z")]
+    assert new_review_pr_keys({"o/r#1", "o/r#2"}, prs) == set()
+
+
+def test_new_review_pr_keys_reports_only_the_addition() -> None:
+    prs = [_pr("o/r", 1, "2025-01-01T00:00:00Z"), _pr("o/r", 2, "2025-01-02T00:00:00Z")]
+    assert new_review_pr_keys({"o/r#1"}, prs) == {"o/r#2"}
+
+
+def test_new_review_pr_keys_excludes_mine_rows() -> None:
+    """A newly-appearing `_mine=True` row is not a 'new review request' —
+    flipping the `m` toggle must never manufacture a phantom alert."""
+    mine = _pr("o/r", 9, "2025-01-03T00:00:00Z")
+    mine["_mine"] = True
+    prs = [_pr("o/r", 1, "2025-01-01T00:00:00Z"), mine]
+    assert new_review_pr_keys({"o/r#1"}, prs) == set()
+
+
+def test_new_review_pr_keys_ignores_removals() -> None:
+    """A PR present in `previous` but gone from the current list (merged/
+    closed) is not reported — we only flag additions."""
+    prs = [_pr("o/r", 1, "2025-01-01T00:00:00Z")]
+    assert new_review_pr_keys({"o/r#1", "o/r#2"}, prs) == set()
+
+
+def test_new_review_pr_keys_distinguishes_repos_with_same_number() -> None:
+    prs = [_pr("o/a", 1, "2025-01-01T00:00:00Z"), _pr("o/b", 1, "2025-01-01T00:00:00Z")]
+    assert new_review_pr_keys({"o/a#1"}, prs) == {"o/b#1"}
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("3600", 3600),
+        ("5400", 5400),
+        ("", _mod._DEFAULT_REFRESH_SECS),
+        ("abc", _mod._DEFAULT_REFRESH_SECS),
+        ("0", 0),
+        ("-5", 0),
+        ("10", 60),  # clamped to the 60s floor
+        ("60", 60),
+    ],
+)
+def test_parse_refresh_interval(raw: str, expected: int) -> None:
+    assert parse_refresh_interval(raw) == expected
+
+
+def test_parse_refresh_interval_honours_custom_default() -> None:
+    assert parse_refresh_interval("nonsense", default=900) == 900
+
+
+@pytest.mark.parametrize(
+    "secs,label",
+    [(0, "off"), (-1, "off"), (900, "15m"), (1800, "30m"), (3600, "1h"), (90, "90s")],
+)
+def test_refresh_interval_label(secs: int, label: str) -> None:
+    assert _refresh_interval_label(secs) == label

@@ -59,6 +59,7 @@ from textual.containers import Vertical, VerticalScroll
 from textual.content import Content
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen
+from textual.timer import Timer
 from textual.widgets import (
     Checkbox,
     DataTable,
@@ -634,6 +635,15 @@ _GROUP_CYCLE: dict[GroupBy, GroupBy] = {"": "repo", "repo": "author", "author": 
 # GraphQL query); "updated" sorts the merged list by `updatedAt` descending.
 SortBy = Literal["", "updated"]
 _SORT_CYCLE: dict[SortBy, SortBy] = {"": "updated", "updated": ""}
+
+# Auto-refresh interval cycle (seconds): off → 15m → 30m → 1h → off. The
+# `a` footer key cycles through these. Same single-source-of-truth pattern
+# as the group/sort cycles. `parse_refresh_interval` clamps any
+# hand-edited stored value and `action_cycle_refresh` falls back to the
+# first enabled step for a stored value not on the cycle. Default is 1h —
+# the issue-#49 ask is to refresh the list hourly out of the box.
+_DEFAULT_REFRESH_SECS = 3600
+_REFRESH_CYCLE: dict[int, int] = {0: 900, 900: 1800, 1800: 3600, 3600: 0}
 
 # Which coding-agent CLI to hand the review off to. Single source of truth
 # for the cycle order (footer-key `c` and the modal Ctrl+L override both
@@ -1751,6 +1761,46 @@ def humanise(iso: str) -> str:
 
 def _pr_key(pr: dict[str, Any]) -> str:
     return f"{pr['repository']['nameWithOwner']}#{pr['number']}"
+
+
+def new_review_pr_keys(previous: set[str], current_prs: list[dict[str, Any]]) -> set[str]:
+    """PR keys among the current review-requested PRs that aren't in `previous`.
+
+    `_mine=True` rows are excluded — only PRs actually requesting *your*
+    review count as "new" for the auto-refresh notification, so flipping
+    the `m` toggle can never manufacture a phantom new-PR alert. Diffing
+    against a cumulative seen-set (rather than the immediately-prior tick)
+    means a PR already shown never re-notifies.
+    """
+    current = {_pr_key(p) for p in current_prs if not p.get("_mine")}
+    return current - previous
+
+
+def parse_refresh_interval(raw: str, default: int = _DEFAULT_REFRESH_SECS) -> int:
+    """Parse a stored auto-refresh interval (seconds).
+
+    Non-numeric input falls back to `default`; `0`/negative disables the
+    timer (returns 0); positive values are floored at 60s so a hand-edited
+    tiny value can't hammer `gh`.
+    """
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return default
+    if v <= 0:
+        return 0
+    return max(v, 60)
+
+
+def _refresh_interval_label(secs: int) -> str:
+    """Human label for the footer/notify (`off` / `15m` / `1h`)."""
+    if secs <= 0:
+        return "off"
+    if secs % 3600 == 0:
+        return f"{secs // 3600}h"
+    if secs % 60 == 0:
+        return f"{secs // 60}m"
+    return f"{secs}s"
 
 
 def _open_review_db() -> sqlite3.Connection:
@@ -3010,6 +3060,7 @@ class PRReviewer(App):
         Binding("s", "toggle_sort", "Sort by"),
         Binding("c", "toggle_cli", "CLI"),
         Binding("x", "toggle_codegraph", "CodeGraph"),
+        Binding("a", "cycle_refresh", "Auto-refresh"),
         Binding("u", "upgrade", "Upgrade"),
         Binding("q", "quit", "Quit"),
     ]
@@ -3086,6 +3137,22 @@ class PRReviewer(App):
         # render-toggle calls of `_populate` so a previously-shown ERROR
         # badge isn't silently dropped when the user presses `g`.
         self._last_mine_error: str | None = None
+        # --- auto-refresh (issue #49) ---
+        # Periodically refetch the PR list; on a tick that surfaces
+        # review-requested PRs not seen before, notify the user.
+        self._auto_refresh_secs: int = parse_refresh_interval(
+            _get_setting(self.review_db, "refresh_interval", str(_DEFAULT_REFRESH_SECS))
+        )
+        self._auto_refresh_timer: Timer | None = None
+        # Cumulative set of review-PR keys already shown, so a steady-state
+        # tick doesn't re-notify and only genuinely-new PRs fire a toast.
+        self._seen_review_keys: set[str] = set()
+        # Suppress the new-PR notification on the very first populate — every
+        # PR would otherwise look "new". Set True at the end of `_populate`.
+        self._first_load_done: bool = False
+        # Set around `_launch_claude`'s suspend window so an auto-refresh
+        # tick doesn't rebuild the table while the agent owns the TTY.
+        self._suspended_for_review: bool = False
 
     def compose(self) -> ComposeResult:
         yield HeaderWithChangelog(show_clock=True)
@@ -3166,6 +3233,8 @@ class PRReviewer(App):
         # within one tick) and cheap enough to be invisible — one small
         # SELECT plus a bounded scan over `_row_to_pr_idx` per tick.
         self.set_interval(3.0, self._poll_in_progress)
+        # Periodic auto-refresh (issue #49). No-op when disabled (interval 0).
+        self._start_auto_refresh_timer()
         if self.installed_version is None:
             # Source/editable install: nothing to compare against on PyPI, so
             # skip the worker and surface a tailored message via `u`.
@@ -3189,6 +3258,7 @@ class PRReviewer(App):
         # consuming a separate status-bar slot.
         self._set_footer_active("c", self.cli != DEFAULT_CLI)
         self._set_footer_active("x", self.codegraph_assist)
+        self._set_footer_active("a", self._auto_refresh_secs > 0)
 
     def _set_footer_active(self, key: str, active: bool, retries: int = 2) -> None:
         """Toggle the `-state-active` CSS class on the FooterKey for `key`.
@@ -3214,11 +3284,17 @@ class PRReviewer(App):
         self._load_prs()
 
     @work(thread=True, exclusive=True)
-    def _load_prs(self) -> None:
+    def _load_prs(self, auto: bool = False) -> None:
         repo = self.repo_filter
         try:
             data = fetch_review_prs(repo)
         except Exception as e:  # noqa: BLE001
+            # A background auto-refresh tick fails silently: keep the last
+            # good list, status, and count rather than clobbering the view
+            # with an error the user didn't ask for. The next tick (or a
+            # manual `r`) recovers.
+            if auto:
+                return
             self.call_from_thread(self._set_status, f"Error fetching review PRs: {e}", True)
             # Without this, the "…" placeholder set by `action_refresh` /
             # `action_toggle_mine` would linger forever — the user can't
@@ -3245,7 +3321,10 @@ class PRReviewer(App):
                     continue
                 pr["_mine"] = True
                 data.append(pr)
-        self.call_from_thread(self._populate, data, mine_error, mine_warning)
+        # An auto tick populates quietly (suppress incidental warning
+        # re-toasts) but still fires the explicit new-PR notification and
+        # preserves the cursor — both keyed off `auto` in `_populate`.
+        self.call_from_thread(self._populate, data, mine_error, mine_warning, auto, auto)
 
     def _filter_desc(self) -> str:
         return f" [repo={self.repo_filter}]" if self.repo_filter else ""
@@ -3262,7 +3341,29 @@ class PRReviewer(App):
         mine_error: str | None = None,
         mine_warning: str | None = None,
         quiet: bool = False,
+        auto: bool = False,
     ) -> None:
+        # Capture the cursor's PR identity before the rebuild so an auto
+        # refresh (a background tick the user didn't trigger) doesn't park
+        # the cursor back at row 0 mid-navigation. Read while `self.prs` /
+        # `_row_to_pr_idx` still hold the OLD table state.
+        prev_cursor_key = self._cursor_pr_key() if auto else None
+        # New-PR detection (issue #49): diff the current review-requested
+        # set against everything seen so far. Runs on every populate to keep
+        # the baseline current, but only an auto tick after the first load
+        # notifies — manual `r`, the `m`/filter toggles, and the very first
+        # load all re-baseline silently.
+        new_keys = new_review_pr_keys(self._seen_review_keys, data)
+        if auto and self._first_load_done and new_keys:
+            n = len(new_keys)
+            self.notify(
+                f"{n} new PR{'s' if n != 1 else ''} awaiting your review",
+                title="New review requests",
+                timeout=10,
+            )
+            self.bell()
+        self._seen_review_keys = {_pr_key(p) for p in data if not p.get("_mine")}
+        self._first_load_done = True
         self.prs = data
         # Count review-requested PRs separately from `_mine=True` rows so the
         # primary number reflects what the user actually has to act on. Append
@@ -3423,6 +3524,34 @@ class PRReviewer(App):
             "•  g: group  •  s: sort  •  r: refresh  •  u: upgrade  •  q: quit",
             error=bool(mine_error),
         )
+        # Restore the cursor onto the PR it was on before an auto rebuild.
+        # A no-op if the PR is gone (merged/closed) — cursor stays at the
+        # default top row.
+        if prev_cursor_key is not None:
+            self._move_cursor_to_pr(prev_cursor_key)
+
+    def _cursor_pr_key(self) -> tuple[str, int] | None:
+        """Identity (repo, number) of the PR under the cursor, or None when
+        the cursor is on a group header or the table is empty. Reads the
+        current `self.prs` / `_row_to_pr_idx`, so call it BEFORE a rebuild."""
+        table = self.query_one("#pr-table", DataTable)
+        if table.row_count and 0 <= (table.cursor_row or 0) < len(self._row_to_pr_idx):
+            idx = self._row_to_pr_idx[table.cursor_row]
+            if idx is not None:
+                p = self.prs[idx]
+                return (p["repository"]["nameWithOwner"], p["number"])
+        return None
+
+    def _move_cursor_to_pr(self, prev_key: tuple[str, int]) -> None:
+        """Seek the cursor to the row whose PR matches `prev_key`, if present."""
+        table = self.query_one("#pr-table", DataTable)
+        for row, idx in enumerate(self._row_to_pr_idx):
+            if idx is None:
+                continue
+            p = self.prs[idx]
+            if (p["repository"]["nameWithOwner"], p["number"]) == prev_key:
+                table.move_cursor(row=row)
+                break
 
     def _selected(self) -> dict[str, Any] | None:
         table = self.query_one("#pr-table", DataTable)
@@ -3644,6 +3773,53 @@ class PRReviewer(App):
         # common toggle case is still quiet.
         self._maybe_notify_codegraph_setup()
 
+    def action_cycle_refresh(self) -> None:
+        # Cycle the auto-refresh interval (off → 15m → 30m → 1h → off),
+        # persist it, rebuild the timer, and update the footer indicator.
+        # `.get` fallback covers a hand-edited stored value not on the
+        # cycle (e.g. a clamped 120s) — land on the first enabled step.
+        nxt = _REFRESH_CYCLE.get(self._auto_refresh_secs, _REFRESH_CYCLE[0])
+        self._auto_refresh_secs = nxt
+        try:
+            _set_setting(self.review_db, "refresh_interval", str(nxt))
+        except sqlite3.Error as e:
+            self.notify(f"Couldn't persist auto-refresh toggle: {e}", severity="warning")
+        self.notify(f"Auto-refresh: {_refresh_interval_label(nxt)}", timeout=3)
+        self._refresh_footer_indicators()
+        self._start_auto_refresh_timer()
+
+    def _start_auto_refresh_timer(self) -> None:
+        """(Re)create the auto-refresh timer from `self._auto_refresh_secs`.
+
+        Stops any existing timer first so cycling the interval doesn't leak
+        overlapping timers; a non-positive interval leaves it disabled.
+        """
+        if self._auto_refresh_timer is not None:
+            self._auto_refresh_timer.stop()
+            self._auto_refresh_timer = None
+        if self._auto_refresh_secs > 0:
+            self._auto_refresh_timer = self.set_interval(
+                self._auto_refresh_secs, self._auto_refresh_tick
+            )
+
+    def _auto_refresh_tick(self) -> None:
+        # Skip while a review has the TUI suspended — the agent owns the
+        # TTY, and a background rebuild would be invisible and could race
+        # the post-review refresh. The next tick after the user returns
+        # picks it up.
+        if self._suspended_for_review:
+            return
+        # Skip while a modal (confirm / filter / diff) is on top so an auto
+        # rebuild doesn't yank the cursor out from under a dialog. Manual
+        # `r` refresh stays available regardless.
+        if self.screen is not self.screen_stack[0]:
+            return
+        # `_load_prs` is `exclusive=True`, so a tick landing while a manual
+        # refresh is in flight is harmless. `auto=True` keeps the fetch
+        # silent (no status churn / error toast) and drives the new-PR
+        # notification + cursor preservation in `_populate`.
+        self._load_prs(auto=True)
+
     def _maybe_notify_codegraph_setup(self) -> None:
         """Per-invocation: surface a warning if CodeGraph is installed but
         the active CLI isn't wired up. Silent for `not-installed` (don't
@@ -3838,6 +4014,11 @@ class PRReviewer(App):
                 )
 
         # Suspend the TUI so the coding-agent CLI can take over stdin/stdout.
+        # Pause auto-refresh for the duration of the suspended session so a
+        # background tick can't rebuild the table while the agent owns the
+        # TTY. Reset on every exit path below (reserve-abort return + the
+        # main finally).
+        self._suspended_for_review = True
         with self.suspend():
             WORKSPACE.mkdir(parents=True, exist_ok=True)
             print(f"\n── Reviewing {repo_full}#{number} with {_CLI_DISPLAY[cli]} ──\n")
@@ -3860,6 +4041,7 @@ class PRReviewer(App):
                     "override the new holder.\n"
                 )
                 input("Press Enter to return to the TUI…")
+                self._suspended_for_review = False
                 return
 
             # Captured here so the `finally` block can call `_cleanup_skills`
@@ -4197,6 +4379,11 @@ class PRReviewer(App):
                 if skills_manifest is not None:
                     _cleanup_skills(skills_manifest)
                 _release_in_progress(self.review_db, key)
+                # Re-enable auto-refresh ticks now the agent has handed the
+                # TTY back. In the inner finally (still inside `suspend()`)
+                # so it's cleared by the time the TUI resumes regardless of
+                # how the session ended (clean exit, Ctrl-C, crash).
+                self._suspended_for_review = False
 
         # Refresh in case review state changed (e.g. you approved the PR).
         self.action_refresh()
