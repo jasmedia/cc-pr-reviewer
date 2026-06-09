@@ -4,6 +4,37 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0] — 2026-06-09
+
+### Added
+- **Slack notifications on a completed review** (issue #51). After a
+  *clean* CLI exit (`rc == 0`), the app can announce the finished review
+  to a shared Slack channel via an incoming webhook. Gated entirely on
+  the `slack_webhook_url` setting (edited in the Settings modal, `,`):
+  blank = off, and when off no Slack work runs at all (no extra
+  `gh api`, no POST). The verdict is ground-truthed from GitHub, not
+  inferred — `fetch_my_latest_review` reads the latest *submitted*
+  review (`APPROVED`/`CHANGES_REQUESTED`/`COMMENTED`) authored by the
+  current `gh` user. To avoid pinging on no-op exits, the app snapshots
+  that review *before* the session and only posts when a *new*, *later*
+  review appears afterward, so quitting without submitting (or a
+  re-review that adds no verdict) stays quiet. `build_slack_payload` is
+  pure and unit-tested, rendering **plain text** — GitHub handles as
+  `@handle` literals, deliberately not Slack `<@id>` mentions (no
+  login→Slack-id map is maintained). `_post_slack_webhook` uses stdlib
+  `urllib` (no new dependency) and is best-effort/loud: a configured
+  webhook that fails to POST prints a warning but never breaks the
+  launch.
+
+### Fixed
+- Guarded the Slack notify path against an **unreliable pre-session
+  baseline** — if the pre-review snapshot couldn't be fetched
+  (`pre_review_ok=False`), the app stays quiet rather than risk
+  announcing a pre-existing review after a transient blip. The new-id
+  check is also paired with a `submitted_at` recency check so dismissing
+  this session's verdict — which can surface an *older* surviving review
+  as "latest" — doesn't fire a false notification.
+
 ## [0.16.0] — 2026-06-09
 
 ### Added
@@ -779,6 +810,7 @@ Initial release.
 - Prereq checks for `gh`, `claude`, `git`, and the **PR Review Toolkit**
   Claude Code plugin.
 
+[0.17.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.17.0
 [0.16.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.16.0
 [0.15.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.15.0
 [0.14.1]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.14.1
