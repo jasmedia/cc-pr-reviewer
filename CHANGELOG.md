@@ -4,6 +4,50 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.0] — 2026-06-09
+
+### Added
+- **Auto-refresh the PR list and notify on new review requests**
+  (issue #49). A new `a` footer key cycles the refresh interval
+  (`off → 15m → 30m → 1h → off`, persisted under `refresh_interval`
+  in the `settings` table, following the same cycle-dict
+  single-source-of-truth pattern as group/sort/CLI). The timer reuses
+  the existing `set_interval` + `_load_prs` worker path; a tick skips
+  while a review has the TUI suspended or a modal is open, so a
+  background rebuild can't yank the table out from under the agent or
+  a dialog. When a tick surfaces review-requested PRs not seen before,
+  the app toasts and rings the terminal bell. New-PR detection is a
+  pure helper (`new_review_pr_keys`) that diffs the current review set
+  against a *cumulative* seen-set — so a PR already shown never
+  re-notifies — and excludes `_mine` rows so flipping the `m` toggle
+  can't manufacture a phantom alert. First load, manual refresh, and
+  filter/mine toggles re-baseline silently. Auto refreshes fail
+  silently (keep the last-good list) and preserve the cursor across
+  the background rebuild. `parse_refresh_interval` floors any
+  hand-edited stored value at 60s so a tiny value can't hammer `gh`,
+  and `action_cycle_refresh` falls back to the first enabled step for
+  a stored value off the cycle. Covered by 11 new unit tests for the
+  pure helpers.
+
+### Fixed
+- An auto-refresh tick can no longer cancel an in-flight **manual**
+  refresh — the two now compose instead of the background timer
+  clobbering a user-initiated reload.
+
+## [0.15.0] — 2026-06-09
+
+### Changed
+- **Reviews now launch Claude in `--permission-mode auto`** (was
+  `acceptEdits`; closes #50). Auto mode's classifier auto-approves the
+  edits *and* the `git`/`gh api …` bash a review needs — including the
+  post-inline comment-publishing path — while still gating genuinely
+  risky operations, so the reviewer isn't interrupted mid-run.
+  `acceptEdits` auto-approved edits but still prompted on every bash
+  command. Claude-only — the codex/gemini argv surfaces are unchanged.
+  Note: `auto` requires a recent Claude Code build (`claude --help`
+  should list `auto` among the `--permission-mode` choices; older
+  builds error at launch) — flagged in the README prerequisites.
+
 ## [0.14.1] — 2026-05-31
 
 ### Added
@@ -735,6 +779,13 @@ Initial release.
 - Prereq checks for `gh`, `claude`, `git`, and the **PR Review Toolkit**
   Claude Code plugin.
 
+[0.16.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.16.0
+[0.15.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.15.0
+[0.14.1]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.14.1
+[0.14.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.14.0
+[0.13.2]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.13.2
+[0.13.1]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.13.1
+[0.13.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.13.0
 [0.12.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.12.0
 [0.11.1]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.11.1
 [0.11.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.11.0
