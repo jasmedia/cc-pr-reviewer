@@ -48,6 +48,7 @@ from cc_pr_reviewer import (
     _cleanup_skills,
     _codegraph_mcp_registered,
     _first_available_cli,
+    _get_setting,
     _in_progress_age_str,
     _is_newer,
     _join_agents,
@@ -61,8 +62,10 @@ from cc_pr_reviewer import (
     _release_in_progress,
     _reserve_in_progress,
     _review_cell,
+    _set_setting,
     _skills_dir,
     build_review_prompt,
+    build_slack_payload,
     check_prereqs,
     format_codegraph_affected_tests,
     format_existing_comments,
@@ -2520,3 +2523,85 @@ def test_maybe_notify_ignores_mine_only_additions() -> None:
     assert fake.notifies == []
     # `_mine` rows are excluded from the baseline too.
     assert fake._seen_review_keys == {"o/r#1"}
+
+
+# --- Slack review notifications --------------------------------------------
+
+
+def test_build_slack_payload_approved_uses_handles_and_url() -> None:
+    payload = build_slack_payload(
+        repo="o/r",
+        number=7,
+        title="Add widget",
+        url="https://github.com/o/r/pull/7",
+        author_login="alice",
+        reviewer_login="bob",
+        state="APPROVED",
+    )
+    text = payload["text"]
+    assert "@bob" in text and "approved" in text
+    assert "o/r#7: Add widget" in text
+    assert "@alice" in text
+    assert "https://github.com/o/r/pull/7" in text
+
+
+@pytest.mark.parametrize(
+    ("state", "phrase"),
+    [
+        ("APPROVED", "approved"),
+        ("CHANGES_REQUESTED", "requested changes on"),
+        ("COMMENTED", "left comments on"),
+    ],
+)
+def test_build_slack_payload_verdict_phrasing(state: str, phrase: str) -> None:
+    payload = build_slack_payload(
+        repo="o/r",
+        number=1,
+        title="t",
+        url="u",
+        author_login="a",
+        reviewer_login="b",
+        state=state,
+    )
+    assert phrase in payload["text"]
+
+
+def test_build_slack_payload_unknown_state_still_notifies() -> None:
+    payload = build_slack_payload(
+        repo="o/r",
+        number=1,
+        title="t",
+        url="u",
+        author_login="a",
+        reviewer_login="b",
+        state="DISMISSED",
+    )
+    # Unknown states fall back to a generic line rather than being dropped.
+    assert "reviewed (dismissed)" in payload["text"]
+
+
+def test_build_slack_payload_missing_logins_degrade_gracefully() -> None:
+    payload = build_slack_payload(
+        repo="o/r",
+        number=1,
+        title="t",
+        url="u",
+        author_login=None,
+        reviewer_login=None,
+        state="APPROVED",
+    )
+    text = payload["text"]
+    assert "A reviewer" in text
+    assert "the author" in text
+    assert "@" not in text
+
+
+def test_slack_webhook_setting_round_trips_and_defaults_empty(review_db) -> None:
+    # Unset → empty (feature off).
+    assert _get_setting(review_db, "slack_webhook_url", "") == ""
+    url = "https://hooks.slack.com/services/T/B/x"
+    _set_setting(review_db, "slack_webhook_url", url)
+    assert _get_setting(review_db, "slack_webhook_url", "") == url
+    # Clearing it turns the feature back off.
+    _set_setting(review_db, "slack_webhook_url", "")
+    assert _get_setting(review_db, "slack_webhook_url", "") == ""
