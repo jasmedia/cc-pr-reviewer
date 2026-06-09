@@ -1109,6 +1109,17 @@ _REVIEW_STATE_VERDICT: dict[str, tuple[str, str]] = {
 }
 
 
+def _slack_escape(s: str) -> str:
+    """Escape the three characters Slack treats specially in mrkdwn `text`.
+
+    Slack's incoming-webhook docs require `&`, `<`, `>` to be HTML-escaped so a
+    PR title like `Fix <Foo> & bar` renders verbatim instead of being parsed as
+    (or mangling) Slack markup. `&` must go first or the later replacements'
+    ampersands would be double-escaped.
+    """
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def build_slack_payload(
     *,
     repo: str,
@@ -1124,28 +1135,34 @@ def build_slack_payload(
     Pure (no I/O) so the message wording is unit-testable. Posts plain text
     to a shared channel: GitHub handles are rendered as `@handle` literal
     text — NOT Slack `<@id>` mentions, which would need a login→Slack-id map
-    we deliberately don't maintain (issue #51 scoped this to plain text).
+    we deliberately don't maintain (issue #51 scoped this to plain text). The
+    user-controlled `title` is mrkdwn-escaped; the other fields are
+    structurally constrained (logins, `owner/name`, a GitHub URL) and need no
+    escaping.
     """
     emoji, verdict = _REVIEW_STATE_VERDICT.get(state, ("🔔", f"reviewed ({state.lower()})"))
     reviewer = f"@{reviewer_login}" if reviewer_login else "A reviewer"
     author = f"@{author_login}" if author_login else "the author"
-    text = f"{emoji} {reviewer} {verdict} {repo}#{number}: {title}\nAuthor: {author} — {url}"
+    safe_title = _slack_escape(title)
+    text = f"{emoji} {reviewer} {verdict} {repo}#{number}: {safe_title}\nAuthor: {author} — {url}"
     return {"text": text}
 
 
 def _post_slack_webhook(webhook_url: str, payload: dict[str, Any]) -> None:
     """POST `payload` as JSON to a Slack incoming webhook. Best-effort but loud.
 
-    A configured webhook that fails (network, non-2xx, malformed URL) prints a
-    warning and returns — the notification is a side-benefit recorded after the
-    review subprocess already returned, so it must never crash the launch
-    handler. Reaching this function means the caller already confirmed a
+    A configured webhook that fails (network error, HTTP error, malformed URL)
+    prints a warning and returns — the notification is a side-benefit recorded
+    after the review subprocess already returned, so it must never crash the
+    launch handler. Reaching this function means the caller already confirmed a
     non-empty URL, so a failure here is a real, surfaced error rather than the
     intentional off-switch (which is an empty URL the caller never posts).
 
-    `urllib.error.URLError`/`HTTPError` both subclass `OSError`, so catching
-    `OSError` covers transport/HTTP failures; `ValueError` covers a malformed
-    URL string.
+    The `except (OSError, ValueError)` clause is what actually surfaces non-2xx
+    responses: `urlopen` follows 3xx and raises `HTTPError` (an `OSError`
+    subclass, like `URLError`) for 4xx/5xx, so the in-context `status >= 300`
+    branch is just defensive belt-and-suspenders and rarely fires. `ValueError`
+    covers a malformed URL string.
     """
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
@@ -4181,7 +4198,7 @@ class PRReviewer(App):
         repo: str,
         number: int,
         reviewer_login: str | None,
-        pre_review_id: Any,
+        pre_review: dict[str, Any] | None,
     ) -> None:
         """Announce a just-completed review to the configured Slack channel.
 
@@ -4198,9 +4215,19 @@ class PRReviewer(App):
             # No review submitted by us this session, or the lookup failed
             # (already warned). Either way there's nothing to announce.
             return
-        if post.get("id") == pre_review_id:
-            # Same review that existed before the session — no new verdict.
-            return
+        if pre_review is not None:
+            if post.get("id") == pre_review.get("id"):
+                # Same review that existed before the session — no new verdict.
+                return
+            # Guard the dismiss edge: `fetch_my_latest_review` hides DISMISSED
+            # rows, so dismissing this session's newest verdict can make an
+            # *older* surviving review become "latest" with a different id —
+            # which the id check alone would mistake for a new submission. A
+            # genuinely new review must also be newer in time. (ISO-8601 `Z`
+            # timestamps compare correctly as plain strings.)
+            pre_ts, post_ts = pre_review.get("submitted_at"), post.get("submitted_at")
+            if pre_ts and post_ts and post_ts <= pre_ts:
+                return
         payload = build_slack_payload(
             repo=repo,
             number=number,
@@ -4482,16 +4509,16 @@ class PRReviewer(App):
                 my_login = _current_gh_login()
 
                 # Slack review-notification baseline: when a webhook is
-                # configured, capture the id of our latest existing review
-                # BEFORE handing off so we can tell afterwards whether THIS
-                # session actually submitted a new review (vs a no-op exit or
-                # a re-review that changed nothing). Skipped entirely when no
-                # webhook is set, so the off case costs no extra `gh api` call.
+                # configured, snapshot our latest existing review (id +
+                # timestamp) BEFORE handing off so we can tell afterwards
+                # whether THIS session actually submitted a new review (vs a
+                # no-op exit or a re-review that changed nothing). Skipped
+                # entirely when no webhook is set, so the off case costs no
+                # extra `gh api` call.
                 slack_webhook = self.slack_webhook_url.strip()
-                pre_review_id: Any = None
+                pre_review: dict[str, Any] | None = None
                 if slack_webhook:
                     pre_review = fetch_my_latest_review(repo_full, number, my_login or "")
-                    pre_review_id = pre_review.get("id") if pre_review else None
 
                 # Compose every signal the agent's session actually needs
                 # before promising MCP tools in the prompt suffix:
@@ -4645,7 +4672,7 @@ class PRReviewer(App):
                             repo=repo_full,
                             number=number,
                             reviewer_login=my_login,
-                            pre_review_id=pre_review_id,
+                            pre_review=pre_review,
                         )
                 else:
                     print(
