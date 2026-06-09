@@ -50,6 +50,10 @@ refuses to launch until they're satisfied.
      check fires at *launch* time (not startup), so you can still start
      the TUI even if the plugin is missing — you'd just see a clear toast
      when you try to review with Claude. Codex/Gemini are unaffected.
+     Reviews launch Claude with `--permission-mode auto`, so you need a
+     Claude Code version that supports that mode (run `claude --help` and
+     check the `--permission-mode` choices include `auto` — older builds
+     will error at launch).
    - **OpenAI Codex CLI** (`codex`) — <https://github.com/openai/codex>
    - **Google Gemini CLI** (`gemini`) — <https://github.com/google-gemini/gemini-cli>
 
@@ -157,7 +161,7 @@ All three are launched in modes that minimise manual permission prompts
 while keeping edits scoped to the cloned PR workspace. Claude's `auto`
 mode lets its classifier auto-approve the edits and `git`/`gh api …` bash
 the review needs (broader than the old `acceptEdits`, which still
-prompted on every command); Codex and Gemini auto-accept edits as closely
+prompted on every bash command); Codex and Gemini auto-accept edits as closely
 as each permits. For Codex, `sandbox_workspace_write` blocks
 network by default; the `-c sandbox_workspace_write.network_access=true`
 override restores it so the post-inline review path can reach GitHub
