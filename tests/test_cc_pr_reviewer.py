@@ -51,7 +51,6 @@ from cc_pr_reviewer import (
     ReviewInProgressError,
     SettingsScreen,
     _approx_tokens,
-    _badge_style,
     _build_cli_command,
     _check_codegraph_setup,
     _cleanup_skills,
@@ -76,7 +75,6 @@ from cc_pr_reviewer import (
     _skills_dir,
     build_review_prompt,
     build_slack_payload,
-    build_state_badges,
     check_prereqs,
     fetch_my_latest_review,
     format_codegraph_affected_tests,
@@ -2547,59 +2545,53 @@ def test_refresh_interval_label(secs: int, label: str) -> None:
     assert _refresh_interval_label(secs) == label
 
 
-# --- build_state_badges ----------------------------------------------------
-
-_DEFAULT_BADGE_STATE: dict[str, Any] = {
-    "include_mine": False,
-    "repo_filter": None,
-    "group_by": "",
-    "sort_by": "",
-    "cli": "claude",
-    "codegraph_assist": False,
-    "auto_refresh_secs": 0,
-}
+# --- format_title (header is title-only; no subtitle) ----------------------
 
 
-def test_build_state_badges_all_default_is_empty() -> None:
-    """Every state at its default contributes no badge → clean subtitle."""
-    assert build_state_badges(**_DEFAULT_BADGE_STATE) == ""
+def test_format_title_renders_title_only() -> None:
+    """The header shows just `CC PR Reviewer [count]` — no subtitle text."""
+    content = _mod.PRReviewer.format_title(None, "CC PR Reviewer [3]", "")  # type: ignore[arg-type]
+    assert content.plain == "CC PR Reviewer [3]"
+
+
+def test_format_title_ignores_any_subtitle() -> None:
+    """Even a non-empty sub_title is dropped — locks the no-subtitle contract."""
+    content = _mod.PRReviewer.format_title(  # type: ignore[arg-type]
+        None, "CC PR Reviewer [3]", "Review Github PRs · mine"
+    )
+    assert content.plain == "CC PR Reviewer [3]"
+
+
+# --- footer active-highlight predicate -------------------------------------
+
+
+class _FooterStateFake:
+    """Minimal stand-in carrying just the toggle state `_footer_action_active`
+    reads — mirrors the unbound-method dummy-harness pattern used elsewhere."""
+
+    def __init__(self, *, include_mine: bool, group_by: str, sort_by: str) -> None:
+        self.include_mine = include_mine
+        self.group_by = group_by
+        self.sort_by = sort_by
 
 
 @pytest.mark.parametrize(
-    "override,expected",
+    "state,action,expected",
     [
-        ({"include_mine": True}, "mine"),
-        ({"repo_filter": "owner/repo"}, "repo:owner/repo"),
-        ({"group_by": "repo"}, "group:repo"),
-        ({"sort_by": "updated"}, "sort:updated"),
-        ({"cli": "codex"}, "cli:Codex"),
-        ({"codegraph_assist": True}, "codegraph"),
-        ({"auto_refresh_secs": 900}, "auto:15m"),
-        # The default CLI never shows a badge — only a non-default one does.
-        ({"cli": "claude"}, ""),
-        # An empty (but non-None) repo filter is a reachable state and must
-        # not render a badge — locks the truthiness contract for `str | None`.
-        ({"repo_filter": ""}, ""),
+        # Each toggle lights up only when its own state is non-default.
+        ({"include_mine": True, "group_by": "", "sort_by": ""}, "toggle_mine", True),
+        ({"include_mine": False, "group_by": "", "sort_by": ""}, "toggle_mine", False),
+        ({"include_mine": False, "group_by": "repo", "sort_by": ""}, "toggle_group", True),
+        ({"include_mine": False, "group_by": "", "sort_by": ""}, "toggle_group", False),
+        ({"include_mine": False, "group_by": "", "sort_by": "updated"}, "toggle_sort", True),
+        ({"include_mine": False, "group_by": "", "sort_by": ""}, "toggle_sort", False),
+        # Unrelated / non-toggle footer keys never highlight.
+        ({"include_mine": True, "group_by": "repo", "sort_by": "updated"}, "refresh", False),
     ],
 )
-def test_build_state_badges_single(override: dict[str, Any], expected: str) -> None:
-    assert build_state_badges(**{**_DEFAULT_BADGE_STATE, **override}) == expected
-
-
-def test_build_state_badges_combined_order() -> None:
-    """Active states join with ` · ` in a stable, readable order."""
-    badges = build_state_badges(
-        include_mine=True,
-        repo_filter="o/x",
-        group_by="author",
-        sort_by="updated",
-        cli="gemini",
-        codegraph_assist=True,
-        auto_refresh_secs=3600,
-    )
-    assert badges == (
-        "mine · repo:o/x · group:author · sort:updated · cli:Gemini · codegraph · auto:1h"
-    )
+def test_footer_action_active(state: dict[str, Any], action: str, expected: bool) -> None:
+    fake = _FooterStateFake(**state)
+    assert _mod.PRReviewer._footer_action_active(fake, action) is expected  # type: ignore[arg-type]
 
 
 # --- auto-refresh Settings dropdown (regression: PR #56 P0 crash) -----------
@@ -2842,19 +2834,6 @@ def test_branded_theme_is_offered_and_default() -> None:
     assert CLAUDE_THEME.name == CLAUDE_THEME_NAME
     assert CLAUDE_THEME_NAME in _THEME_OPTIONS
     assert DEFAULT_THEME == CLAUDE_THEME_NAME
-
-
-def test_badge_style_maps_tokens_and_falls_back_to_dim() -> None:
-    # Bare tokens and key:value badges both key off the part before `:`.
-    assert _badge_style("mine") == "$accent"
-    assert _badge_style("repo:owner/x") == "$accent"
-    assert _badge_style("group:repo") == "$primary"
-    assert _badge_style("sort:updated") == "$primary"
-    assert _badge_style("cli:Codex") == "$warning"
-    assert _badge_style("codegraph") == "$success"
-    assert _badge_style("auto:1h") == "$success"
-    # Unknown token → neutral dim, never unstyled.
-    assert _badge_style("future:thing") == "dim"
 
 
 def test_build_slack_payload_escapes_mrkdwn_special_chars_in_title() -> None:
