@@ -67,6 +67,7 @@ from cc_pr_reviewer import (
     _skills_dir,
     build_review_prompt,
     build_slack_payload,
+    build_state_badges,
     check_prereqs,
     fetch_my_latest_review,
     format_codegraph_affected_tests,
@@ -2535,6 +2536,58 @@ def test_parse_refresh_interval_honours_custom_default() -> None:
 )
 def test_refresh_interval_label(secs: int, label: str) -> None:
     assert _refresh_interval_label(secs) == label
+
+
+# --- build_state_badges ----------------------------------------------------
+
+_DEFAULT_BADGE_STATE: dict[str, Any] = {
+    "include_mine": False,
+    "repo_filter": None,
+    "group_by": "",
+    "sort_by": "",
+    "cli": "claude",
+    "codegraph_assist": False,
+    "auto_refresh_secs": 0,
+}
+
+
+def test_build_state_badges_all_default_is_empty() -> None:
+    """Every state at its default contributes no badge → clean subtitle."""
+    assert build_state_badges(**_DEFAULT_BADGE_STATE) == ""
+
+
+@pytest.mark.parametrize(
+    "override,expected",
+    [
+        ({"include_mine": True}, "mine"),
+        ({"repo_filter": "owner/repo"}, "repo:owner/repo"),
+        ({"group_by": "repo"}, "group:repo"),
+        ({"sort_by": "updated"}, "sort:updated"),
+        ({"cli": "codex"}, "cli:Codex"),
+        ({"codegraph_assist": True}, "codegraph"),
+        ({"auto_refresh_secs": 900}, "auto:15m"),
+        # The default CLI never shows a badge — only a non-default one does.
+        ({"cli": "claude"}, ""),
+    ],
+)
+def test_build_state_badges_single(override: dict[str, Any], expected: str) -> None:
+    assert build_state_badges(**{**_DEFAULT_BADGE_STATE, **override}) == expected
+
+
+def test_build_state_badges_combined_order() -> None:
+    """Active states join with ` · ` in a stable, readable order."""
+    badges = build_state_badges(
+        include_mine=True,
+        repo_filter="o/x",
+        group_by="author",
+        sort_by="updated",
+        cli="gemini",
+        codegraph_assist=True,
+        auto_refresh_secs=3600,
+    )
+    assert badges == (
+        "mine · repo:o/x · group:author · sort:updated · cli:Gemini · codegraph · auto:1h"
+    )
 
 
 class _NotifyFake:

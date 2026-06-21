@@ -69,10 +69,10 @@ from textual.widgets import (
     Label,
     Link,
     OptionList,
+    Select,
     Static,
     TextArea,
 )
-from textual.widgets._footer import FooterKey
 from textual.widgets._header import HeaderClock, HeaderClockSpace, HeaderIcon, HeaderTitle
 from textual.widgets.data_table import CellDoesNotExist
 from textual.widgets.option_list import Option
@@ -1976,6 +1976,42 @@ def _refresh_interval_label(secs: int) -> str:
     return f"{secs}s"
 
 
+def build_state_badges(
+    *,
+    include_mine: bool,
+    repo_filter: str | None,
+    group_by: GroupBy,
+    sort_by: SortBy,
+    cli: CliChoice,
+    codegraph_assist: bool,
+    auto_refresh_secs: int,
+) -> str:
+    """Compact ` · `-joined summary of the active/non-default app state.
+
+    Replaces the old green footer-key highlight (dropped when those keys
+    moved off the footer): the same at-a-glance signal now rides in the
+    header subtitle. Only *active* / *non-default* states contribute a
+    badge, so a fully-default app yields `""` and the subtitle stays clean.
+    Pure so it can be unit-tested without a running App.
+    """
+    badges: list[str] = []
+    if include_mine:
+        badges.append("mine")
+    if repo_filter:
+        badges.append(f"repo:{repo_filter}")
+    if group_by:
+        badges.append(f"group:{group_by}")
+    if sort_by:
+        badges.append(f"sort:{sort_by}")
+    if cli != DEFAULT_CLI:
+        badges.append(f"cli:{_CLI_DISPLAY[cli]}")
+    if codegraph_assist:
+        badges.append("codegraph")
+    if auto_refresh_secs > 0:
+        badges.append(f"auto:{_refresh_interval_label(auto_refresh_secs)}")
+    return " · ".join(badges)
+
+
 def _open_review_db() -> sqlite3.Connection:
     REVIEW_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     # `timeout` covers Python-side waits; `busy_timeout` covers SQLite-side
@@ -3065,21 +3101,37 @@ class SettingsResult:
 
     A dataclass rather than a bare string so the screen can grow more
     settings without changing its dismiss contract. `slack_webhook_url` is
-    normalised to a stripped string; empty means "notifications off".
+    normalised to a stripped string; empty means "notifications off". The
+    `cli` / `codegraph_assist` / `refresh_interval` fields are the persisted
+    preferences that used to be footer cycle-keys (`c`/`x`/`a`) and now live
+    here as proper widgets.
     """
 
+    cli: CliChoice
+    codegraph_assist: bool
+    refresh_interval: int
     slack_webhook_url: str
+
+
+# Auto-refresh options for the Settings dropdown: every distinct interval the
+# `a`-cycle could land on (its keys ∪ values), sorted, rendered with the same
+# `_refresh_interval_label` the toast/badge use. Sourced from `_REFRESH_CYCLE`
+# so the option list can't drift from the cycle's legal values.
+_REFRESH_OPTIONS: tuple[int, ...] = tuple(
+    sorted(set(_REFRESH_CYCLE) | set(_REFRESH_CYCLE.values()))
+)
 
 
 class SettingsScreen(ModalScreen[SettingsResult | None]):
     """Edit persisted app settings.
 
-    Currently a single field: the Slack incoming-webhook URL used to announce
+    Hosts the persisted preferences — review CLI, CodeGraph assist,
+    auto-refresh interval, and the Slack incoming-webhook URL used to announce
     completed reviews to a shared channel. Dismisses with a SettingsResult on
     save (Enter) or None on cancel (Esc).
     """
 
-    AUTO_FOCUS = "#settings-slack"
+    AUTO_FOCUS = "#settings-cli"
 
     BINDINGS = [
         # `priority=True` so Enter/Esc win over the focused Input widget,
@@ -3089,13 +3141,42 @@ class SettingsScreen(ModalScreen[SettingsResult | None]):
         Binding("escape", "cancel", "Cancel", priority=True),
     ]
 
-    def __init__(self, slack_webhook_url: str):
+    def __init__(
+        self,
+        *,
+        cli: CliChoice,
+        codegraph_assist: bool,
+        refresh_interval: int,
+        slack_webhook_url: str,
+    ):
         super().__init__()
+        self.cli = cli
+        self.codegraph_assist = codegraph_assist
+        self.refresh_interval = refresh_interval
         self.slack_webhook_url = slack_webhook_url
 
     def compose(self) -> ComposeResult:
         yield Vertical(
             Label("Settings", id="settings-title"),
+            Label("Review CLI:", id="settings-cli-label"),
+            Select(
+                [(_CLI_DISPLAY[c], c) for c in _CLI_CYCLE],
+                value=self.cli,
+                allow_blank=False,
+                id="settings-cli",
+            ),
+            Checkbox(
+                "CodeGraph assist (prompt to index missing workspaces)",
+                value=self.codegraph_assist,
+                id="settings-codegraph",
+            ),
+            Label("Auto-refresh interval:", id="settings-refresh-label"),
+            Select(
+                [(_refresh_interval_label(s), s) for s in _REFRESH_OPTIONS],
+                value=self.refresh_interval,
+                allow_blank=False,
+                id="settings-refresh",
+            ),
             Label(
                 "Slack webhook URL for review notifications (blank = off):",
                 id="settings-slack-label",
@@ -3110,8 +3191,14 @@ class SettingsScreen(ModalScreen[SettingsResult | None]):
         )
 
     def action_save(self) -> None:
-        value = self.query_one("#settings-slack", Input).value.strip()
-        self.dismiss(SettingsResult(slack_webhook_url=value))
+        self.dismiss(
+            SettingsResult(
+                cli=self.query_one("#settings-cli", Select).value,
+                codegraph_assist=self.query_one("#settings-codegraph", Checkbox).value,
+                refresh_interval=self.query_one("#settings-refresh", Select).value,
+                slack_webhook_url=self.query_one("#settings-slack", Input).value.strip(),
+            )
+        )
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -3274,15 +3361,6 @@ class PRReviewer(App):
     #filter-hint {
         margin-top: 1;
     }
-    FooterKey.-state-active .footer-key--key {
-        background: $success;
-        color: $text;
-    }
-    FooterKey.-state-active .footer-key--description {
-        background: $success;
-        color: $text;
-        text-style: bold;
-    }
     """
 
     TITLE = "CC PR Reviewer"
@@ -3293,15 +3371,22 @@ class PRReviewer(App):
         Binding("enter", "review", "Review"),
         Binding("o", "open_web", "Open in browser"),
         Binding("d", "show_diff", "View diff"),
-        Binding("m", "toggle_mine", "Toggle my PRs"),
-        Binding("f", "filter", "Filter by repo"),
-        Binding("g", "toggle_group", "Group by"),
-        Binding("s", "toggle_sort", "Sort by"),
-        Binding("c", "toggle_cli", "CLI"),
-        Binding("x", "toggle_codegraph", "CodeGraph"),
-        Binding("a", "cycle_refresh", "Auto-refresh"),
+        # View toggles and persisted-preference keys are hidden from the
+        # footer (`show=False`) to keep the bar minimal — they still work on
+        # keypress and stay discoverable in the `^p` command palette. The
+        # persisted prefs (`c`/`x`/`a`) also have a home in the Settings modal
+        # (`,`); `u`/Upgrade self-advertises via the header "Release Notes"
+        # badge. Active view-state is surfaced as header-subtitle badges (see
+        # `_refresh_state_badges`) since the footer no longer highlights it.
+        Binding("m", "toggle_mine", "Toggle my PRs", show=False),
+        Binding("f", "filter", "Filter by repo", show=False),
+        Binding("g", "toggle_group", "Group by", show=False),
+        Binding("s", "toggle_sort", "Sort by", show=False),
+        Binding("c", "toggle_cli", "CLI", show=False),
+        Binding("x", "toggle_codegraph", "CodeGraph", show=False),
+        Binding("a", "cycle_refresh", "Auto-refresh", show=False),
         Binding("comma", "settings", "Settings"),
-        Binding("u", "upgrade", "Upgrade"),
+        Binding("u", "upgrade", "Upgrade", show=False),
         Binding("q", "quit", "Quit"),
     ]
 
@@ -3420,23 +3505,11 @@ class PRReviewer(App):
         table.add_column("Reviews", key="reviews")
         table.add_column("Last Review", key="last_review")
         table.add_column("", key="tags")
-        # The Footer recomposes whenever the screen's active bindings change
-        # (e.g. on modal push/pop), which wipes any per-FooterKey class we
-        # set. Subscribing here re-applies our `-state-active` tags *after*
-        # each such recompose so the highlights survive modal interactions.
-        #
-        # `call_after_refresh` is chained twice: Footer also schedules its
-        # recompose via `call_after_refresh` from the same signal, so a
-        # single defer would land BEFORE Footer remounts its FooterKeys
-        # (causing our class to be set on doomed widgets and lost). The
-        # double defer pushes us past Footer's mount cycle.
-        self.screen.bindings_updated_signal.subscribe(
-            self,
-            lambda _screen: self.call_after_refresh(
-                lambda: self.call_after_refresh(self._refresh_footer_indicators)
-            ),
-        )
-        self._refresh_footer_indicators()
+        # Active app state rides in the header subtitle (an App reactive),
+        # which re-renders on its own and survives modal push/pop — so unlike
+        # the old per-FooterKey highlight there's no recompose to chase and
+        # no `bindings_updated_signal` subscription to maintain.
+        self._refresh_state_badges()
         # Surface CLI-availability problems set in `__init__`. Two
         # distinct cases:
         #   * `_no_cli_available`: TOCTOU race — every supported CLI was
@@ -3487,39 +3560,28 @@ class PRReviewer(App):
         else:
             self._check_for_update()
 
-    def _refresh_footer_indicators(self) -> None:
-        """Re-apply the `-state-active` class on every state-bearing key.
+    def _refresh_state_badges(self) -> None:
+        """Mirror the active app state into the header subtitle.
 
-        Centralised so that both bindings-signal callbacks and post-action
-        calls (toggle mine, apply filter) end up at the same place — adding
-        a new state-bearing key only takes a single line here.
+        The view toggles (`m`/`f`/`g`/`s`) and persisted prefs (`c`/`x`/`a`)
+        no longer live on the footer, so their old green-key highlight is
+        gone. `build_state_badges` rebuilds the same at-a-glance signal as a
+        compact subtitle suffix. Centralised so every post-action call ends
+        up here — adding a new state-bearing key is a one-line change in the
+        pure helper. `sub_title` is an App reactive rendered by
+        `format_title`, so this re-renders automatically and survives modal
+        push/pop without any signal plumbing.
         """
-        self._set_footer_active("m", self.include_mine)
-        self._set_footer_active("f", self.repo_filter is not None)
-        self._set_footer_active("g", bool(self.group_by))
-        self._set_footer_active("s", bool(self.sort_by))
-        # Highlight `c` whenever the user has moved off the default CLI,
-        # so the footer always advertises a non-default selection without
-        # consuming a separate status-bar slot.
-        self._set_footer_active("c", self.cli != DEFAULT_CLI)
-        self._set_footer_active("x", self.codegraph_assist)
-        self._set_footer_active("a", self._auto_refresh_secs > 0)
-
-    def _set_footer_active(self, key: str, active: bool, retries: int = 2) -> None:
-        """Toggle the `-state-active` CSS class on the FooterKey for `key`.
-
-        Footer mounts its `FooterKey` children only after it processes the
-        `bindings_updated_signal`. If our App-level subscriber runs before
-        Footer's, the query is empty on first try — so we re-schedule via
-        `call_after_refresh` until the FooterKey appears (bounded retries
-        keep this from spinning if Footer is hidden / never mounted).
-        """
-        for fk in self.query(FooterKey):
-            if fk.key == key:
-                fk.set_class(active, "-state-active")
-                return
-        if retries > 0:
-            self.call_after_refresh(self._set_footer_active, key, active, retries - 1)
+        badges = build_state_badges(
+            include_mine=self.include_mine,
+            repo_filter=self.repo_filter,
+            group_by=self.group_by,
+            sort_by=self.sort_by,
+            cli=self.cli,
+            codegraph_assist=self.codegraph_assist,
+            auto_refresh_secs=self._auto_refresh_secs,
+        )
+        self.sub_title = f"{type(self).SUB_TITLE} · {badges}" if badges else type(self).SUB_TITLE
 
     # --- actions ---
 
@@ -3971,7 +4033,7 @@ class PRReviewer(App):
         self.notify(f"My PRs: {state}", timeout=3)
         self._set_status(f"Refreshing… (mine {state})")
         self._set_pr_count("…")
-        self._refresh_footer_indicators()
+        self._refresh_state_badges()
         self._load_prs()
 
     def action_toggle_group(self) -> None:
@@ -3997,7 +4059,7 @@ class PRReviewer(App):
         except sqlite3.Error as e:
             self.notify(f"Couldn't persist group toggle: {e}", severity="warning")
         self.notify(f"Group: {nxt or 'off'}", timeout=3)
-        self._refresh_footer_indicators()
+        self._refresh_state_badges()
         # Render-only re-populate: forward the last fetch's mine_error so
         # the ERROR badge isn't lost, and `quiet=True` to suppress
         # re-toasting toasts the user already saw on the original fetch.
@@ -4024,7 +4086,7 @@ class PRReviewer(App):
         except sqlite3.Error as e:
             self.notify(f"Couldn't persist CLI toggle: {e}", severity="warning")
         self.notify(f"CLI: {_CLI_DISPLAY[nxt]}", timeout=3)
-        self._refresh_footer_indicators()
+        self._refresh_state_badges()
         # Re-emit the CodeGraph health toast for the new CLI: a user
         # who has codegraph wired for claude but not codex would
         # otherwise toggle to codex with no warning and only learn at
@@ -4045,7 +4107,7 @@ class PRReviewer(App):
         except sqlite3.Error as e:
             self.notify(f"Couldn't persist auto-refresh toggle: {e}", severity="warning")
         self.notify(f"Auto-refresh: {_refresh_interval_label(nxt)}", timeout=3)
-        self._refresh_footer_indicators()
+        self._refresh_state_badges()
         self._start_auto_refresh_timer()
 
     def _start_auto_refresh_timer(self) -> None:
@@ -4142,7 +4204,7 @@ class PRReviewer(App):
         except sqlite3.Error as e:
             self.notify(f"Couldn't persist CodeGraph toggle: {e}", severity="warning")
         self.notify(f"CodeGraph assist: {state}", timeout=3)
-        self._refresh_footer_indicators()
+        self._refresh_state_badges()
 
     def action_toggle_sort(self) -> None:
         # Mirrors `action_toggle_group`: capture cursor PR identity, cycle the
@@ -4163,7 +4225,7 @@ class PRReviewer(App):
         except sqlite3.Error as e:
             self.notify(f"Couldn't persist sort toggle: {e}", severity="warning")
         self.notify(f"Sort: {nxt or 'default'}", timeout=3)
-        self._refresh_footer_indicators()
+        self._refresh_state_badges()
         self._populate(self.prs, mine_error=self._last_mine_error, quiet=True)
 
         if prev_key is not None:
@@ -4184,7 +4246,7 @@ class PRReviewer(App):
                 # callback runs, so the highlight refresh from the signal
                 # subscriber sees the OLD filter value. Refresh again here
                 # so the `f` key reflects the just-applied filter.
-                self._refresh_footer_indicators()
+                self._refresh_state_badges()
                 self.action_refresh()
 
         self.push_screen(
@@ -4224,18 +4286,49 @@ class PRReviewer(App):
         def _apply(result: SettingsResult | None) -> None:
             if result is None:
                 return
-            # Persist first so session and disk can't diverge on a write
-            # failure; keep the prior value and warn if it fails.
+            # Persist every field first so session and disk can't diverge on a
+            # write failure; on any failure keep the prior values and bail with
+            # a warning. Mirrors the per-key warn-on-failure pattern the
+            # individual toggle actions use (`action_toggle_cli` et al.).
             try:
+                _set_setting(self.review_db, "cli", result.cli)
+                _set_setting(
+                    self.review_db,
+                    "codegraph_assist",
+                    "1" if result.codegraph_assist else "0",
+                )
+                _set_setting(self.review_db, "refresh_interval", str(result.refresh_interval))
                 _set_setting(self.review_db, "slack_webhook_url", result.slack_webhook_url)
             except sqlite3.Error as e:
                 self.notify(f"Couldn't save settings: {e}", severity="warning")
                 return
-            self.slack_webhook_url = result.slack_webhook_url
-            state = "on" if result.slack_webhook_url else "off"
-            self.notify(f"Slack review notifications {state}.", timeout=3)
 
-        self.push_screen(SettingsScreen(self.slack_webhook_url), _apply)
+            cli_changed = result.cli != self.cli
+            refresh_changed = result.refresh_interval != self._auto_refresh_secs
+            self.cli = result.cli
+            self.codegraph_assist = result.codegraph_assist
+            self._auto_refresh_secs = result.refresh_interval
+            self.slack_webhook_url = result.slack_webhook_url
+
+            # Restart the timer only when the interval actually changed, and
+            # re-emit the CodeGraph health toast when the CLI changed — same
+            # follow-ups `action_cycle_refresh` / `action_toggle_cli` run.
+            if refresh_changed:
+                self._start_auto_refresh_timer()
+            if cli_changed:
+                self._maybe_notify_codegraph_setup()
+            self._refresh_state_badges()
+            self.notify("Settings saved.", timeout=3)
+
+        self.push_screen(
+            SettingsScreen(
+                cli=self.cli,
+                codegraph_assist=self.codegraph_assist,
+                refresh_interval=self._auto_refresh_secs,
+                slack_webhook_url=self.slack_webhook_url,
+            ),
+            _apply,
+        )
 
     def _notify_review_to_slack(
         self,
