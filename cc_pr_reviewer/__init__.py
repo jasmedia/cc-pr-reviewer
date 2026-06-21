@@ -74,6 +74,7 @@ from textual.widgets import (
     Static,
     TextArea,
 )
+from textual.widgets._footer import FooterKey
 from textual.widgets._header import HeaderClock, HeaderClockSpace, HeaderIcon, HeaderTitle
 from textual.widgets.data_table import CellDoesNotExist
 from textual.widgets.option_list import Option
@@ -734,32 +735,6 @@ _THEME_OPTIONS: tuple[str, ...] = (
     "atom-one-light",
 )
 DEFAULT_THEME = CLAUDE_THEME_NAME
-
-
-# Header-subtitle badge colors keyed by the badge's leading token (the part
-# before `:`). Lets the at-a-glance state read by *category* — what-you-see
-# filters, view arrangement, tooling — instead of uniform dim. Tokens not
-# listed (and the `SUB_TITLE` base text) stay `dim`. See `format_title`.
-_BADGE_STYLES: dict[str, str] = {
-    "mine": "$accent",  # what-you-see filters
-    "repo": "$accent",
-    "group": "$primary",  # view arrangement
-    "sort": "$primary",
-    "cli": "$warning",  # tooling / behaviour
-    "codegraph": "$success",
-    "auto": "$success",
-}
-
-
-def _badge_style(badge: str) -> str:
-    """Style for one header-subtitle badge, keyed by its leading token.
-
-    Badges are either bare (`mine`, `codegraph`) or `key:value`
-    (`repo:o/r`, `cli:Codex`); both key off the part before the first `:`.
-    Unknown tokens fall back to `dim` so a future badge can't render
-    unstyled — it just stays neutral until added to `_BADGE_STYLES`.
-    """
-    return _BADGE_STYLES.get(badge.split(":", 1)[0], "dim")
 
 
 def _resolve_theme(stored: str) -> str:
@@ -2066,42 +2041,6 @@ def _refresh_interval_label(secs: int) -> str:
     return f"{secs}s"
 
 
-def build_state_badges(
-    *,
-    include_mine: bool,
-    repo_filter: str | None,
-    group_by: GroupBy,
-    sort_by: SortBy,
-    cli: CliChoice,
-    codegraph_assist: bool,
-    auto_refresh_secs: int,
-) -> str:
-    """Compact ` · `-joined summary of the active/non-default app state.
-
-    Replaces the old green footer-key highlight (dropped when those keys
-    moved off the footer): the same at-a-glance signal now rides in the
-    header subtitle. Only *active* / *non-default* states contribute a
-    badge, so a fully-default app yields `""` and the subtitle stays clean.
-    Pure so it can be unit-tested without a running App.
-    """
-    badges: list[str] = []
-    if include_mine:
-        badges.append("mine")
-    if repo_filter:
-        badges.append(f"repo:{repo_filter}")
-    if group_by:
-        badges.append(f"group:{group_by}")
-    if sort_by:
-        badges.append(f"sort:{sort_by}")
-    if cli != DEFAULT_CLI:
-        badges.append(f"cli:{_CLI_DISPLAY[cli]}")
-    if codegraph_assist:
-        badges.append("codegraph")
-    if auto_refresh_secs > 0:
-        badges.append(f"auto:{_refresh_interval_label(auto_refresh_secs)}")
-    return " · ".join(badges)
-
-
 def _open_review_db() -> sqlite3.Connection:
     REVIEW_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     # `timeout` covers Python-side waits; `busy_timeout` covers SQLite-side
@@ -3389,6 +3328,45 @@ class HeaderWithChangelog(Header):
         )
 
 
+class StateAwareFooter(Footer):
+    """Footer that highlights a key while its toggle is active/non-default.
+
+    Revives the at-a-glance "this mode is on" cue the removed header badges used
+    to carry, but only for the list-reshaping toggles that live on the footer
+    (`m` my-PRs, `g` grouping, `s` sorting). The highlight is (re)applied in
+    `compose` — keyed off `PRReviewer._footer_action_active` — so it survives the
+    footer's own recomposes (binding/focus changes, modal push/pop) without any
+    signal plumbing; `PRReviewer._refresh_footer_highlights` flips the class on
+    the live widgets after a toggle, where no recompose fires.
+    """
+
+    DEFAULT_CSS = """
+    StateAwareFooter {
+        FooterKey.-active {
+            background: $primary;
+            .footer-key--key {
+                color: $background;
+                background: $primary;
+                text-style: bold;
+            }
+            .footer-key--description {
+                color: $background;
+                background: $primary;
+                text-style: bold;
+            }
+        }
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        for widget in super().compose():
+            if isinstance(widget, FooterKey):
+                # type: ignore[attr-defined] — only ever mounted under PRReviewer.
+                active = self.app._footer_action_active(widget.action)  # type: ignore[attr-defined]
+                widget.set_class(active, "-active")
+            yield widget
+
+
 class PRReviewer(App):
     CSS = """
     Screen { background: $surface; }
@@ -3510,26 +3488,30 @@ class PRReviewer(App):
     """
 
     TITLE = "CC PR Reviewer"
-    SUB_TITLE = "Review Github PRs with Claude Code"
+    # Header subtitle intentionally blank: the active-state badges that used to
+    # ride here moved into the Settings modal (`,`), keeping the header to a
+    # single uncluttered `CC PR Reviewer [count]` line.
+    SUB_TITLE = ""
 
     BINDINGS = [
         Binding("r,f5", "refresh", "Refresh"),
         Binding("enter", "review", "Review"),
         Binding("o", "open_web", "Open in browser"),
         Binding("d", "show_diff", "View diff"),
-        # View toggles and persisted-preference keys are hidden from the
-        # footer (`show=False`) to keep the bar minimal — they still work on
-        # keypress and stay discoverable in the `^p` command palette. The
-        # persisted prefs (`c`/`x`/`a`) also have a home in the Settings modal
-        # (`,`); `u`/Upgrade self-advertises via the `#version-badge` (shown
-        # only when an update is available — the header "Release Notes" link is
-        # a static changelog link, unrelated to update availability). Active
-        # view-state is surfaced as header-subtitle badges (see
-        # `_refresh_state_badges`) since the footer no longer highlights it.
-        Binding("m", "toggle_mine", "Toggle my PRs", show=False),
+        # The view toggles that reshape the on-screen list (`m` my-PRs filter,
+        # `g`/`s` grouping/sorting) ride in the footer — they change what the
+        # table shows, so a visible affordance fits. The rest of the
+        # toggles/prefs stay hidden (`show=False`) to keep the bar minimal —
+        # they still work on keypress and stay discoverable in the `^p` command
+        # palette. The persisted prefs (`c`/`x`/`a`) and the `m` "my PRs" filter
+        # also have a home in the Settings modal (`,`); `u`/Upgrade
+        # self-advertises via the `#version-badge` (shown only when an update is
+        # available — the header "Release Notes" link is a static changelog
+        # link, unrelated to update availability).
+        Binding("m", "toggle_mine", "My PRs"),
+        Binding("g", "toggle_group", "Group by"),
+        Binding("s", "toggle_sort", "Sort by"),
         Binding("f", "filter", "Filter by repo", show=False),
-        Binding("g", "toggle_group", "Group by", show=False),
-        Binding("s", "toggle_sort", "Sort by", show=False),
         Binding("c", "toggle_cli", "CLI", show=False),
         Binding("x", "toggle_codegraph", "CodeGraph", show=False),
         Binding("a", "cycle_refresh", "Auto-refresh", show=False),
@@ -3645,7 +3627,7 @@ class PRReviewer(App):
         yield Static("", id="version-badge")
         yield PRDataTable(id="pr-table", cursor_type="row", zebra_stripes=True)
         yield Static("Loading…", id="status", markup=False)
-        yield Footer()
+        yield StateAwareFooter()
 
     def on_mount(self) -> None:
         # Register the custom branded theme before applying the persisted
@@ -3668,11 +3650,6 @@ class PRReviewer(App):
         table.add_column("Reviews", key="reviews")
         table.add_column("Last Review", key="last_review")
         table.add_column("", key="tags")
-        # Active app state rides in the header subtitle (an App reactive),
-        # which re-renders on its own and survives modal push/pop — so unlike
-        # the old per-FooterKey highlight there's no recompose to chase and
-        # no `bindings_updated_signal` subscription to maintain.
-        self._refresh_state_badges()
         # Surface CLI-availability problems set in `__init__`. Two
         # distinct cases:
         #   * `_no_cli_available`: TOCTOU race — every supported CLI was
@@ -3722,29 +3699,6 @@ class PRReviewer(App):
             self.update_check_state = "unavailable"
         else:
             self._check_for_update()
-
-    def _refresh_state_badges(self) -> None:
-        """Mirror the active app state into the header subtitle.
-
-        The view toggles (`m`/`f`/`g`/`s`) and persisted prefs (`c`/`x`/`a`)
-        no longer live on the footer, so their old green-key highlight is
-        gone. `build_state_badges` rebuilds the same at-a-glance signal as a
-        compact subtitle suffix. Centralised so every post-action call ends
-        up here — adding a new state-bearing key is a one-line change in the
-        pure helper. `sub_title` is an App reactive rendered by
-        `format_title`, so this re-renders automatically and survives modal
-        push/pop without any signal plumbing.
-        """
-        badges = build_state_badges(
-            include_mine=self.include_mine,
-            repo_filter=self.repo_filter,
-            group_by=self.group_by,
-            sort_by=self.sort_by,
-            cli=self.cli,
-            codegraph_assist=self.codegraph_assist,
-            auto_refresh_secs=self._auto_refresh_secs,
-        )
-        self.sub_title = f"{type(self).SUB_TITLE} · {badges}" if badges else type(self).SUB_TITLE
 
     # --- actions ---
 
@@ -4183,6 +4137,31 @@ class PRReviewer(App):
             _on_warn,
         )
 
+    def _footer_action_active(self, action: str) -> bool:
+        """Whether a footer toggle's key should read as highlighted.
+
+        Drives `StateAwareFooter`'s `-active` class: a key lights up while its
+        toggle is non-default (my-PRs filter on, grouping/sorting engaged).
+        Pure over `self`'s state so it's the single source both the compose-time
+        tag and the live `_refresh_footer_highlights` consult.
+        """
+        return (
+            (action == "toggle_mine" and self.include_mine)
+            or (action == "toggle_group" and bool(self.group_by))
+            or (action == "toggle_sort" and bool(self.sort_by))
+        )
+
+    def _refresh_footer_highlights(self) -> None:
+        """Re-flip the footer `-active` highlights to match current state.
+
+        Called after a toggle action: those don't change the binding set, so the
+        footer doesn't recompose on its own and the live `FooterKey` widgets need
+        their class updated in place. (Footer recomposes — focus/binding changes,
+        modal pop — are covered by `StateAwareFooter.compose` instead.)
+        """
+        for key in self.query(FooterKey):
+            key.set_class(self._footer_action_active(key.action), "-active")
+
     def action_toggle_mine(self) -> None:
         self.include_mine = not self.include_mine
         state = "on" if self.include_mine else "off"
@@ -4194,9 +4173,9 @@ class PRReviewer(App):
         except sqlite3.Error as e:
             self.notify(f"Couldn't persist mine toggle: {e}", severity="warning")
         self.notify(f"My PRs: {state}", timeout=3)
+        self._refresh_footer_highlights()
         self._set_status(f"Refreshing… (mine {state})")
         self._set_pr_count("…")
-        self._refresh_state_badges()
         self._load_prs()
 
     def action_toggle_group(self) -> None:
@@ -4222,7 +4201,7 @@ class PRReviewer(App):
         except sqlite3.Error as e:
             self.notify(f"Couldn't persist group toggle: {e}", severity="warning")
         self.notify(f"Group: {nxt or 'off'}", timeout=3)
-        self._refresh_state_badges()
+        self._refresh_footer_highlights()
         # Render-only re-populate: forward the last fetch's mine_error so
         # the ERROR badge isn't lost, and `quiet=True` to suppress
         # re-toasting toasts the user already saw on the original fetch.
@@ -4240,8 +4219,7 @@ class PRReviewer(App):
     def action_toggle_cli(self) -> None:
         # CLI choice doesn't affect the table contents, so there's no
         # cursor preservation or re-populate to do — just cycle, persist,
-        # update the footer indicator, and notify. The launcher reads
-        # `self.cli` at action_review time.
+        # and notify. The launcher reads `self.cli` at action_review time.
         nxt = _CLI_CYCLE[self.cli]
         self.cli = nxt
         try:
@@ -4249,7 +4227,6 @@ class PRReviewer(App):
         except sqlite3.Error as e:
             self.notify(f"Couldn't persist CLI toggle: {e}", severity="warning")
         self.notify(f"CLI: {_CLI_DISPLAY[nxt]}", timeout=3)
-        self._refresh_state_badges()
         # Re-emit the CodeGraph health toast for the new CLI: a user
         # who has codegraph wired for claude but not codex would
         # otherwise toggle to codex with no warning and only learn at
@@ -4260,7 +4237,7 @@ class PRReviewer(App):
 
     def action_cycle_refresh(self) -> None:
         # Cycle the auto-refresh interval (off → 15m → 30m → 1h → off),
-        # persist it, rebuild the timer, and update the footer indicator.
+        # persist it, and rebuild the timer.
         # `.get` fallback covers a hand-edited stored value not on the
         # cycle (e.g. a clamped 120s) — land on the first enabled step.
         nxt = _REFRESH_CYCLE.get(self._auto_refresh_secs, _REFRESH_CYCLE[0])
@@ -4270,7 +4247,6 @@ class PRReviewer(App):
         except sqlite3.Error as e:
             self.notify(f"Couldn't persist auto-refresh toggle: {e}", severity="warning")
         self.notify(f"Auto-refresh: {_refresh_interval_label(nxt)}", timeout=3)
-        self._refresh_state_badges()
         self._start_auto_refresh_timer()
 
     def _start_auto_refresh_timer(self) -> None:
@@ -4367,7 +4343,6 @@ class PRReviewer(App):
         except sqlite3.Error as e:
             self.notify(f"Couldn't persist CodeGraph toggle: {e}", severity="warning")
         self.notify(f"CodeGraph assist: {state}", timeout=3)
-        self._refresh_state_badges()
 
     def action_toggle_sort(self) -> None:
         # Mirrors `action_toggle_group`: capture cursor PR identity, cycle the
@@ -4388,7 +4363,7 @@ class PRReviewer(App):
         except sqlite3.Error as e:
             self.notify(f"Couldn't persist sort toggle: {e}", severity="warning")
         self.notify(f"Sort: {nxt or 'default'}", timeout=3)
-        self._refresh_state_badges()
+        self._refresh_footer_highlights()
         self._populate(self.prs, mine_error=self._last_mine_error, quiet=True)
 
         if prev_key is not None:
@@ -4405,10 +4380,6 @@ class PRReviewer(App):
             if result is None or result.repo == self.repo_filter:
                 return
             if self._set_repo_filter(result.repo):
-                # `_set_repo_filter` persists the filter but doesn't touch the
-                # subtitle, so refresh the state badges here to reflect the
-                # just-applied filter before the list reloads.
-                self._refresh_state_badges()
                 self.action_refresh()
 
         self.push_screen(
@@ -4487,7 +4458,6 @@ class PRReviewer(App):
                 self._start_auto_refresh_timer()
             if cli_changed:
                 self._maybe_notify_codegraph_setup()
-            self._refresh_state_badges()
             self.notify("Settings saved.", timeout=3)
 
         self.push_screen(
@@ -5048,7 +5018,8 @@ class PRReviewer(App):
         self.title = f"{type(self).TITLE} [{msg}]"
 
     def format_title(self, title: str, sub_title: str) -> Content:
-        # Two-tone styling on the title:
+        # Two-tone styling on the title (the header carries no subtitle — see
+        # `SUB_TITLE`):
         #   • leading "CC PR Reviewer" → bold $primary (matches the theme
         #     primary palette color)
         #   • bracketed "[count]" suffix → bold $accent (same emphasis the
@@ -5059,31 +5030,13 @@ class PRReviewer(App):
         if bracket_start != -1 and bracket_end > bracket_start:
             prefix = title[:bracket_start].rstrip()
             gap = title[len(prefix) : bracket_start]
-            title_content = Content.assemble(
+            return Content.assemble(
                 (prefix, "bold $primary"),
                 gap,
                 (title[bracket_start : bracket_end + 1], "bold $accent"),
                 title[bracket_end + 1 :],
             )
-        else:
-            title_content = Content.assemble((title, "bold $primary"))
-        if sub_title:
-            # Subtitle is "<base description> · badge · badge …" (see
-            # `_refresh_state_badges`). The base stays dim; each state badge
-            # is tinted by category via `_badge_style` so the active state
-            # reads at a glance. Splitting on the same ` · ` separator the
-            # builder joins with — the base text has no embedded separator.
-            parts = sub_title.split(" · ")
-            sub_parts: list[Any] = [(parts[0], "dim")]
-            for badge in parts[1:]:
-                sub_parts.append((" · ", "dim"))
-                sub_parts.append((badge, _badge_style(badge)))
-            return Content.assemble(
-                title_content,
-                (" — ", "dim"),
-                Content.assemble(*sub_parts),
-            )
-        return title_content
+        return Content.assemble((title, "bold $primary"))
 
     @work(thread=True, exclusive=True)
     def _poll_in_progress(self) -> None:
