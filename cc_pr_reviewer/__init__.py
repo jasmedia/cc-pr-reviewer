@@ -1892,7 +1892,14 @@ def build_review_prompt(
             if rereview_can_approve:
                 post += POST_INLINE_REREVIEW_APPROVE_SUFFIX
                 post += POST_INLINE_REREVIEW_RESOLVE_SUFFIX
-        elif not_self_authored:
+        elif not_self_authored and fetch_ok:
+            # `and fetch_ok`: a failed existing-comments fetch forces
+            # `existing=[]`, which forces `rereview=False` — so without this
+            # guard the approve clause would fire on a fetch failure and could
+            # auto-approve a PR we can't actually confirm is a first review
+            # (a re-review whose prior comments were unreachable looks
+            # identical). When the prior-comment state is unknown, stay
+            # conservative and fall through to plain `event: COMMENT`.
             post += POST_INLINE_APPROVE_SUFFIX
         sections.append(post)
 

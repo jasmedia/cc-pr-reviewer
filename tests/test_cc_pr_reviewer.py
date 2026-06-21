@@ -357,6 +357,22 @@ def test_first_review_my_login_none_omits_approve_suffix() -> None:
     assert POST_INLINE_APPROVE_SUFFIX not in built.text
 
 
+def test_first_review_failed_fetch_omits_approve_suffix() -> None:
+    """A failed existing-comments fetch can't confirm this is a first review
+    (a re-review whose prior comments were unreachable looks identical), so
+    the approve clause must stay off — fall through to plain COMMENT."""
+    built = build_review_prompt(
+        post_inline=True,
+        extra_prompt="",
+        existing=[],
+        fetch_ok=False,
+        my_login="alice",
+        author_login="bob",
+    )
+    assert POST_INLINE_FETCH_FAILED_SUFFIX in built.text
+    assert POST_INLINE_APPROVE_SUFFIX not in built.text
+
+
 @pytest.mark.parametrize(
     ("cli", "expected_base"),
     [
