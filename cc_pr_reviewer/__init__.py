@@ -550,6 +550,30 @@ POST_INLINE_REREVIEW_RESOLVE_SUFFIX = (
     "and any that failed to resolve (with the GraphQL error)."
 )
 
+# Appended to POST_INLINE_PROMPT on a *first* review (not a re-review) of a PR
+# the `gh` user did NOT author. It turns the post-inline pass into a verdict:
+# classify each finding, and if nothing is blocking, APPROVE while STILL
+# attaching the low/NIT findings as inline comments. GitHub accepts a
+# `comments` array on an `event: APPROVE` submission, so "approve + nits" is a
+# single review. Gated on not-self-authored because GitHub returns 422 on
+# self-approval (same guard as the re-review approve clause) — on our own PR
+# or an unknown login we fall through to the plain `event: COMMENT` behavior.
+# The blocking list mirrors POST_INLINE_REREVIEW_SUFFIX so both passes share
+# one taxonomy.
+POST_INLINE_APPROVE_SUFFIX = (
+    " Then decide the verdict by the highest-priority finding. Classify each "
+    "finding as blocking (correctness, security, data loss, broken contracts, "
+    "breaking changes, concurrency bugs, resource leaks, significant "
+    "performance regressions) or low/NIT (everything else — style, naming, "
+    "minor clarity, optional refactors). If every finding is low/NIT-level (or "
+    "there are none), submit the review with `event: APPROVE` while STILL "
+    "including those findings as inline `comments` — an approval with "
+    "non-blocking nits attached, not an empty approval. If any finding is "
+    "blocking, submit with `event: COMMENT` instead and do not approve. Prefix "
+    "every comment body with its priority label, e.g. `[nit]`, `[low]`, or "
+    "`[blocking]`."
+)
+
 # Appended to POST_INLINE_PROMPT when the existing-comments fetch failed. The
 # alternative (empty `existing_block`) is indistinguishable from a PR that
 # genuinely has no prior comments, so without this hint Claude would happily
@@ -1810,10 +1834,13 @@ def build_review_prompt(
         (c.get("user") or {}).get("login") == my_login for c in existing
     )
     # GitHub returns 422 ("Can not approve your own pull request") on
-    # `event: APPROVE` for the author, so the auto-approve clause is gated
-    # separately on authorship — we still raise the bar on self re-reviews
-    # but drop the auto-approve instruction.
-    rereview_can_approve = rereview and author_login != my_login
+    # `event: APPROVE` for the author, so every auto-approve clause is gated on
+    # authorship — we still raise the bar on self re-reviews but drop the
+    # auto-approve instruction. Require a truthy `my_login` too: an unknown
+    # login can't *prove* the PR isn't ours, so we stay conservative (plain
+    # COMMENT) rather than risk a 422.
+    not_self_authored = bool(my_login) and author_login != my_login
+    rereview_can_approve = rereview and not_self_authored
 
     # Default subset → use the precomputed all-six constants (also what the
     # public `REVIEW_PROMPT_*` symbols document); any non-default subset
@@ -1865,6 +1892,15 @@ def build_review_prompt(
             if rereview_can_approve:
                 post += POST_INLINE_REREVIEW_APPROVE_SUFFIX
                 post += POST_INLINE_REREVIEW_RESOLVE_SUFFIX
+        elif not_self_authored and fetch_ok:
+            # `and fetch_ok`: a failed existing-comments fetch forces
+            # `existing=[]`, which forces `rereview=False` — so without this
+            # guard the approve clause would fire on a fetch failure and could
+            # auto-approve a PR we can't actually confirm is a first review
+            # (a re-review whose prior comments were unreachable looks
+            # identical). When the prior-comment state is unknown, stay
+            # conservative and fall through to plain `event: COMMENT`.
+            post += POST_INLINE_APPROVE_SUFFIX
         sections.append(post)
 
     return BuiltPrompt(

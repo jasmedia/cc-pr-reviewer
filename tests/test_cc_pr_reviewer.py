@@ -28,6 +28,7 @@ from cc_pr_reviewer import (
     CODEGRAPH_IMPACT_NUDGE,
     EXISTING_COMMENT_BODY_CAP,
     EXISTING_COMMENT_LIST_CAP,
+    POST_INLINE_APPROVE_SUFFIX,
     POST_INLINE_DEDUP_SUFFIX,
     POST_INLINE_FETCH_FAILED_SUFFIX,
     POST_INLINE_PROMPT,
@@ -309,6 +310,101 @@ def test_my_login_none_never_triggers_rereview() -> None:
     assert POST_INLINE_REREVIEW_SUFFIX not in built.text
     assert POST_INLINE_REREVIEW_APPROVE_SUFFIX not in built.text
     assert POST_INLINE_REREVIEW_RESOLVE_SUFFIX not in built.text
+
+
+def test_first_review_other_pr_appends_approve_suffix() -> None:
+    """A first review (no prior comment from us) of someone else's PR gets the
+    approve-with-nits verdict instruction, but none of the re-review chain."""
+    built = build_review_prompt(
+        post_inline=True,
+        extra_prompt="",
+        existing=[],
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+    )
+    assert not built.rereview
+    assert POST_INLINE_APPROVE_SUFFIX in built.text
+    assert POST_INLINE_REREVIEW_SUFFIX not in built.text
+    assert POST_INLINE_REREVIEW_APPROVE_SUFFIX not in built.text
+
+
+def test_first_review_self_authored_omits_approve_suffix() -> None:
+    """We can't approve our own PR (GitHub 422), so a first review of our own
+    PR keeps the plain COMMENT behavior."""
+    built = build_review_prompt(
+        post_inline=True,
+        extra_prompt="",
+        existing=[],
+        fetch_ok=True,
+        my_login="alice",
+        author_login="alice",
+    )
+    assert POST_INLINE_APPROVE_SUFFIX not in built.text
+
+
+def test_first_review_my_login_none_omits_approve_suffix() -> None:
+    """An unknown `my_login` can't prove the PR isn't ours, so stay
+    conservative and don't emit the approve instruction."""
+    built = build_review_prompt(
+        post_inline=True,
+        extra_prompt="",
+        existing=[],
+        fetch_ok=True,
+        my_login=None,
+        author_login="bob",
+    )
+    assert POST_INLINE_APPROVE_SUFFIX not in built.text
+
+
+def test_first_review_failed_fetch_omits_approve_suffix() -> None:
+    """A failed existing-comments fetch can't confirm this is a first review
+    (a re-review whose prior comments were unreachable looks identical), so
+    the approve clause must stay off — fall through to plain COMMENT."""
+    built = build_review_prompt(
+        post_inline=True,
+        extra_prompt="",
+        existing=[],
+        fetch_ok=False,
+        my_login="alice",
+        author_login="bob",
+    )
+    assert POST_INLINE_FETCH_FAILED_SUFFIX in built.text
+    assert POST_INLINE_APPROVE_SUFFIX not in built.text
+
+
+@pytest.mark.parametrize(
+    ("cli", "expected_base"),
+    [
+        ("claude", REVIEW_PROMPT_CLAUDE),
+        ("codex", REVIEW_PROMPT_SKILL_BASED),
+        ("gemini", REVIEW_PROMPT_SKILL_BASED),
+    ],
+)
+def test_first_review_approve_assembles_in_canonical_order(cli: str, expected_base: str) -> None:
+    """Lock the first-review approve-path assembly (parameterised over CLI so
+    the suffix matrix can't drift into branching on coding-agent choice). A
+    third-party comment triggers DEDUP but not re-review, so the approve
+    suffix follows the dedup suffix."""
+    existing = [_comment("charlie")]
+    built = build_review_prompt(
+        post_inline=True,
+        extra_prompt="x",
+        existing=existing,
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+        cli=cli,
+    )
+    expected = PROMPT_SECTION_SEP.join(
+        [
+            expected_base,
+            "Additional instructions from reviewer:\nx",
+            format_existing_comments(existing)[0],
+            POST_INLINE_PROMPT + POST_INLINE_DEDUP_SUFFIX + POST_INLINE_APPROVE_SUFFIX,
+        ]
+    )
+    assert built.text == expected
 
 
 # --- selected_agents subset (ConfirmScreen → build_review_prompt) ----------
@@ -638,7 +734,7 @@ def test_codegraph_suffix_placed_after_extra_prompt_before_existing() -> None:
             # nudge rides along with the hint as one section.
             f"{CODEGRAPH_HINT_SUFFIX} {CODEGRAPH_IMPACT_NUDGE}",
             format_existing_comments(existing)[0],
-            POST_INLINE_PROMPT + POST_INLINE_DEDUP_SUFFIX,
+            POST_INLINE_PROMPT + POST_INLINE_DEDUP_SUFFIX + POST_INLINE_APPROVE_SUFFIX,
         ]
     )
     assert built.text == expected
@@ -834,7 +930,7 @@ def test_affected_tests_block_lands_after_hint_before_existing(cli: str) -> None
             CODEGRAPH_HINT_SUFFIX,
             affected_block,
             format_existing_comments(existing)[0],
-            POST_INLINE_PROMPT + POST_INLINE_DEDUP_SUFFIX,
+            POST_INLINE_PROMPT + POST_INLINE_DEDUP_SUFFIX + POST_INLINE_APPROVE_SUFFIX,
         ]
     )
     assert built.text == expected
