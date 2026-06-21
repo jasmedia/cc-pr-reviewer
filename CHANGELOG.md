@@ -4,6 +4,46 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.0] — 2026-06-21
+
+### Added
+- **Approve first reviews that have only low/NIT findings** (PR #55).
+  On a first review of a PR the `gh` user did not author, the agent now
+  classifies each finding as blocking or low/NIT and, when nothing is
+  blocking, submits `event: APPROVE` (with the nit comments still
+  attached — GitHub accepts a comments array on an APPROVE) instead of a
+  bare `COMMENT`; each comment is prefixed with its priority label. Added
+  as `POST_INLINE_APPROVE_SUFFIX`, gated on the shared `not_self_authored`
+  predicate (preserving the self-approval 422 guard) and on `fetch_ok`, so
+  our own PR or an unknown login falls through to plain `COMMENT`.
+  Re-review behavior is unchanged (it already suppresses nits on repeat
+  passes).
+- **Minimal footer; preferences moved into the Settings modal** (PR #56).
+  The footer is trimmed from 14 keys to 6 visible — the view toggles
+  (`m`/`f`/`g`/`s`), persisted-pref cycles (`c`/`x`/`a`), and upgrade
+  (`u`) are hidden but still work on keypress and stay discoverable in the
+  command palette. Persisted prefs (CLI, CodeGraph, auto-refresh) now live
+  in the Settings modal as `Select`/`Checkbox` widgets alongside the Slack
+  webhook. Active view-state is surfaced as header-subtitle badges via the
+  new pure `build_state_badges` helper, replacing the dropped
+  `-state-active` footer highlight (this lets us delete `_set_footer_active`,
+  the `-state-active` CSS, the `bindings_updated_signal` subscription, and
+  the unused `FooterKey` import).
+- **Selectable, persisted color themes** (PR #57). A new `theme` setting
+  (K/V `settings` table) is surfaced as a `Select` at the top of the
+  Settings modal, applied live on save and at startup; `_resolve_theme`
+  falls back to the default on an unknown/hand-edited value. A custom
+  branded `claude-dark` theme (coral palette) is registered at mount,
+  offered alongside 15 built-ins and used as the default. Header subtitle
+  state badges are now color-coded by category via `_badge_style`
+  (filters/accent, arrangement/primary, tooling/success), and focused
+  modal widgets (`Select`/`Input`/`TextArea`/filter-list) gain an accent
+  border plus a tint boost on the settings `Checkbox`.
+
+### Fixed
+- PR #56 review follow-up: fixed a Settings modal crash, made the settings
+  save atomic, and corrected stale docs.
+
 ## [0.17.0] — 2026-06-09
 
 ### Added
