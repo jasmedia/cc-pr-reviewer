@@ -59,6 +59,7 @@ from textual.containers import Vertical, VerticalScroll
 from textual.content import Content
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen
+from textual.theme import Theme
 from textual.timer import Timer
 from textual.widgets import (
     Checkbox,
@@ -681,6 +682,95 @@ _CLI_CYCLE: dict[CliChoice, CliChoice] = {
     "gemini": "claude",
 }
 DEFAULT_CLI: CliChoice = "claude"
+
+# Custom branded theme — a warm dark palette built around Claude's coral
+# (`#d97757`). Registered on the running App (`on_mount`) before the
+# persisted theme is applied; offered in the Settings picker like any
+# built-in. Kept as a module constant (not built inline at mount) so its
+# name can seed `_THEME_OPTIONS`/`DEFAULT_THEME` and so tests can assert
+# on it without a running App. All widget styling is design-token based, so
+# this recolors the whole TUI with no CSS changes.
+CLAUDE_THEME_NAME = "claude-dark"
+CLAUDE_THEME = Theme(
+    name=CLAUDE_THEME_NAME,
+    primary="#d97757",  # Claude coral — titles, modal borders, status bar
+    secondary="#b0aea6",  # warm gray
+    accent="#e8a87c",  # lighter coral — [count] + version badges
+    foreground="#eae6dd",
+    background="#191613",  # warm near-black
+    surface="#1f1b17",
+    panel="#2a2520",
+    success="#8cb369",
+    warning="#e0af68",
+    error="#e06c75",
+    dark=True,
+)
+
+# Selectable color themes. The custom `claude-dark` (registered at mount)
+# leads; the rest are Textual built-ins. This tuple is the single source of
+# truth that both the load validator (`__init__`/`_resolve_theme`) and the
+# Settings-modal `Select` consult, so an unknown/hand-edited stored value
+# falls back to `DEFAULT_THEME`. We list the names explicitly rather than
+# importing `BUILTIN_THEMES` so the menu order is stable and curated (and so
+# a Textual upgrade that adds/removes a theme can't silently change what we
+# offer). The same picker is also reachable live via the command palette
+# (`Ctrl+P` → "Change theme"), but only the Settings-modal choice persists.
+_THEME_OPTIONS: tuple[str, ...] = (
+    CLAUDE_THEME_NAME,
+    "tokyo-night",
+    "textual-dark",
+    "textual-light",
+    "nord",
+    "gruvbox",
+    "catppuccin-mocha",
+    "catppuccin-latte",
+    "dracula",
+    "monokai",
+    "flexoki",
+    "solarized-light",
+    "solarized-dark",
+    "rose-pine",
+    "atom-one-dark",
+    "atom-one-light",
+)
+DEFAULT_THEME = CLAUDE_THEME_NAME
+
+
+# Header-subtitle badge colors keyed by the badge's leading token (the part
+# before `:`). Lets the at-a-glance state read by *category* — what-you-see
+# filters, view arrangement, tooling — instead of uniform dim. Tokens not
+# listed (and the `SUB_TITLE` base text) stay `dim`. See `format_title`.
+_BADGE_STYLES: dict[str, str] = {
+    "mine": "$accent",  # what-you-see filters
+    "repo": "$accent",
+    "group": "$primary",  # view arrangement
+    "sort": "$primary",
+    "cli": "$warning",  # tooling / behaviour
+    "codegraph": "$success",
+    "auto": "$success",
+}
+
+
+def _badge_style(badge: str) -> str:
+    """Style for one header-subtitle badge, keyed by its leading token.
+
+    Badges are either bare (`mine`, `codegraph`) or `key:value`
+    (`repo:o/r`, `cli:Codex`); both key off the part before the first `:`.
+    Unknown tokens fall back to `dim` so a future badge can't render
+    unstyled — it just stays neutral until added to `_BADGE_STYLES`.
+    """
+    return _BADGE_STYLES.get(badge.split(":", 1)[0], "dim")
+
+
+def _resolve_theme(stored: str) -> str:
+    """Coerce a stored theme name to a known one, else `DEFAULT_THEME`.
+
+    Guards against a hand-edited `settings` row or a theme that an upstream
+    Textual change dropped from `_THEME_OPTIONS` — assigning an unknown name
+    to `App.theme` would raise, so we fall back rather than crash on launch.
+    """
+    return stored if stored in _THEME_OPTIONS else DEFAULT_THEME
+
 
 # CLIs that consume bundled `.agents/skills/` material (i.e. ones that
 # need `_materialise_skills` / `_cleanup_skills` around the launch).
@@ -3123,13 +3213,15 @@ class SettingsResult:
     normalised to a stripped string; empty means "notifications off". The
     `cli` / `codegraph_assist` / `refresh_interval` fields are the persisted
     preferences that used to be footer cycle-keys (`c`/`x`/`a`) and now live
-    here as proper widgets.
+    here as proper widgets. `theme` is the persisted color theme (one of
+    `_THEME_OPTIONS`).
     """
 
     cli: CliChoice
     codegraph_assist: bool
     refresh_interval: int
     slack_webhook_url: str
+    theme: str
 
 
 # Auto-refresh options for the Settings dropdown: every distinct interval the
@@ -3144,13 +3236,13 @@ _REFRESH_OPTIONS: tuple[int, ...] = tuple(
 class SettingsScreen(ModalScreen[SettingsResult | None]):
     """Edit persisted app settings.
 
-    Hosts the persisted preferences — review CLI, CodeGraph assist,
-    auto-refresh interval, and the Slack incoming-webhook URL used to announce
-    completed reviews to a shared channel. Dismisses with a SettingsResult on
-    save (Enter) or None on cancel (Esc).
+    Hosts the persisted preferences — color theme, review CLI, CodeGraph
+    assist, auto-refresh interval, and the Slack incoming-webhook URL used to
+    announce completed reviews to a shared channel. Dismisses with a
+    SettingsResult on save (Enter) or None on cancel (Esc).
     """
 
-    AUTO_FOCUS = "#settings-cli"
+    AUTO_FOCUS = "#settings-theme"
 
     BINDINGS = [
         # `priority=True` so Enter/Esc win over the focused Input widget,
@@ -3167,6 +3259,7 @@ class SettingsScreen(ModalScreen[SettingsResult | None]):
         codegraph_assist: bool,
         refresh_interval: int,
         slack_webhook_url: str,
+        theme: str,
     ):
         super().__init__()
         self.cli = cli
@@ -3181,10 +3274,18 @@ class SettingsScreen(ModalScreen[SettingsResult | None]):
             refresh_interval if refresh_interval in _REFRESH_OPTIONS else _DEFAULT_REFRESH_SECS
         )
         self.slack_webhook_url = slack_webhook_url
+        self.theme_choice = theme
 
     def compose(self) -> ComposeResult:
         yield Vertical(
             Label("Settings", id="settings-title"),
+            Label("Theme:", id="settings-theme-label"),
+            Select(
+                [(t, t) for t in _THEME_OPTIONS],
+                value=self.theme_choice,
+                allow_blank=False,
+                id="settings-theme",
+            ),
             Label("Review CLI:", id="settings-cli-label"),
             Select(
                 [(_CLI_DISPLAY[c], c) for c in _CLI_CYCLE],
@@ -3224,6 +3325,7 @@ class SettingsScreen(ModalScreen[SettingsResult | None]):
                 codegraph_assist=self.query_one("#settings-codegraph", Checkbox).value,
                 refresh_interval=self.query_one("#settings-refresh", Select).value,
                 slack_webhook_url=self.query_one("#settings-slack", Input).value.strip(),
+                theme=self.query_one("#settings-theme", Select).value,
             )
         )
 
@@ -3388,6 +3490,23 @@ class PRReviewer(App):
     #filter-hint {
         margin-top: 1;
     }
+    /* Stronger focus affordance on modal form widgets. Textual's default
+       focus is subtle on a $panel background; recoloring the (already
+       present) border to $accent makes the active control unmistakable when
+       tabbing through the Settings / Confirm modals. Only widgets that
+       already carry a `tall` border are recolored, so focus never shifts
+       layout. The borderless Checkbox gets a background tint instead. */
+    #settings-container Select:focus,
+    #settings-container Select:focus-within,
+    #settings-container Input:focus,
+    #confirm-container Input:focus,
+    #confirm-container TextArea:focus,
+    #filter-list:focus {
+        border: tall $accent;
+    }
+    #settings-container Checkbox:focus {
+        background: $boost;
+    }
     """
 
     TITLE = "CC PR Reviewer"
@@ -3483,6 +3602,14 @@ class PRReviewer(App):
                     self._cli_fallback_from = persisted
         else:
             self.cli = persisted
+        # Persisted color theme. Validated against `_THEME_OPTIONS` so a
+        # hand-edited or upgrade-removed value falls back to `DEFAULT_THEME`
+        # rather than raising when applied. `App.theme` is a reactive that
+        # only takes effect on a running app, so we stash the resolved value
+        # here and assign `self.theme` in `on_mount`.
+        self._initial_theme: str = _resolve_theme(
+            _get_setting(self.review_db, "theme", DEFAULT_THEME)
+        )
         self._row_to_pr_idx: list[int | None] = []
         # Snapshot of `reviews_in_progress` rows from the most recent poll,
         # keyed by `pr_key`. `_poll_in_progress` diffs against this to
@@ -3521,6 +3648,13 @@ class PRReviewer(App):
         yield Footer()
 
     def on_mount(self) -> None:
+        # Register the custom branded theme before applying the persisted
+        # choice, so a stored/default `claude-dark` resolves to a real theme
+        # rather than raising. Built-ins are already registered by Textual.
+        self.register_theme(CLAUDE_THEME)
+        # Apply the persisted color theme now the app is running (App.theme is
+        # a reactive that no-ops until mount). Resolved+validated in __init__.
+        self.theme = self._initial_theme
         table = self.query_one("#pr-table", DataTable)
         # Explicit column keys so `_poll_in_progress` can target the
         # "Reviews" cell via `table.update_cell(row_key, "reviews", …)`
@@ -4328,6 +4462,7 @@ class PRReviewer(App):
                         "codegraph_assist": "1" if result.codegraph_assist else "0",
                         "refresh_interval": str(result.refresh_interval),
                         "slack_webhook_url": result.slack_webhook_url,
+                        "theme": result.theme,
                     },
                 )
             except sqlite3.Error as e:
@@ -4340,6 +4475,10 @@ class PRReviewer(App):
             self.codegraph_assist = result.codegraph_assist
             self._auto_refresh_secs = result.refresh_interval
             self.slack_webhook_url = result.slack_webhook_url
+            # Assigning the App.theme reactive re-themes the running app live
+            # (no restart). `result.theme` is constrained to `_THEME_OPTIONS`
+            # by the Select, so it's always a valid registered theme.
+            self.theme = result.theme
 
             # Restart the timer only when the interval actually changed, and
             # re-emit the CodeGraph health toast when the CLI changed — same
@@ -4357,6 +4496,12 @@ class PRReviewer(App):
                 codegraph_assist=self.codegraph_assist,
                 refresh_interval=self._auto_refresh_secs,
                 slack_webhook_url=self.slack_webhook_url,
+                # Coerce through `_resolve_theme` so a non-curated theme set
+                # live via the command palette (`Ctrl+P`) maps to a value the
+                # `Select` actually contains — otherwise its initial selection
+                # would be undefined and a no-touch save could silently persist
+                # the wrong theme.
+                theme=_resolve_theme(self.theme),
             ),
             _apply,
         )
@@ -4923,10 +5068,20 @@ class PRReviewer(App):
         else:
             title_content = Content.assemble((title, "bold $primary"))
         if sub_title:
+            # Subtitle is "<base description> · badge · badge …" (see
+            # `_refresh_state_badges`). The base stays dim; each state badge
+            # is tinted by category via `_badge_style` so the active state
+            # reads at a glance. Splitting on the same ` · ` separator the
+            # builder joins with — the base text has no embedded separator.
+            parts = sub_title.split(" · ")
+            sub_parts: list[Any] = [(parts[0], "dim")]
+            for badge in parts[1:]:
+                sub_parts.append((" · ", "dim"))
+                sub_parts.append((badge, _badge_style(badge)))
             return Content.assemble(
                 title_content,
                 (" — ", "dim"),
-                Content(sub_title).stylize("dim"),
+                Content.assemble(*sub_parts),
             )
         return title_content
 

@@ -25,9 +25,13 @@ from cc_pr_reviewer import (
     _REFRESH_CYCLE,
     _REFRESH_OPTIONS,
     _SKILL_COVERAGE,
+    _THEME_OPTIONS,
+    CLAUDE_THEME,
+    CLAUDE_THEME_NAME,
     CODEGRAPH_AFFECTED_TESTS_CAP,
     CODEGRAPH_HINT_SUFFIX,
     CODEGRAPH_IMPACT_NUDGE,
+    DEFAULT_THEME,
     EXISTING_COMMENT_BODY_CAP,
     EXISTING_COMMENT_LIST_CAP,
     POST_INLINE_APPROVE_SUFFIX,
@@ -47,6 +51,7 @@ from cc_pr_reviewer import (
     ReviewInProgressError,
     SettingsScreen,
     _approx_tokens,
+    _badge_style,
     _build_cli_command,
     _check_codegraph_setup,
     _cleanup_skills,
@@ -65,6 +70,7 @@ from cc_pr_reviewer import (
     _refresh_interval_label,
     _release_in_progress,
     _reserve_in_progress,
+    _resolve_theme,
     _review_cell,
     _set_setting,
     _skills_dir,
@@ -2635,6 +2641,7 @@ def test_settings_screen_mounts_with_offcycle_refresh(interval: int) -> None:
                     codegraph_assist=False,
                     refresh_interval=interval,
                     slack_webhook_url="",
+                    theme=DEFAULT_THEME,
                 )
             )
             await pilot.pause()
@@ -2809,6 +2816,45 @@ def test_slack_webhook_setting_round_trips_and_defaults_empty(review_db) -> None
     # Clearing it turns the feature back off.
     _set_setting(review_db, "slack_webhook_url", "")
     assert _get_setting(review_db, "slack_webhook_url", "") == ""
+
+
+def test_theme_setting_round_trips_and_defaults(review_db) -> None:
+    # Unset → the configured default.
+    assert _get_setting(review_db, "theme", DEFAULT_THEME) == DEFAULT_THEME
+    _set_setting(review_db, "theme", "nord")
+    assert _get_setting(review_db, "theme", DEFAULT_THEME) == "nord"
+
+
+def test_resolve_theme_passes_known_falls_back_on_unknown() -> None:
+    # Every offered theme resolves to itself.
+    for name in _THEME_OPTIONS:
+        assert _resolve_theme(name) == name
+    # The default is itself a known theme.
+    assert DEFAULT_THEME in _THEME_OPTIONS
+    # Unknown / hand-edited / blank → default (never raises).
+    assert _resolve_theme("no-such-theme") == DEFAULT_THEME
+    assert _resolve_theme("") == DEFAULT_THEME
+
+
+def test_branded_theme_is_offered_and_default() -> None:
+    # The custom theme's object name matches its constant, leads the picker,
+    # and is the out-of-the-box default.
+    assert CLAUDE_THEME.name == CLAUDE_THEME_NAME
+    assert CLAUDE_THEME_NAME in _THEME_OPTIONS
+    assert DEFAULT_THEME == CLAUDE_THEME_NAME
+
+
+def test_badge_style_maps_tokens_and_falls_back_to_dim() -> None:
+    # Bare tokens and key:value badges both key off the part before `:`.
+    assert _badge_style("mine") == "$accent"
+    assert _badge_style("repo:owner/x") == "$accent"
+    assert _badge_style("group:repo") == "$primary"
+    assert _badge_style("sort:updated") == "$primary"
+    assert _badge_style("cli:Codex") == "$warning"
+    assert _badge_style("codegraph") == "$success"
+    assert _badge_style("auto:1h") == "$success"
+    # Unknown token → neutral dim, never unstyled.
+    assert _badge_style("future:thing") == "dim"
 
 
 def test_build_slack_payload_escapes_mrkdwn_special_chars_in_title() -> None:
