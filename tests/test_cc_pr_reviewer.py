@@ -22,6 +22,8 @@ import pytest
 import cc_pr_reviewer as _mod
 from cc_pr_reviewer import (
     _APP_HOSTNAME,
+    _REFRESH_CYCLE,
+    _REFRESH_OPTIONS,
     _SKILL_COVERAGE,
     CODEGRAPH_AFFECTED_TESTS_CAP,
     CODEGRAPH_HINT_SUFFIX,
@@ -43,6 +45,7 @@ from cc_pr_reviewer import (
     SKILL_FILE_NAME,
     InProgressHolder,
     ReviewInProgressError,
+    SettingsScreen,
     _approx_tokens,
     _build_cli_command,
     _check_codegraph_setup,
@@ -2568,6 +2571,9 @@ def test_build_state_badges_all_default_is_empty() -> None:
         ({"auto_refresh_secs": 900}, "auto:15m"),
         # The default CLI never shows a badge — only a non-default one does.
         ({"cli": "claude"}, ""),
+        # An empty (but non-None) repo filter is a reachable state and must
+        # not render a badge — locks the truthiness contract for `str | None`.
+        ({"repo_filter": ""}, ""),
     ],
 )
 def test_build_state_badges_single(override: dict[str, Any], expected: str) -> None:
@@ -2588,6 +2594,54 @@ def test_build_state_badges_combined_order() -> None:
     assert badges == (
         "mine · repo:o/x · group:author · sort:updated · cli:Gemini · codegraph · auto:1h"
     )
+
+
+# --- auto-refresh Settings dropdown (regression: PR #56 P0 crash) -----------
+
+
+def test_refresh_options_match_cycle() -> None:
+    """The dropdown's options are exactly the cycle's reachable values.
+
+    Pins `_REFRESH_OPTIONS` so it can't silently drift from `_REFRESH_CYCLE`,
+    which is the invariant the Settings `Select` depends on for its values.
+    """
+    assert _REFRESH_OPTIONS == (0, 900, 1800, 3600)
+    assert set(_REFRESH_OPTIONS) == set(_REFRESH_CYCLE) | set(_REFRESH_CYCLE.values())
+
+
+@pytest.mark.parametrize("interval", [300, 120, 7200, 60])
+def test_settings_screen_mounts_with_offcycle_refresh(interval: int) -> None:
+    """An off-cycle `refresh_interval` must not crash the Settings modal.
+
+    `parse_refresh_interval` tolerates hand-edited/legacy values (floored at
+    60s), so a persisted `300` is a legal session value — but feeding it
+    straight into `Select(allow_blank=False)` raises `InvalidSelectValueError`
+    on mount, taking the app down on `,` with no way back in to fix it. The
+    modal snaps off-cycle values to a legal option; assert it mounts cleanly.
+    """
+    import asyncio
+
+    from textual.app import App
+    from textual.widgets import Select
+
+    async def _run() -> int:
+        app: App = App()
+        async with app.run_test() as pilot:
+            # Mounting the modal is the regression site: an off-cycle value
+            # would raise InvalidSelectValueError here.
+            await app.push_screen(
+                SettingsScreen(
+                    cli="claude",
+                    codegraph_assist=False,
+                    refresh_interval=interval,
+                    slack_webhook_url="",
+                )
+            )
+            await pilot.pause()
+            return app.screen.query_one("#settings-refresh", Select).value
+
+    # No exception == the regression is fixed; the snapped value is legal.
+    assert asyncio.run(_run()) in _REFRESH_OPTIONS
 
 
 class _NotifyFake:

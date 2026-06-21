@@ -2128,6 +2128,25 @@ def _set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
     conn.commit()
 
 
+def _set_settings(conn: sqlite3.Connection, items: dict[str, str]) -> None:
+    """Upsert several settings atomically (all-or-nothing).
+
+    Calling `_set_setting` per key commits each write independently, so a
+    mid-sequence error leaves earlier keys committed to disk while the caller
+    bails — a partial save. Batching into one `with conn:` transaction commits
+    on success and rolls back on any exception, so a multi-field save (the
+    Settings modal) either lands fully or not at all.
+    """
+    with conn:
+        conn.executemany(
+            """
+            INSERT INTO settings (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            list(items.items()),
+        )
+
+
 def _load_review_state(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
     rows = conn.execute("SELECT * FROM reviews").fetchall()
     return {r["pr_key"]: dict(r) for r in rows}
@@ -3152,7 +3171,15 @@ class SettingsScreen(ModalScreen[SettingsResult | None]):
         super().__init__()
         self.cli = cli
         self.codegraph_assist = codegraph_assist
-        self.refresh_interval = refresh_interval
+        # Snap to a legal dropdown option: the rest of the app tolerates
+        # hand-edited / legacy intervals (`parse_refresh_interval` only floors
+        # them at 60s), but `Select(allow_blank=False)` raises
+        # `InvalidSelectValueError` on mount for any value not in its options —
+        # which would take the whole app down on `,`. Defaulting an off-cycle
+        # value keeps the modal openable; saving then persists a legal value.
+        self.refresh_interval = (
+            refresh_interval if refresh_interval in _REFRESH_OPTIONS else _DEFAULT_REFRESH_SECS
+        )
         self.slack_webhook_url = slack_webhook_url
 
     def compose(self) -> ComposeResult:
@@ -3375,8 +3402,10 @@ class PRReviewer(App):
         # footer (`show=False`) to keep the bar minimal — they still work on
         # keypress and stay discoverable in the `^p` command palette. The
         # persisted prefs (`c`/`x`/`a`) also have a home in the Settings modal
-        # (`,`); `u`/Upgrade self-advertises via the header "Release Notes"
-        # badge. Active view-state is surfaced as header-subtitle badges (see
+        # (`,`); `u`/Upgrade self-advertises via the `#version-badge` (shown
+        # only when an update is available — the header "Release Notes" link is
+        # a static changelog link, unrelated to update availability). Active
+        # view-state is surfaced as header-subtitle badges (see
         # `_refresh_state_badges`) since the footer no longer highlights it.
         Binding("m", "toggle_mine", "Toggle my PRs", show=False),
         Binding("f", "filter", "Filter by repo", show=False),
@@ -4242,10 +4271,9 @@ class PRReviewer(App):
             if result is None or result.repo == self.repo_filter:
                 return
             if self._set_repo_filter(result.repo):
-                # The modal-pop's bindings_updated_signal fires before this
-                # callback runs, so the highlight refresh from the signal
-                # subscriber sees the OLD filter value. Refresh again here
-                # so the `f` key reflects the just-applied filter.
+                # `_set_repo_filter` persists the filter but doesn't touch the
+                # subtitle, so refresh the state badges here to reflect the
+                # just-applied filter before the list reloads.
                 self._refresh_state_badges()
                 self.action_refresh()
 
@@ -4286,19 +4314,22 @@ class PRReviewer(App):
         def _apply(result: SettingsResult | None) -> None:
             if result is None:
                 return
-            # Persist every field first so session and disk can't diverge on a
-            # write failure; on any failure keep the prior values and bail with
-            # a warning. Mirrors the per-key warn-on-failure pattern the
-            # individual toggle actions use (`action_toggle_cli` et al.).
+            # Persist all fields atomically *before* touching in-memory state,
+            # so a write failure can't leave session and disk diverged:
+            # `_set_settings` is all-or-nothing (one transaction), and on
+            # failure we bail with a warning having mutated neither disk nor
+            # `self`. (Per-key `_set_setting` would commit each write
+            # independently — a mid-sequence error there leaves a partial save.)
             try:
-                _set_setting(self.review_db, "cli", result.cli)
-                _set_setting(
+                _set_settings(
                     self.review_db,
-                    "codegraph_assist",
-                    "1" if result.codegraph_assist else "0",
+                    {
+                        "cli": result.cli,
+                        "codegraph_assist": "1" if result.codegraph_assist else "0",
+                        "refresh_interval": str(result.refresh_interval),
+                        "slack_webhook_url": result.slack_webhook_url,
+                    },
                 )
-                _set_setting(self.review_db, "refresh_interval", str(result.refresh_interval))
-                _set_setting(self.review_db, "slack_webhook_url", result.slack_webhook_url)
             except sqlite3.Error as e:
                 self.notify(f"Couldn't save settings: {e}", severity="warning")
                 return
