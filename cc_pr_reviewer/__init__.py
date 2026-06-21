@@ -4496,7 +4496,12 @@ class PRReviewer(App):
                 codegraph_assist=self.codegraph_assist,
                 refresh_interval=self._auto_refresh_secs,
                 slack_webhook_url=self.slack_webhook_url,
-                theme=self.theme,
+                # Coerce through `_resolve_theme` so a non-curated theme set
+                # live via the command palette (`Ctrl+P`) maps to a value the
+                # `Select` actually contains — otherwise its initial selection
+                # would be undefined and a no-touch save could silently persist
+                # the wrong theme.
+                theme=_resolve_theme(self.theme),
             ),
             _apply,
         )
