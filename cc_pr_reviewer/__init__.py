@@ -3982,11 +3982,20 @@ class PRReviewer(App):
             "•  g: group  •  s: sort  •  r: refresh  •  u: upgrade  •  q: quit",
             error=bool(mine_error),
         )
-        # Restore the cursor onto the PR it was on before an auto rebuild.
-        # A no-op if the PR is gone (merged/closed) — cursor stays at the
-        # default top row.
-        if prev_cursor_key is not None:
-            self._move_cursor_to_pr(prev_cursor_key)
+        if auto:
+            # Background tick: restore the cursor onto the PR it was on before
+            # the rebuild so an auto refresh isn't disruptive. A no-op if the
+            # PR is gone (merged/closed) — cursor stays at the default top row.
+            if prev_cursor_key is not None:
+                self._move_cursor_to_pr(prev_cursor_key)
+        else:
+            # Manual refresh / initial load: land on the first selectable PR
+            # row (skips a leading group header) and focus the table so the
+            # highlight is visible and Enter/arrows work without a click first.
+            first = self._first_pr_row()
+            if first is not None:
+                table.move_cursor(row=first)
+            table.focus()
 
     def _maybe_notify_new_prs(self, data: list[dict[str, Any]], auto: bool) -> bool:
         """Diff `data`'s review-requested PRs against the last-fetched
@@ -4025,6 +4034,14 @@ class PRReviewer(App):
             if idx is not None:
                 p = self.prs[idx]
                 return (p["repository"]["nameWithOwner"], p["number"])
+        return None
+
+    def _first_pr_row(self) -> int | None:
+        """Row index of the first selectable PR row (skips group headers),
+        or None when the table holds no PR rows."""
+        for row, idx in enumerate(self._row_to_pr_idx):
+            if idx is not None:
+                return row
         return None
 
     def _move_cursor_to_pr(self, prev_key: tuple[str, int]) -> None:
