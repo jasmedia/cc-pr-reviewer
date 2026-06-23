@@ -4,6 +4,75 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.2] — 2026-06-23
+
+### Added
+- **Per-PR git worktrees isolate parallel reviews of the same repo** (PR #60).
+  Two different PRs in the same repo could both reserve successfully (the
+  in-progress reservation is per-PR) and then both run `gh pr checkout
+  --force` in the single shared `$GH_PR_WORKSPACE/<owner>/<repo>` tree — the
+  second clobbered the first. Now the shared clone stays the **primary** (a
+  fetched-but-never-checked-out object store) and each PR is checked out into
+  an ephemeral worktree at `$GH_PR_WORKSPACE/.worktrees/<owner>/<repo>/<number>`
+  via `git worktree add --detach` + `gh pr checkout --detach`. Every
+  agent-facing operation (checkout, `HEAD` capture, skill materialise,
+  CodeGraph, MCP probe, CLI launch cwd) moves to the worktree; only clone/fetch
+  stay on the primary. The worktree is removed in the `finally` block before the
+  reservation is released, and `git worktree prune` + leftover-removal makes
+  crash recovery self-healing.
+- **CodeGraph index is auto-seeded into each worktree instead of prompting**
+  (PR #60). The per-PR worktree change made the CodeGraph "Initialize now?
+  [y/N]" prompt fire on every review (ephemeral worktrees never carry an
+  index), turning a once-per-repo step into a per-launch nag. The index is now
+  maintained on the primary clone (a frozen tree, indexed once) and seeded into
+  each worktree via `_seed_worktree_codegraph`, which copies
+  `codegraph.db`/`-wal` — safe because CodeGraph stores project-relative paths,
+  so the index is portable between worktrees of the same repo; the existing
+  `codegraph sync` then re-indexes only the PR's diff. Fully automatic when the
+  `codegraph_assist` (`x`) toggle is on — no prompt. A seed failure falls back
+  to a one-off full worktree init.
+
+### Fixed
+- Hardening folded in from PR #60 review:
+  - **Orphaned worktrees self-heal.** A crash that left the worktree dir but
+    lost git's registration wedged the PR permanently — `git worktree remove
+    --force` exits 128 and the dir survives, then `git worktree add --force`
+    also exits 128 ("already exists"). A `shutil.rmtree` fallback now makes the
+    self-heal the comment/CLAUDE.md promised actually hold.
+  - **Warn (don't silently proceed) when `git fetch --all --prune` on the
+    primary clone fails**, so a stale primary doesn't quietly feed an
+    out-of-date worktree.
+  - The `finally` teardown now checks the worktree path still exists after
+    removal and **warns on a silent survival** instead of leaking it.
+  - WAL-absent seed-path test coverage added; docstring/comment nits.
+
+## [0.18.1] — 2026-06-21
+
+### Changed
+- **Decluttered header; list-reshaping toggles surfaced on the footer with
+  an active highlight** (PR #58). The header subtitle (static tagline +
+  active-state badges) is removed, so the header is a single uncluttered
+  `CC PR Reviewer [count]` line that no longer truncates mid-word on narrow
+  terminals. The `My PRs` (`m`), `Group by` (`g`), and `Sort by` (`s`)
+  toggles now show on the previously sparse footer, and the at-a-glance
+  "mode is on" cue the removed badges carried returns as a highlighted
+  footer key: `StateAwareFooter` re-applies the `-active` class in
+  `compose` so it survives footer recomposes (focus/binding changes, modal
+  push/pop), driven by the pure `_footer_action_active` predicate and
+  `_refresh_footer_highlights`. This reverses the header-subtitle-badge
+  direction introduced in 0.18.0 (PRs #56–#57) — the now-dead helpers
+  (`build_state_badges`, `_refresh_state_badges`, `_badge_style`,
+  `_BADGE_STYLES`) and their call sites are deleted, and `format_title`
+  renders title-only.
+
+### Fixed
+- **Focus the first PR row after a manual refresh / initial load** (PR #59).
+  The cursor now lands on the first selectable PR row and the table is
+  focused on manual refresh and initial load, so the highlight is visible
+  and Enter/arrows work without clicking first. A leading group-header row
+  is skipped when grouping is active; auto-refresh keeps its existing
+  cursor-restore behavior.
+
 ## [0.18.0] — 2026-06-21
 
 ### Added
@@ -850,6 +919,9 @@ Initial release.
 - Prereq checks for `gh`, `claude`, `git`, and the **PR Review Toolkit**
   Claude Code plugin.
 
+[0.18.2]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.18.2
+[0.18.1]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.18.1
+[0.18.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.18.0
 [0.17.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.17.0
 [0.16.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.16.0
 [0.15.0]: https://github.com/jasmedia/cc-reviewer/releases/tag/v0.15.0
