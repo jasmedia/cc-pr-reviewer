@@ -72,6 +72,7 @@ from cc_pr_reviewer import (
     _reserve_in_progress,
     _resolve_theme,
     _review_cell,
+    _seed_worktree_codegraph,
     _set_setting,
     _skills_dir,
     _worktree_path,
@@ -2539,6 +2540,47 @@ def test_worktree_path_separates_from_clone_namespace() -> None:
     wt = _worktree_path("o", "n", 1)
     assert wt != primary
     assert primary not in wt.parents
+
+
+# --- _seed_worktree_codegraph ----------------------------------------------
+
+
+def _make_primary_index(primary: Path) -> None:
+    """Stand up a minimal `.codegraph/` like `codegraph init` would."""
+    cg = primary / ".codegraph"
+    cg.mkdir(parents=True)
+    (cg / "codegraph.db").write_bytes(b"DBDATA")
+    (cg / "codegraph.db-wal").write_bytes(b"WALDATA")
+    (cg / "codegraph.db-shm").write_bytes(b"SHMDATA")
+    (cg / ".gitignore").write_text("*.db\n")
+    (cg / "daemon.log").write_text("noise\n")
+
+
+def test_seed_worktree_codegraph_missing_source_returns_false(tmp_path: Path) -> None:
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    assert _seed_worktree_codegraph(primary, worktree) is False
+    assert not (worktree / ".codegraph").exists()
+
+
+def test_seed_worktree_codegraph_copies_db_and_wal(tmp_path: Path) -> None:
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    _make_primary_index(primary)
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    assert _seed_worktree_codegraph(primary, worktree) is True
+    dst = worktree / ".codegraph"
+    assert (dst / "codegraph.db").read_bytes() == b"DBDATA"
+    assert (dst / "codegraph.db-wal").read_bytes() == b"WALDATA"
+    assert (dst / ".gitignore").read_text() == "*.db\n"
+    # `-shm` is rebuilt by SQLite, and daemon state is per-process — neither
+    # should be copied into the worktree.
+    assert not (dst / "codegraph.db-shm").exists()
+    assert not (dst / "daemon.log").exists()
 
 
 @pytest.mark.parametrize(

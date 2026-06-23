@@ -1571,6 +1571,37 @@ def _check_codegraph_setup(
     return "wired" if mcp_state is True else "binary-only"
 
 
+def _seed_worktree_codegraph(primary_path: Path, worktree_path: Path) -> bool:
+    """Copy the primary clone's CodeGraph index into a fresh worktree.
+
+    Lets a per-PR review pay only a fast incremental `codegraph sync` of
+    the PR's diff instead of a ~30s full re-index every launch. Safe
+    because codegraph stores file paths *relative* to the project root,
+    so an index built in the primary clone is portable into any worktree
+    of the same repo (identical relative layout).
+
+    Copies only the SQLite db files, never the daemon socket/pid/log. The
+    `-shm` shared-memory file is intentionally skipped — SQLite rebuilds
+    it — while `-wal` is copied so recently-committed (un-checkpointed)
+    rows aren't lost. Best-effort: returns False (caller falls back to a
+    full init/sync in the worktree) if the source index is missing or a
+    copy fails.
+    """
+    src = primary_path / ".codegraph"
+    if not (src / "codegraph.db").is_file():
+        return False
+    dst = worktree_path / ".codegraph"
+    try:
+        dst.mkdir(parents=True, exist_ok=True)
+        for fname in ("codegraph.db", "codegraph.db-wal", ".gitignore"):
+            f = src / fname
+            if f.is_file():
+                shutil.copy2(f, dst / fname)
+    except OSError:
+        return False
+    return (dst / "codegraph.db").is_file()
+
+
 def _collect_codegraph_affected(local_path: Path, repo: str, number: int) -> list[str]:
     """Resolve the PR's base ref and pipe the diff into `codegraph affected`.
 
@@ -4754,41 +4785,33 @@ class PRReviewer(App):
                 # against the probe-vs-launch race (binary uninstalled
                 # mid-launch) via `OSError` guards.
                 codegraph_on_path = shutil.which("codegraph") is not None
-                # CodeGraph is anchored to the per-PR WORKTREE, not the
-                # primary clone: the agent launches with `cwd=worktree_path`,
-                # so its MCP server resolves `.codegraph/` from there. The
-                # cost is that an ephemeral worktree starts without an index,
-                # so a `codegraph_assist` user re-indexes (~30s) per review
-                # rather than amortising — the deliberate trade-off for
-                # branch-accurate, collision-free parallel reviews.
                 codegraph_present = (worktree_path / ".codegraph").is_dir()
 
-                # Tier 3: opt-in init helper. When `self.codegraph_assist`
-                # is on (`x` toggle) AND this worktree doesn't yet have an
-                # index AND the `codegraph` binary is on PATH, prompt the
-                # user during the suspended terminal session to bootstrap
-                # one. We never auto-init — `codegraph init --index` can
-                # take ~30s on a large repo and adds files to the worktree,
-                # so it's a conscious user step. The toggle's only purpose
-                # is to make that step opt-in rather than nag-on-every-launch.
+                # CodeGraph anchors to the per-PR WORKTREE (the agent's
+                # `cwd`, where its MCP server resolves `.codegraph/`), but
+                # an ephemeral worktree starts empty. To avoid a ~30s full
+                # re-index — or a y/N prompt — on every launch, we maintain
+                # the index on the PRIMARY clone (a *frozen* tree: we fetch
+                # but never check it out, so it's indexed once and stays
+                # valid) and SEED each worktree from it. `codegraph.db`
+                # stores paths relative to the project root, so the index
+                # is portable between worktrees of the same repo; the sync
+                # block below then incrementally re-indexes only the PR's
+                # diff. Gated on the `codegraph_assist` (`x`) toggle, which
+                # is now full consent to manage the index automatically —
+                # no per-launch prompt (which, with ephemeral worktrees,
+                # would fire every single review).
                 if not codegraph_present and self.codegraph_assist and codegraph_on_path:
-                    print(
-                        f"\nNo CodeGraph index in {worktree_path}. "
-                        "`codegraph init --index` takes ~30s; the per-PR worktree is "
-                        "ephemeral, so this runs fresh each review."
-                    )
-                    # Match the EOFError pattern established at the upgrade
-                    # path: non-interactive / piped stdin must not crash
-                    # the launch; an EOF is a "no" and we move on.
-                    answer = "n"
-                    with contextlib.suppress(EOFError):
-                        answer = input("Initialize CodeGraph now? [y/N]: ").strip().lower()
-                    if answer in ("y", "yes"):
-                        print("Running `codegraph init --index`…")
+                    primary_index = primary_path / ".codegraph"
+                    if not primary_index.is_dir():
+                        print(
+                            f"\nBuilding CodeGraph index for {primary_path} "
+                            "(one-time per repo, ~30s; reused by every future review)…"
+                        )
                         init_rc = 1
                         try:
                             init_rc = subprocess.call(
-                                ["codegraph", "init", str(worktree_path), "--index"]
+                                ["codegraph", "init", str(primary_path), "--index"]
                             )
                         except OSError as e:
                             # Mirrors the `uv tool upgrade` path: ENOENT/
@@ -4797,16 +4820,30 @@ class PRReviewer(App):
                             # an uncaught OSError post-`suspend()` drops
                             # the user into a half-restored terminal.
                             print(f"\nFailed to launch `codegraph init`: {e}")
-                        if init_rc == 0:
-                            # Re-probe — the sync block below now becomes a
-                            # no-op (the just-built index is current), and
-                            # `build_review_prompt` gets the right flag.
-                            codegraph_present = (worktree_path / ".codegraph").is_dir()
-                        else:
+                        if init_rc != 0:
                             print(
                                 f"warning: `codegraph init --index` exited with status {init_rc}; "
                                 "continuing without an index."
                             )
+                    if primary_index.is_dir():
+                        print("Seeding CodeGraph index into the worktree from the primary clone…")
+                        if _seed_worktree_codegraph(primary_path, worktree_path):
+                            codegraph_present = True
+                        else:
+                            # Seeding failed (copy error). Fall back to a full
+                            # index in the worktree so the session still gets
+                            # tools — just slower this once.
+                            print(
+                                "warning: couldn't seed from the primary clone; "
+                                "building a fresh index in the worktree (~30s)…"
+                            )
+                            try:
+                                subprocess.call(
+                                    ["codegraph", "init", str(worktree_path), "--index"]
+                                )
+                            except OSError as e:
+                                print(f"\nFailed to launch `codegraph init`: {e}")
+                            codegraph_present = (worktree_path / ".codegraph").is_dir()
 
                 # If the user has wired CodeGraph into this workspace
                 # (`codegraph init` writes `.codegraph/`), refresh the
