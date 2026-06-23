@@ -47,6 +47,7 @@ from cc_pr_reviewer import (
     REVIEW_SKILL_LABELS,
     REVIEW_SKILLS,
     SKILL_FILE_NAME,
+    WORKSPACE,
     InProgressHolder,
     ReviewInProgressError,
     SettingsScreen,
@@ -71,8 +72,10 @@ from cc_pr_reviewer import (
     _reserve_in_progress,
     _resolve_theme,
     _review_cell,
+    _seed_worktree_codegraph,
     _set_setting,
     _skills_dir,
+    _worktree_path,
     build_review_prompt,
     build_slack_payload,
     check_prereqs,
@@ -2514,6 +2517,85 @@ def test_new_review_pr_keys_ignores_removals() -> None:
 def test_new_review_pr_keys_distinguishes_repos_with_same_number() -> None:
     prs = [_pr("o/a", 1, "2025-01-01T00:00:00Z"), _pr("o/b", 1, "2025-01-01T00:00:00Z")]
     assert new_review_pr_keys({"o/a#1"}, prs) == {"o/b#1"}
+
+
+# --- _worktree_path --------------------------------------------------------
+
+
+def test_worktree_path_layout() -> None:
+    assert _worktree_path("o", "n", 42) == WORKSPACE / ".worktrees" / "o" / "n" / "42"
+
+
+def test_worktree_path_distinct_per_number() -> None:
+    """The core isolation invariant: each PR number maps to its own
+    worktree, so two parallel reviews of different PRs never collide."""
+    assert _worktree_path("o", "n", 1) != _worktree_path("o", "n", 2)
+
+
+def test_worktree_path_separates_from_clone_namespace() -> None:
+    """The worktree must live OUTSIDE the `owner/name` primary-clone path,
+    so `primary_path.exists()` clone-vs-fetch detection can't be tripped by
+    a worktree dir."""
+    primary = WORKSPACE / "o" / "n"
+    wt = _worktree_path("o", "n", 1)
+    assert wt != primary
+    assert primary not in wt.parents
+
+
+# --- _seed_worktree_codegraph ----------------------------------------------
+
+
+def _make_primary_index(primary: Path) -> None:
+    """Stand up a minimal `.codegraph/` like `codegraph init` would."""
+    cg = primary / ".codegraph"
+    cg.mkdir(parents=True)
+    (cg / "codegraph.db").write_bytes(b"DBDATA")
+    (cg / "codegraph.db-wal").write_bytes(b"WALDATA")
+    (cg / "codegraph.db-shm").write_bytes(b"SHMDATA")
+    (cg / ".gitignore").write_text("*.db\n")
+    (cg / "daemon.log").write_text("noise\n")
+
+
+def test_seed_worktree_codegraph_missing_source_returns_false(tmp_path: Path) -> None:
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    assert _seed_worktree_codegraph(primary, worktree) is False
+    assert not (worktree / ".codegraph").exists()
+
+
+def test_seed_worktree_codegraph_copies_db_and_wal(tmp_path: Path) -> None:
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    _make_primary_index(primary)
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    assert _seed_worktree_codegraph(primary, worktree) is True
+    dst = worktree / ".codegraph"
+    assert (dst / "codegraph.db").read_bytes() == b"DBDATA"
+    assert (dst / "codegraph.db-wal").read_bytes() == b"WALDATA"
+    assert (dst / ".gitignore").read_text() == "*.db\n"
+    # `-shm` is rebuilt by SQLite, and daemon state is per-process — neither
+    # should be copied into the worktree.
+    assert not (dst / "codegraph.db-shm").exists()
+    assert not (dst / "daemon.log").exists()
+
+
+def test_seed_worktree_codegraph_succeeds_without_wal(tmp_path: Path) -> None:
+    """A checkpointed source (no `-wal`) still seeds: the `-wal` copy is
+    skipped when absent, not treated as a failure."""
+    primary = tmp_path / "primary"
+    (primary / ".codegraph").mkdir(parents=True)
+    (primary / ".codegraph" / "codegraph.db").write_bytes(b"DBDATA")
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    assert _seed_worktree_codegraph(primary, worktree) is True
+    dst = worktree / ".codegraph"
+    assert (dst / "codegraph.db").read_bytes() == b"DBDATA"
+    assert not (dst / "codegraph.db-wal").exists()
 
 
 @pytest.mark.parametrize(
