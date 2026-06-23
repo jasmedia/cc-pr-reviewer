@@ -2001,6 +2001,23 @@ def _pr_key(pr: dict[str, Any]) -> str:
     return f"{pr['repository']['nameWithOwner']}#{pr['number']}"
 
 
+def _worktree_path(owner: str, name: str, number: int) -> Path:
+    """Filesystem location of the per-PR git worktree.
+
+    The primary clone lives at `WORKSPACE/owner/name` (shared `.git`
+    object store); each review checks its PR out into an isolated
+    worktree here so concurrent reviews of *different* PRs in the same
+    repo don't race on a single working tree (the `gh pr checkout
+    --force` clobber this layout exists to prevent).
+
+    The dot-prefixed top-level `.worktrees/` keeps these dirs out of the
+    `owner/name` namespace — so the `primary_path.exists()` clone-vs-fetch
+    check in `_launch_claude` can never be tripped by a worktree dir — and
+    makes the whole set trivially sweepable.
+    """
+    return WORKSPACE / ".worktrees" / owner / name / str(number)
+
+
 def new_review_pr_keys(previous: set[str], current_prs: list[dict[str, Any]]) -> set[str]:
     """PR keys among the current review-requested PRs that aren't in `previous`.
 
@@ -4566,7 +4583,14 @@ class PRReviewer(App):
         repo_full = pr["repository"]["nameWithOwner"]
         owner, name = repo_full.split("/", 1)
         number = pr["number"]
-        local_path = WORKSPACE / owner / name
+        # `primary_path` is the shared clone (git object store + remote
+        # refs) reused across every review of this repo; `worktree_path`
+        # is this PR's isolated checkout. Everything the agent touches
+        # runs in the worktree so two concurrent reviews of *different*
+        # PRs in the same repo can't clobber each other's checkout — the
+        # `gh pr checkout --force` race this layout exists to prevent.
+        primary_path = WORKSPACE / owner / name
+        worktree_path = _worktree_path(owner, name, number)
         key = _pr_key(pr)
 
         # Pre-flight: surface a missing CLI binary as a toast in the TUI
@@ -4620,13 +4644,14 @@ class PRReviewer(App):
             WORKSPACE.mkdir(parents=True, exist_ok=True)
             print(f"\n── Reviewing {repo_full}#{number} with {_CLI_DISPLAY[cli]} ──\n")
 
-            # Reserve BEFORE clone/checkout: `gh pr checkout --force`
-            # mutates the shared workspace tree. Two tabs both passing
-            # the action_review gate would otherwise both run that
-            # command and switch branches under each other — the very
-            # race this feature exists to prevent. Hold the reservation
-            # across the entire suspend block so every existing
-            # early-return path still releases (clone-fail, checkout-fail,
+            # Reserve BEFORE clone/checkout. The reservation is per-PR, so
+            # it doesn't serialise peers reviewing *different* PRs of the
+            # same repo — that isolation now comes from the per-PR worktree
+            # below. What it still guards is two tabs reviewing the *same*
+            # PR, which would otherwise both target the same `worktree_path`
+            # and race on it. Hold the reservation across the entire suspend
+            # block so every existing early-return path still releases
+            # (clone-fail, worktree-fail, checkout-fail,
             # ReviewInProgressError, Ctrl-C, clean exit).
             try:
                 _reserve_in_progress(self.review_db, key, expected_holder=expected_holder)
@@ -4642,9 +4667,14 @@ class PRReviewer(App):
 
             # Captured here so the `finally` block can call `_cleanup_skills`
             # only if materialisation actually completed — early-return paths
-            # below (clone-fail, checkout-fail) leave it `None` and skip the
-            # restore.
+            # below (clone-fail, worktree-fail, checkout-fail) leave it `None`
+            # and skip the restore.
             skills_manifest: _MaterialisedSkills | None = None
+            # Set True only once `git worktree add` (or reuse) succeeds, so
+            # the `finally` block removes a worktree only if we actually
+            # created one — the clone-fail / worktree-add-fail early returns
+            # above it leave nothing to tear down.
+            worktree_created = False
             try:
                 # Pause auto-refresh for the suspended session so a background
                 # tick can't rebuild the table while the agent owns the TTY.
@@ -4654,30 +4684,64 @@ class PRReviewer(App):
                 # leak (a `mkdir`/`reserve` failure above never sets it, so
                 # auto-refresh can't silently die for the session).
                 self._suspended_for_review = True
-                if not local_path.exists():
-                    print(f"Cloning {repo_full} → {local_path}…")
-                    if subprocess.call(["gh", "repo", "clone", repo_full, str(local_path)]) != 0:
+                # Primary clone: shared object store + remote-tracking refs.
+                # It stays on its default branch — we never `gh pr checkout`
+                # it — so concurrent reviews never contend here.
+                if not primary_path.exists():
+                    print(f"Cloning {repo_full} → {primary_path}…")
+                    if subprocess.call(["gh", "repo", "clone", repo_full, str(primary_path)]) != 0:
                         input("\nClone failed. Press Enter to return…")
                         return
                 else:
-                    print(f"Fetching latest into {local_path}…")
-                    subprocess.call(["git", "fetch", "--all", "--prune"], cwd=local_path)
+                    print(f"Fetching latest into {primary_path}…")
+                    subprocess.call(["git", "fetch", "--all", "--prune"], cwd=primary_path)
 
+                # Per-PR worktree off the primary clone (shares its `.git`
+                # objects, so it's cheap). `prune` reaps metadata orphaned by
+                # a previous crash; a leftover dir on disk (removal failed
+                # last time) is force-removed so we always start from a clean
+                # tree. `--detach` starts the worktree at primary HEAD with no
+                # branch, sidestepping git's "branch already checked out in
+                # another worktree" refusal.
+                subprocess.call(["git", "worktree", "prune"], cwd=primary_path)
+                if worktree_path.exists():
+                    subprocess.call(
+                        ["git", "worktree", "remove", "--force", str(worktree_path)],
+                        cwd=primary_path,
+                    )
+                worktree_path.parent.mkdir(parents=True, exist_ok=True)
+                print(f"\nCreating worktree {worktree_path}…")
+                if (
+                    subprocess.call(
+                        ["git", "worktree", "add", "--force", "--detach", str(worktree_path)],
+                        cwd=primary_path,
+                    )
+                    != 0
+                ):
+                    input("\nWorktree creation failed. Press Enter to return…")
+                    return
+                worktree_created = True
+
+                # `gh pr checkout --detach` lands the PR's head commit in the
+                # worktree without creating a local branch, so it can never
+                # collide with a branch checked out in the primary clone or a
+                # sibling worktree. The fresh detached tree means there's no
+                # dirty state to `--force` past.
                 print(f"\nChecking out PR #{number}…")
                 if (
                     subprocess.call(
-                        ["gh", "pr", "checkout", str(number), "--force"],
-                        cwd=local_path,
+                        ["gh", "pr", "checkout", str(number), "--detach"],
+                        cwd=worktree_path,
                     )
                     != 0
                 ):
                     input("\nCheckout failed. Press Enter to return…")
                     return
 
-                sha_r = run(["git", "rev-parse", "HEAD"], cwd=local_path)
+                sha_r = run(["git", "rev-parse", "HEAD"], cwd=worktree_path)
                 if sha_r.returncode != 0:
                     err = (sha_r.stderr or sha_r.stdout).strip() or f"exit {sha_r.returncode}"
-                    print(f"warning: could not resolve HEAD in {local_path}: {err}")
+                    print(f"warning: could not resolve HEAD in {worktree_path}: {err}")
                     head_sha = ""
                 else:
                     head_sha = sha_r.stdout.strip()
@@ -4690,21 +4754,28 @@ class PRReviewer(App):
                 # against the probe-vs-launch race (binary uninstalled
                 # mid-launch) via `OSError` guards.
                 codegraph_on_path = shutil.which("codegraph") is not None
-                codegraph_present = (local_path / ".codegraph").is_dir()
+                # CodeGraph is anchored to the per-PR WORKTREE, not the
+                # primary clone: the agent launches with `cwd=worktree_path`,
+                # so its MCP server resolves `.codegraph/` from there. The
+                # cost is that an ephemeral worktree starts without an index,
+                # so a `codegraph_assist` user re-indexes (~30s) per review
+                # rather than amortising — the deliberate trade-off for
+                # branch-accurate, collision-free parallel reviews.
+                codegraph_present = (worktree_path / ".codegraph").is_dir()
 
                 # Tier 3: opt-in init helper. When `self.codegraph_assist`
-                # is on (`x` toggle) AND the workspace doesn't yet have an
+                # is on (`x` toggle) AND this worktree doesn't yet have an
                 # index AND the `codegraph` binary is on PATH, prompt the
                 # user during the suspended terminal session to bootstrap
                 # one. We never auto-init — `codegraph init --index` can
-                # take ~30s on a large repo and adds files to the workspace,
+                # take ~30s on a large repo and adds files to the worktree,
                 # so it's a conscious user step. The toggle's only purpose
                 # is to make that step opt-in rather than nag-on-every-launch.
                 if not codegraph_present and self.codegraph_assist and codegraph_on_path:
                     print(
-                        f"\nNo CodeGraph index in {local_path}. "
-                        "`codegraph init --index` takes ~30s on first run, then "
-                        "amortises across every future review in this workspace."
+                        f"\nNo CodeGraph index in {worktree_path}. "
+                        "`codegraph init --index` takes ~30s; the per-PR worktree is "
+                        "ephemeral, so this runs fresh each review."
                     )
                     # Match the EOFError pattern established at the upgrade
                     # path: non-interactive / piped stdin must not crash
@@ -4717,7 +4788,7 @@ class PRReviewer(App):
                         init_rc = 1
                         try:
                             init_rc = subprocess.call(
-                                ["codegraph", "init", str(local_path), "--index"]
+                                ["codegraph", "init", str(worktree_path), "--index"]
                             )
                         except OSError as e:
                             # Mirrors the `uv tool upgrade` path: ENOENT/
@@ -4730,7 +4801,7 @@ class PRReviewer(App):
                             # Re-probe — the sync block below now becomes a
                             # no-op (the just-built index is current), and
                             # `build_review_prompt` gets the right flag.
-                            codegraph_present = (local_path / ".codegraph").is_dir()
+                            codegraph_present = (worktree_path / ".codegraph").is_dir()
                         else:
                             print(
                                 f"warning: `codegraph init --index` exited with status {init_rc}; "
@@ -4744,14 +4815,14 @@ class PRReviewer(App):
                 # own file watcher, but it only runs while the CLI is
                 # alive — at this point the CLI hasn't started yet, so
                 # the index can be stale (especially after `gh pr
-                # checkout --force`, which can rewrite many files at
-                # once). `codegraph sync` is incremental and idempotent;
+                # checkout`, which can rewrite many files at once).
+                # `codegraph sync` is incremental and idempotent;
                 # no-op when the index is already current.
                 if codegraph_present and codegraph_on_path:
                     print("Syncing CodeGraph index for the checked-out branch…")
                     sync_rc = 1
                     try:
-                        sync_rc = subprocess.call(["codegraph", "sync", str(local_path)])
+                        sync_rc = subprocess.call(["codegraph", "sync", str(worktree_path)])
                     except OSError as e:
                         print(f"warning: failed to launch `codegraph sync`: {e}")
                     if sync_rc != 0:
@@ -4780,7 +4851,7 @@ class PRReviewer(App):
                 affected_count = 0  # paths actually injected into the prompt; for telemetry
                 if codegraph_present and codegraph_on_path:
                     print("Querying CodeGraph for tests affected by this PR's diff…")
-                    affected = _collect_codegraph_affected(local_path, repo_full, number)
+                    affected = _collect_codegraph_affected(worktree_path, repo_full, number)
                     codegraph_affected_block = format_codegraph_affected_tests(affected)
                     # Record what the agent actually saw, not the raw query
                     # count: `format_codegraph_affected_tests` caps the block at
@@ -4807,8 +4878,8 @@ class PRReviewer(App):
                 # Ctrl-C, crashes, and clean exits all leave the workspace
                 # byte-identical to its pre-launch state.
                 if cli in _SKILL_BASED_CLIS:
-                    print(f"Materialising review skills under {local_path}/.agents/skills/…")
-                    skills_manifest = _materialise_skills(local_path, selected=selected_agents)
+                    print(f"Materialising review skills under {worktree_path}/.agents/skills/…")
+                    skills_manifest = _materialise_skills(worktree_path, selected=selected_agents)
 
                 print("Fetching existing review comments…")
                 existing, fetch_ok = fetch_existing_review_comments(repo_full, number)
@@ -4852,7 +4923,7 @@ class PRReviewer(App):
                 # users who don't have CodeGraph at all.
                 codegraph_tools_available = False
                 if codegraph_present and codegraph_on_path:
-                    mcp_state = _codegraph_mcp_registered(cli, local_path)
+                    mcp_state = _codegraph_mcp_registered(cli, worktree_path)
                     codegraph_tools_available = mcp_state is True
                     install_hint = _CODEGRAPH_INSTALL_HINT[cli]
                     if mcp_state is False:
@@ -4942,7 +5013,7 @@ class PRReviewer(App):
                     " — exit the CLI when you're done.\n"
                 )
                 launch_start = time.monotonic()
-                rc = subprocess.call(cmd, cwd=local_path)
+                rc = subprocess.call(cmd, cwd=worktree_path)
                 launch_duration = time.monotonic() - launch_start
 
                 # Append-only launch telemetry, recorded for EVERY exit
@@ -5001,17 +5072,37 @@ class PRReviewer(App):
                     f"\n── {_CLI_DISPLAY[cli]} session ended. Press Enter to return to the TUI ──"
                 )
             finally:
-                # Restore the materialised skills before releasing the
-                # reservation so the workspace is in its pre-launch state
-                # by the time the slot is yielded. (The reservation is
-                # per-PR, so it doesn't serialise peers reviewing
-                # *different* PRs of the same repo — and `gh pr checkout
-                # --force` already races on the shared worktree for those,
-                # which is a pre-existing limitation orthogonal to skills.)
-                # The `None` guard handles early-return paths above where
-                # materialisation never ran — there's nothing to restore.
+                # Tear-down order matters. Restore the materialised skills
+                # first (the `None` guard skips early-return paths where
+                # materialisation never ran), then remove the worktree, then
+                # release the reservation — so the slot isn't yielded while
+                # the worktree still exists. Each PR now reviews in its own
+                # worktree, so the per-PR reservation is no longer a
+                # collision point for *different* PRs of the same repo; they
+                # run in parallel without racing on a shared checkout.
                 if skills_manifest is not None:
                     _cleanup_skills(skills_manifest)
+                # Remove the per-PR worktree (only if we created one). The
+                # agent may have left it dirty, so `--force`. Best-effort and
+                # loud: a failure prints a warning naming the path (next
+                # launch's `git worktree prune` + leftover-removal recovers)
+                # but must never mask the launch exception or block the
+                # reservation release below.
+                if worktree_created:
+                    try:
+                        rc_wt = subprocess.call(
+                            ["git", "worktree", "remove", "--force", str(worktree_path)],
+                            cwd=primary_path,
+                        )
+                    except OSError as e:
+                        print(f"warning: failed to launch `git worktree remove`: {e}")
+                    else:
+                        if rc_wt != 0:
+                            print(
+                                f"warning: `git worktree remove` exited with status {rc_wt} "
+                                f"for {worktree_path}; it will be reaped on the next launch "
+                                "(`git worktree prune` + leftover removal)."
+                            )
                 _release_in_progress(self.review_db, key)
                 # Re-enable auto-refresh ticks now the agent has handed the
                 # TTY back. In the inner finally (still inside `suspend()`)

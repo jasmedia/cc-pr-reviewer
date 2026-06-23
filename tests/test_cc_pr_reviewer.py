@@ -47,6 +47,7 @@ from cc_pr_reviewer import (
     REVIEW_SKILL_LABELS,
     REVIEW_SKILLS,
     SKILL_FILE_NAME,
+    WORKSPACE,
     InProgressHolder,
     ReviewInProgressError,
     SettingsScreen,
@@ -73,6 +74,7 @@ from cc_pr_reviewer import (
     _review_cell,
     _set_setting,
     _skills_dir,
+    _worktree_path,
     build_review_prompt,
     build_slack_payload,
     check_prereqs,
@@ -2514,6 +2516,29 @@ def test_new_review_pr_keys_ignores_removals() -> None:
 def test_new_review_pr_keys_distinguishes_repos_with_same_number() -> None:
     prs = [_pr("o/a", 1, "2025-01-01T00:00:00Z"), _pr("o/b", 1, "2025-01-01T00:00:00Z")]
     assert new_review_pr_keys({"o/a#1"}, prs) == {"o/b#1"}
+
+
+# --- _worktree_path --------------------------------------------------------
+
+
+def test_worktree_path_layout() -> None:
+    assert _worktree_path("o", "n", 42) == WORKSPACE / ".worktrees" / "o" / "n" / "42"
+
+
+def test_worktree_path_distinct_per_number() -> None:
+    """The core isolation invariant: each PR number maps to its own
+    worktree, so two parallel reviews of different PRs never collide."""
+    assert _worktree_path("o", "n", 1) != _worktree_path("o", "n", 2)
+
+
+def test_worktree_path_separates_from_clone_namespace() -> None:
+    """The worktree must live OUTSIDE the `owner/name` primary-clone path,
+    so `primary_path.exists()` clone-vs-fetch detection can't be tripped by
+    a worktree dir."""
+    primary = WORKSPACE / "o" / "n"
+    wt = _worktree_path("o", "n", 1)
+    assert wt != primary
+    assert primary not in wt.parents
 
 
 @pytest.mark.parametrize(
