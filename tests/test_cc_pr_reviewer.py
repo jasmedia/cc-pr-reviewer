@@ -2583,6 +2583,21 @@ def test_seed_worktree_codegraph_copies_db_and_wal(tmp_path: Path) -> None:
     assert not (dst / "daemon.log").exists()
 
 
+def test_seed_worktree_codegraph_succeeds_without_wal(tmp_path: Path) -> None:
+    """A checkpointed source (no `-wal`) still seeds: the `-wal` copy is
+    skipped when absent, not treated as a failure."""
+    primary = tmp_path / "primary"
+    (primary / ".codegraph").mkdir(parents=True)
+    (primary / ".codegraph" / "codegraph.db").write_bytes(b"DBDATA")
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    assert _seed_worktree_codegraph(primary, worktree) is True
+    dst = worktree / ".codegraph"
+    assert (dst / "codegraph.db").read_bytes() == b"DBDATA"
+    assert not (dst / "codegraph.db-wal").exists()
+
+
 @pytest.mark.parametrize(
     "raw,expected",
     [

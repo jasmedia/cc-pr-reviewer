@@ -2038,8 +2038,8 @@ def _worktree_path(owner: str, name: str, number: int) -> Path:
     The primary clone lives at `WORKSPACE/owner/name` (shared `.git`
     object store); each review checks its PR out into an isolated
     worktree here so concurrent reviews of *different* PRs in the same
-    repo don't race on a single working tree (the `gh pr checkout
-    --force` clobber this layout exists to prevent).
+    repo don't race on a single working tree — the `gh pr checkout
+    --force` clobbering this layout exists to prevent.
 
     The dot-prefixed top-level `.worktrees/` keeps these dirs out of the
     `owner/name` namespace — so the `primary_path.exists()` clone-vs-fetch
@@ -4701,10 +4701,10 @@ class PRReviewer(App):
             # below (clone-fail, worktree-fail, checkout-fail) leave it `None`
             # and skip the restore.
             skills_manifest: _MaterialisedSkills | None = None
-            # Set True only once `git worktree add` (or reuse) succeeds, so
-            # the `finally` block removes a worktree only if we actually
-            # created one — the clone-fail / worktree-add-fail early returns
-            # above it leave nothing to tear down.
+            # Set True only once `git worktree add` succeeds, so the
+            # `finally` block removes a worktree only if we actually created
+            # one — the clone-fail / worktree-add-fail early returns above it
+            # leave nothing to tear down.
             worktree_created = False
             try:
                 # Pause auto-refresh for the suspended session so a background
@@ -4725,21 +4725,38 @@ class PRReviewer(App):
                         return
                 else:
                     print(f"Fetching latest into {primary_path}…")
-                    subprocess.call(["git", "fetch", "--all", "--prune"], cwd=primary_path)
+                    # A failed fetch isn't fatal (`gh pr checkout` below fetches
+                    # the PR ref itself), but it means the shared object store
+                    # may be stale — warn loudly rather than silently reviewing
+                    # against last-fetched refs.
+                    if subprocess.call(["git", "fetch", "--all", "--prune"], cwd=primary_path) != 0:
+                        print(
+                            "warning: `git fetch` failed; continuing against last-fetched refs — "
+                            "the checkout may be stale."
+                        )
 
                 # Per-PR worktree off the primary clone (shares its `.git`
                 # objects, so it's cheap). `prune` reaps metadata orphaned by
-                # a previous crash; a leftover dir on disk (removal failed
-                # last time) is force-removed so we always start from a clean
-                # tree. `--detach` starts the worktree at primary HEAD with no
-                # branch, sidestepping git's "branch already checked out in
-                # another worktree" refusal.
+                # a previous crash; a leftover dir on disk is then force-removed
+                # so we always start from a clean tree. `--detach` starts the
+                # worktree at primary HEAD with no branch, sidestepping git's
+                # "branch already checked out in another worktree" refusal.
                 subprocess.call(["git", "worktree", "prune"], cwd=primary_path)
                 if worktree_path.exists():
                     subprocess.call(
                         ["git", "worktree", "remove", "--force", str(worktree_path)],
                         cwd=primary_path,
                     )
+                    # `git worktree remove` only removes a *registered* worktree.
+                    # If a crash left the directory but `prune` (or a partial
+                    # prune) already reaped its admin entry, the remove exits
+                    # non-zero and the dir survives — and `git worktree add`
+                    # then refuses ("already exists"; `--force` won't overwrite
+                    # a populated dir), wedging this PR's review until manual
+                    # cleanup. Force the filesystem removal so the self-heal the
+                    # comment promises actually holds for an orphaned dir too.
+                    if worktree_path.exists():
+                        shutil.rmtree(worktree_path, ignore_errors=True)
                 worktree_path.parent.mkdir(parents=True, exist_ok=True)
                 print(f"\nCreating worktree {worktree_path}…")
                 if (
@@ -5134,11 +5151,17 @@ class PRReviewer(App):
                     except OSError as e:
                         print(f"warning: failed to launch `git worktree remove`: {e}")
                     else:
-                        if rc_wt != 0:
+                        # A zero rc isn't proof the tree is gone, and a
+                        # non-zero one leaves it explicitly — check the path
+                        # either way so a silent survival is reported here, not
+                        # deferred to the next launch. The next launch's
+                        # `prune` + filesystem `rmtree` fallback still reaps it
+                        # regardless.
+                        if worktree_path.exists():
                             print(
-                                f"warning: `git worktree remove` exited with status {rc_wt} "
-                                f"for {worktree_path}; it will be reaped on the next launch "
-                                "(`git worktree prune` + leftover removal)."
+                                f"warning: worktree dir survived removal at {worktree_path} "
+                                f"(`git worktree remove` rc={rc_wt}); it will be reaped on the "
+                                "next launch."
                             )
                 _release_in_progress(self.review_db, key)
                 # Re-enable auto-refresh ticks now the agent has handed the
