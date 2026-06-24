@@ -48,6 +48,7 @@ from cc_pr_reviewer import (
     REVIEW_SKILLS,
     SKILL_FILE_NAME,
     WORKSPACE,
+    BuiltPrompt,
     InProgressHolder,
     ReviewInProgressError,
     SettingsScreen,
@@ -57,6 +58,7 @@ from cc_pr_reviewer import (
     _cleanup_skills,
     _codegraph_mcp_registered,
     _first_available_cli,
+    _format_launch_banner_parts,
     _get_setting,
     _in_progress_age_str,
     _is_newer,
@@ -66,6 +68,7 @@ from cc_pr_reviewer import (
     _open_review_db,
     _parse_semver,
     _pid_alive,
+    _prepare_pr_worktree,
     _record_launch_telemetry,
     _refresh_interval_label,
     _release_in_progress,
@@ -1793,6 +1796,111 @@ def test_build_cli_command_rejects_unknown_cli() -> None:
         _build_cli_command("nonsense", "prompt body")  # type: ignore[arg-type]
 
 
+# --- _format_launch_banner_parts (pure launch-banner assembly) -------------
+
+
+def _built(
+    *,
+    rereview: bool = False,
+    existing_shown: int = 0,
+    existing_total: int = 0,
+    text: str = "prompt",
+) -> BuiltPrompt:
+    """Minimal BuiltPrompt for banner-formatting tests."""
+    return BuiltPrompt(
+        text=text, rereview=rereview, existing_shown=existing_shown, existing_total=existing_total
+    )
+
+
+def test_banner_default_agents_omits_agents_part() -> None:
+    """A full (default) agent set must not add an `agents:` fragment — the
+    banner only calls out subsets that diverge from the default."""
+    parts = _format_launch_banner_parts(
+        False, _built(existing_shown=2, existing_total=5), True, "me", REVIEW_SKILLS, ""
+    )
+    assert parts == [
+        "post-inline: off",
+        "existing comments: 2 in prompt of 5 fetched",
+    ]
+
+
+def test_banner_reordered_full_set_still_omits_agents_part() -> None:
+    """Comparison is by SET — a reordered-but-full subset is still the
+    default shape and shouldn't trip the agents gate."""
+    parts = _format_launch_banner_parts(
+        False, _built(), True, "me", tuple(reversed(REVIEW_SKILLS)), ""
+    )
+    assert not any(p.startswith("agents:") for p in parts)
+
+
+def test_banner_small_subset_uses_friendly_labels() -> None:
+    subset = REVIEW_SKILLS[:2]
+    parts = _format_launch_banner_parts(False, _built(), True, "me", subset, "")
+    expected = "agents: " + ", ".join(REVIEW_SKILL_LABELS[n] for n in subset)
+    assert expected in parts
+
+
+def test_banner_large_subset_uses_count() -> None:
+    subset = REVIEW_SKILLS[:4]  # >3 → count form, not the label list
+    parts = _format_launch_banner_parts(False, _built(), True, "me", subset, "")
+    assert f"agents: 4/{len(REVIEW_SKILLS)}" in parts
+
+
+def test_banner_empty_selection_is_generic_review() -> None:
+    parts = _format_launch_banner_parts(False, _built(), True, "me", (), "")
+    assert "agents: none (generic review)" in parts
+
+
+def test_banner_post_inline_on_plain() -> None:
+    parts = _format_launch_banner_parts(True, _built(), True, "me", REVIEW_SKILLS, "")
+    assert parts[0] == "post-inline: on"
+
+
+def test_banner_post_inline_rereview() -> None:
+    parts = _format_launch_banner_parts(True, _built(rereview=True), True, "me", REVIEW_SKILLS, "")
+    assert parts[0] == "post-inline: on, rereview"
+
+
+def test_banner_post_inline_rereview_detection_unavailable() -> None:
+    """`my_login is None` (login lookup failed) with post-inline on but no
+    detected rereview surfaces the detection-unavailable marker."""
+    parts = _format_launch_banner_parts(True, _built(), True, None, REVIEW_SKILLS, "")
+    assert parts[0] == "post-inline: on, rereview-detection-unavailable"
+
+
+def test_banner_rereview_wins_over_unavailable() -> None:
+    """rereview is checked first: even when my_login is None, a detected
+    rereview shows `rereview`, not the unavailable marker."""
+    parts = _format_launch_banner_parts(True, _built(rereview=True), True, None, REVIEW_SKILLS, "")
+    assert parts[0] == "post-inline: on, rereview"
+
+
+def test_banner_fetch_failed_existing_desc() -> None:
+    parts = _format_launch_banner_parts(
+        False, _built(existing_shown=3, existing_total=9), False, "me", REVIEW_SKILLS, ""
+    )
+    assert "existing comments: fetch failed" in parts
+    assert not any("in prompt of" in p for p in parts)
+
+
+def test_banner_short_extra_prompt_has_no_overflow_suffix() -> None:
+    parts = _format_launch_banner_parts(False, _built(), True, "me", REVIEW_SKILLS, "fix typos")
+    assert parts[-1] == "extra prompt: 'fix typos'"
+
+
+def test_banner_long_extra_prompt_caps_and_marks_overflow() -> None:
+    """Over-cap pastes are truncated with an explicit `(+N more chars)` so a
+    201-char paste can't render identically to a clean 200-char one."""
+    cap = _mod.EXTRA_PROMPT_BANNER_CAP
+    extra = "x" * (cap + 17)
+    parts = _format_launch_banner_parts(False, _built(), True, "me", REVIEW_SKILLS, extra)
+    banner = parts[-1]
+    assert banner.startswith("extra prompt: ")
+    assert "(+17 more chars)" in banner
+    # Only the capped prefix is shown in the preview.
+    assert repr("x" * cap) in banner
+
+
 # --- _first_available_cli --------------------------------------------------
 
 
@@ -2540,6 +2648,40 @@ def test_worktree_path_separates_from_clone_namespace() -> None:
     wt = _worktree_path("o", "n", 1)
     assert wt != primary
     assert primary not in wt.parents
+
+
+# --- _prepare_pr_worktree (teardown-invariant guard) -----------------------
+
+
+def test_prepare_pr_worktree_oserror_after_add_still_reports_created(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Regression: an `OSError` from `gh pr checkout` (raised, not non-zero
+    rc) *after* `git worktree add` succeeds must still surface
+    `worktree_created=True` so the caller's `finally` tears the worktree
+    down. Before the guard, the raise escaped before the caller could
+    assign the flag, leaking the worktree.
+    """
+    primary = tmp_path / "primary"
+    primary.mkdir()  # exists → fetch path, not clone
+    worktree = tmp_path / "wt"
+
+    def fake_call(argv: list[str], **_: Any) -> int:
+        # `git worktree add` succeeds (rc 0); `gh pr checkout` then raises as
+        # if the binary vanished mid-launch (TOCTOU vs the PATH probe).
+        if "checkout" in argv:
+            raise OSError("gh vanished")
+        return 0
+
+    monkeypatch.setattr(_mod.subprocess, "call", fake_call)
+    # `input` would block on the non-zero path; the OSError path returns
+    # before reaching it, but stub it so a regression can't hang the suite.
+    monkeypatch.setattr("builtins.input", lambda *_a, **_k: "")
+
+    ok, created, head_sha = _prepare_pr_worktree("o/r", 7, primary, worktree)
+    assert ok is False
+    assert created is True  # ← the load-bearing assertion: finally must run
+    assert head_sha == ""
 
 
 # --- _seed_worktree_codegraph ----------------------------------------------
