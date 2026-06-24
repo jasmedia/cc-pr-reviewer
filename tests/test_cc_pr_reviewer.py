@@ -54,7 +54,9 @@ from cc_pr_reviewer import (
     ReviewInProgressError,
     SettingsScreen,
     _approx_tokens,
+    _build_claude_prompt,
     _build_cli_command,
+    _build_skill_based_prompt,
     _check_codegraph_setup,
     _cleanup_skills,
     _codegraph_mcp_registered,
@@ -65,20 +67,27 @@ from cc_pr_reviewer import (
     _is_newer,
     _join_agents,
     _load_in_progress,
+    _load_review_state,
     _materialise_skills,
     _open_review_db,
     _parse_semver,
     _pid_alive,
+    _pr_key,
     _prepare_pr_worktree,
     _record_launch_telemetry,
+    _record_review,
     _refresh_interval_label,
     _release_in_progress,
     _reserve_in_progress,
+    _resolve_codegraph_tools,
     _resolve_theme,
     _review_cell,
+    _rmdir_if_empty,
     _seed_worktree_codegraph,
     _set_setting,
+    _set_settings,
     _skills_dir,
+    _slack_escape,
     _worktree_path,
     build_review_prompt,
     build_slack_payload,
@@ -2027,6 +2036,144 @@ def test_check_prereqs_fails_when_gh_missing(monkeypatch: pytest.MonkeyPatch) ->
     assert any("gh" in p and "not found" in p.lower() for p in problems)
 
 
+# --- _build_claude_prompt / _build_skill_based_prompt (direct subset) -------
+
+
+def test_build_claude_prompt_full_set_names_every_agent() -> None:
+    out = _build_claude_prompt(REVIEW_SKILLS)
+    for name in REVIEW_SKILLS:
+        assert REVIEW_SKILL_LABELS[name] in out
+
+
+def test_build_claude_prompt_subset_drops_unselected() -> None:
+    selected = REVIEW_SKILLS[:2]
+    out = _build_claude_prompt(selected)
+    for name in selected:
+        assert REVIEW_SKILL_LABELS[name] in out
+    for name in REVIEW_SKILLS[2:]:
+        assert REVIEW_SKILL_LABELS[name] not in out
+
+
+def test_build_claude_prompt_empty_is_generic_no_agent_pinning() -> None:
+    out = _build_claude_prompt(())
+    assert "PR Review Toolkit" in out
+    for name in REVIEW_SKILLS:
+        assert REVIEW_SKILL_LABELS[name] not in out
+
+
+def test_build_skill_based_prompt_subset_mentions_only_selected() -> None:
+    selected = REVIEW_SKILLS[:2]
+    out = _build_skill_based_prompt(selected)
+    for name in selected:
+        assert f"${name}" in out
+    for name in REVIEW_SKILLS[2:]:
+        assert f"${name}" not in out
+
+
+def test_build_skill_based_prompt_singular_grammar() -> None:
+    """A one-skill selection switches to singular grammar ("skill" /
+    "Activate the skill") — a distinct code path from the plural branch."""
+    out = _build_skill_based_prompt((REVIEW_SKILLS[0],))
+    assert "review skill available" in out
+    assert "Activate the skill" in out
+
+
+def test_build_skill_based_prompt_empty_has_no_skill_mentions() -> None:
+    """Empty selection → generic review with no `$name` mentions, so the
+    agent doesn't fail-search for skills we never materialised."""
+    out = _build_skill_based_prompt(())
+    assert "$" not in out
+
+
+# --- _pr_key ---------------------------------------------------------------
+
+
+def test_pr_key_format() -> None:
+    pr = {"repository": {"nameWithOwner": "octo/cat"}, "number": 7}
+    assert _pr_key(pr) == "octo/cat#7"
+
+
+# --- _slack_escape ---------------------------------------------------------
+
+
+def test_slack_escape_ampersand_escaped_first() -> None:
+    """`&` must be escaped before `<`/`>`, else the `&` in `&lt;`/`&gt;`
+    would itself get double-escaped into `&amp;lt;`."""
+    assert _slack_escape("<a> & <b>") == "&lt;a&gt; &amp; &lt;b&gt;"
+
+
+def test_slack_escape_noop_on_plain_text() -> None:
+    assert _slack_escape("just text 123") == "just text 123"
+
+
+def test_slack_escape_empty() -> None:
+    assert _slack_escape("") == ""
+
+
+# --- _rmdir_if_empty -------------------------------------------------------
+
+
+def test_rmdir_if_empty_removes_empty_dir(tmp_path: Path) -> None:
+    d = tmp_path / "empty"
+    d.mkdir()
+    _rmdir_if_empty(d)
+    assert not d.exists()
+
+
+def test_rmdir_if_empty_keeps_nonempty_dir_silently(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """ENOTEMPTY is the *expected* case (a sibling user file lives there): the
+    dir is preserved and NO warning prints — only genuinely unexpected
+    OSErrors (perms, stale lock) should be loud."""
+    d = tmp_path / "full"
+    d.mkdir()
+    (d / "f.txt").write_text("x")
+    _rmdir_if_empty(d)
+    assert d.exists()
+    assert capsys.readouterr().out == ""
+
+
+def test_rmdir_if_empty_unexpected_error_warns(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A missing dir (ENOENT, not ENOTEMPTY/EEXIST) is unexpected, so it
+    surfaces a warning rather than passing silently."""
+    _rmdir_if_empty(tmp_path / "does-not-exist")
+    assert "could not rmdir" in capsys.readouterr().out
+
+
+# --- _resolve_codegraph_tools (MCP-registration gate) ----------------------
+
+
+def test_resolve_codegraph_tools_skips_probe_unless_present_and_on_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The MCP-config probe must not run unless BOTH the index is present and
+    the binary is on PATH — otherwise it's noise for users without CodeGraph."""
+    called = False
+
+    def _spy(*_a: Any, **_k: Any) -> bool:
+        nonlocal called
+        called = True
+        return True
+
+    monkeypatch.setattr(_mod, "_codegraph_mcp_registered", _spy)
+    assert _resolve_codegraph_tools("claude", tmp_path, False, True) is False
+    assert _resolve_codegraph_tools("claude", tmp_path, True, False) is False
+    assert called is False
+
+
+@pytest.mark.parametrize("mcp_state,expected", [(True, True), (False, False), (None, False)])
+def test_resolve_codegraph_tools_maps_mcp_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mcp_state: bool | None, expected: bool
+) -> None:
+    """Only an explicit True (entry present) promises tools; False (not
+    registered) and None (no/unparseable config) both yield False."""
+    monkeypatch.setattr(_mod, "_codegraph_mcp_registered", lambda *_a, **_k: mcp_state)
+    assert _resolve_codegraph_tools("claude", tmp_path, True, True) is expected
+
+
 # --- humanise (relative-time formatting) -----------------------------------
 
 _FIXED_NOW = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
@@ -2273,6 +2420,70 @@ def review_db(tmp_path, monkeypatch):
         yield conn
     finally:
         conn.close()
+
+
+# --- _record_review / _load_review_state (UPSERT round-trip) ---------------
+
+
+def test_record_review_first_insert_sets_count_one(review_db) -> None:
+    row = _record_review(review_db, "o/r#1", "2025-01-01T00:00:00Z", "abc123")
+    assert row["count"] == 1
+    assert row["pr_key"] == "o/r#1"
+    assert row["last_pr_updated_at"] == "2025-01-01T00:00:00Z"
+    assert row["last_head_sha"] == "abc123"
+
+
+def test_record_review_second_call_increments_and_latest_metadata_wins(review_db) -> None:
+    _record_review(review_db, "o/r#1", "2025-01-01T00:00:00Z", "abc")
+    row = _record_review(review_db, "o/r#1", "2025-02-02T00:00:00Z", "def")
+    assert row["count"] == 2  # UPSERT increments, doesn't reset
+    assert row["last_pr_updated_at"] == "2025-02-02T00:00:00Z"
+    assert row["last_head_sha"] == "def"
+
+
+def test_record_review_blank_head_sha_stored_as_null(review_db) -> None:
+    """An unresolved HEAD ("") lands as SQL NULL via `head_sha or None`, not
+    an empty string — so consumers can distinguish "no SHA" from "''"."""
+    row = _record_review(review_db, "o/r#1", "2025-01-01T00:00:00Z", "")
+    assert row["last_head_sha"] is None
+
+
+def test_record_review_roundtrips_through_load_review_state(review_db) -> None:
+    """The dict `_record_review` returns must equal what `_load_review_state`
+    reconstructs for the same key — the write and read paths agree on shape."""
+    written = _record_review(review_db, "o/r#9", "2025-03-03T00:00:00Z", "sha9")
+    state = _load_review_state(review_db)
+    assert state["o/r#9"] == written
+
+
+def test_load_review_state_empty_db_is_empty_dict(review_db) -> None:
+    assert _load_review_state(review_db) == {}
+
+
+# --- _set_settings (atomic multi-key upsert) -------------------------------
+
+
+def test_set_settings_writes_all_keys(review_db) -> None:
+    _set_settings(review_db, {"cli": "codex", "theme": "nord"})
+    assert _get_setting(review_db, "cli") == "codex"
+    assert _get_setting(review_db, "theme") == "nord"
+
+
+def test_set_settings_upserts_existing_key(review_db) -> None:
+    _set_setting(review_db, "cli", "claude")
+    _set_settings(review_db, {"cli": "gemini"})
+    assert _get_setting(review_db, "cli") == "gemini"
+
+
+def test_set_settings_rolls_back_on_error(review_db) -> None:
+    """All-or-nothing: a NOT NULL violation mid-batch aborts the whole
+    transaction, so neither the new key nor the mutation to an existing one
+    survives — the partial-save the batching exists to prevent."""
+    _set_setting(review_db, "cli", "claude")
+    with pytest.raises(sqlite3.IntegrityError):
+        _set_settings(review_db, {"theme": "nord", "cli": None})  # type: ignore[dict-item]
+    assert _get_setting(review_db, "theme", "MISSING") == "MISSING"
+    assert _get_setting(review_db, "cli") == "claude"
 
 
 def _insert_holder(
