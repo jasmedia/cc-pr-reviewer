@@ -34,6 +34,30 @@ for the duration of each review.
   across sessions), or `Ctrl+L` inside the confirm modal to override
   for a single launch. Default is Claude Code.
 
+## How you use it
+
+A bird's-eye view of a review from your side of the keyboard:
+
+```mermaid
+flowchart TD
+    A([Launch<br/>cc-pr-reviewer]) --> B["See your PR<br/>review queue"]
+    B --> C["Pick a PR<br/>+ press Enter"]
+    C --> D["Confirm modal:<br/>choose CLI, agents,<br/>post-inline comments"]
+    D --> E["Coding agent reviews<br/>the PR in an isolated<br/>checkout"]
+    E --> F{Findings?}
+    F -- "post-inline on" --> G["Comments / approval<br/>posted to the PR"]
+    F -- "post-inline off" --> H["Findings shown<br/>in the session"]
+    G --> I([Back to the queue])
+    H --> I
+    I -. "if configured" .-> S["Slack notification"]
+```
+
+Everything between picking a PR and the agent finishing is automated — the
+clone/checkout, the six-dimension review prompt, and posting results. You stay
+in the TUI and move to the next PR. For the full internals (modals, worktree
+lifecycle, telemetry, teardown), see the detailed flow diagram in
+[`docs/review-flow.md`](docs/review-flow.md).
+
 ## Prerequisites
 
 All prerequisites are validated at startup via `check_prereqs()`; the TUI
