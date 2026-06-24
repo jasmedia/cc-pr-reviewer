@@ -74,6 +74,7 @@ from cc_pr_reviewer import (
     _pid_alive,
     _pr_key,
     _prepare_pr_worktree,
+    _primary_path,
     _record_launch_telemetry,
     _record_review,
     _refresh_interval_label,
@@ -717,7 +718,7 @@ def test_codegraph_suffix_absent_by_default(cli: str) -> None:
 
 @pytest.mark.parametrize("cli", ["claude", "codex", "gemini"])
 def test_codegraph_suffix_present_when_flag_set(cli: str) -> None:
-    """When `_launch_claude` detects `.codegraph/` and sets the flag, the
+    """When `_launch_review_cli` detects `.codegraph/` and sets the flag, the
     suffix must land in the prompt for every CLI — the MCP tool surface
     is identical across claude/codex/gemini, so the gate is presence of
     the index, not the CLI in use."""
@@ -984,7 +985,7 @@ def test_affected_tests_block_absent_when_kwarg_empty() -> None:
 
 def test_affected_tests_block_can_render_without_codegraph_hint() -> None:
     """Edge case: `codegraph_present=False` with a non-empty affected
-    block can't happen in normal `_launch_claude` flow (the orchestration
+    block can't happen in normal `_launch_review_cli` flow (the orchestration
     gates both on the same precondition), but the prompt builder
     shouldn't enforce that coupling — each section is independently
     gated so a future caller (e.g. a CI driver that ships a pre-computed
@@ -1202,7 +1203,7 @@ def test_mcp_registered_returns_none_on_corrupt_toml(tmp_path: Path) -> None:
     since `read_text` doesn't raise on a syntactically-broken TOML body
     — that just causes the regex to not match and the helper returns
     False). A refactor that drops or narrows the except tuple would let
-    OSError escape into `_launch_claude` and crash the launch
+    OSError escape into `_launch_review_cli` and crash the launch
     post-suspend; this test pins the silent-degrade behaviour."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -2908,6 +2909,13 @@ def test_new_review_pr_keys_distinguishes_repos_with_same_number() -> None:
     assert new_review_pr_keys({"o/a#1"}, prs) == {"o/b#1"}
 
 
+# --- _primary_path ---------------------------------------------------------
+
+
+def test_primary_path_layout() -> None:
+    assert _primary_path("o", "n") == WORKSPACE / "o" / "n"
+
+
 # --- _worktree_path --------------------------------------------------------
 
 
@@ -2925,7 +2933,7 @@ def test_worktree_path_separates_from_clone_namespace() -> None:
     """The worktree must live OUTSIDE the `owner/name` primary-clone path,
     so `primary_path.exists()` clone-vs-fetch detection can't be tripped by
     a worktree dir."""
-    primary = WORKSPACE / "o" / "n"
+    primary = _primary_path("o", "n")
     wt = _worktree_path("o", "n", 1)
     assert wt != primary
     assert primary not in wt.parents

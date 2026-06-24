@@ -476,7 +476,7 @@ POST_INLINE_PROMPT = (
 )
 
 # Appended to POST_INLINE_PROMPT only when we actually have existing comments
-# to cross-reference (see `_launch_claude`). Without that list the instruction
+# to cross-reference (see `_launch_review_cli`). Without that list the instruction
 # is meaningless and can cause hallucinated caution.
 POST_INLINE_DEDUP_SUFFIX = (
     " Before submitting, cross-check each finding against the list of existing "
@@ -851,7 +851,7 @@ def _pr_review_toolkit_enabled() -> bool | None:
     anti-pattern called out in CLAUDE.md.
 
     The 5 s timeout guards the TUI thread: this runs synchronously
-    before `self.suspend()` inside `_launch_claude`, so a stalled
+    before `self.suspend()` inside `_launch_review_cli`, so a stalled
     `claude` (slow disk, hung child, network-mounted plugin dir, an
     unresponsive marketplace probe) would otherwise freeze the entire
     TUI indefinitely with no frame updates and no Ctrl-C handling.
@@ -940,7 +940,7 @@ def check_prereqs() -> list[str]:
     The toolkit-plugin check is intentionally NOT here: it only matters
     when cli=claude, and a Codex/Gemini user shouldn't be blocked from
     starting the TUI because the Claude plugin isn't installed. The
-    pre-flight check inside `_launch_claude` covers it.
+    pre-flight check inside `_launch_review_cli` covers it.
     """
     problems: list[str] = []
     if shutil.which("gh") is None:
@@ -1418,7 +1418,7 @@ def _codegraph_mcp_registered(
         # `~/.gemini` lacks search/execute permission. Wrapping the
         # stat-level calls in the same `OSError` bucket as the `read_text`
         # below means an unreadable tree degrades to `None`/parse-error
-        # honestly instead of bubbling a traceback out of `_launch_claude`
+        # honestly instead of bubbling a traceback out of `_launch_review_cli`
         # post-`suspend()` (or out of `on_mount` for the startup path
         # this PR adds).
         try:
@@ -1452,7 +1452,7 @@ def _codegraph_mcp_registered(
         # not "confirmed-not-registered": the file is unusable for our
         # purpose, so the honest state is None. Without bucketing these
         # branches into `had_parse_error`, the helper would fall through
-        # to `return False`, and `_launch_claude` would print the
+        # to `return False`, and `_launch_review_cli` would print the
         # "config exists but lacks the entry — run `codegraph install`"
         # remediation, which won't fix a structurally broken config.
         # `isinstance(mcp, dict)` ALSO guards against substring-style
@@ -1559,7 +1559,7 @@ def _check_codegraph_setup(
         doesn't know about it, so the per-launch suffix would be
         suppressed.
 
-    Per-launch verification stays in `_launch_claude` and remains the
+    Per-launch verification stays in `_launch_review_cli` and remains the
     source of truth for "does this specific review have MCP tools?".
     Startup is an early-warning surface, not a replacement.
     """
@@ -1705,7 +1705,7 @@ def _collect_codegraph_affected(local_path: Path, repo: str, number: int) -> lis
 def format_codegraph_affected_tests(paths: list[str]) -> str:
     """Render the affected-tests prompt block from `codegraph affected` output.
 
-    Pure — `_launch_claude` does the shell-out (gh→git→codegraph) and
+    Pure — `_launch_review_cli` does the shell-out (gh→git→codegraph) and
     feeds the resulting path list in here so the rendering decisions
     (dedup, sort, cap, header phrasing) stay unit-testable in isolation.
 
@@ -2196,7 +2196,7 @@ def build_review_prompt(
 ) -> BuiltPrompt:
     """Assemble the user message for the selected coding-agent CLI. Pure — no I/O.
 
-    Isolated from `_launch_claude` so the conditional `POST_INLINE_*`
+    Isolated from `_launch_review_cli` so the conditional `POST_INLINE_*`
     suffix matrix (locked by `tests/test_cc_pr_reviewer.py`) is
     unit-testable in isolation; that matrix is the most regression-prone
     part of the file.
@@ -2205,13 +2205,13 @@ def build_review_prompt(
     plugin-driven `REVIEW_PROMPT_CLAUDE`, while `codex` and `gemini`
     share `REVIEW_PROMPT_SKILL_BASED` (which references the six bundled
     skills by name; materialisation into `.agents/skills/` happens in
-    `_launch_claude`). All `POST_INLINE_*` suffixes apply identically
+    `_launch_review_cli`). All `POST_INLINE_*` suffixes apply identically
     to every CLI — they're about `gh` CLI usage, not the reviewing
     agent. `cli` defaults to `"claude"` so existing callers and tests
     remain valid without churn.
 
     `codegraph_present` should be `True` only when the agent will
-    actually have CodeGraph MCP tools available in-session — `_launch_claude`
+    actually have CodeGraph MCP tools available in-session — `_launch_review_cli`
     composes three signals: `.codegraph/` exists in the workspace, the
     `codegraph` binary is on PATH, AND the selected CLI's config
     (`~/.claude.json` / `~/.codex/config.toml` / `~/.gemini/settings.json`,
@@ -2239,7 +2239,7 @@ def build_review_prompt(
     presence. This intentionally diverges from the `fetch_ok`/`existing`
     invariant below — that pair has a strict producer contract
     (`fetch_existing_review_comments`), while these two are derived from
-    independent shell-outs in `_launch_claude`. Empty string (the default)
+    independent shell-outs in `_launch_review_cli`. Empty string (the default)
     skips the section entirely — that covers both "no index" and "empty
     diff / no affected files" without callers needing to disambiguate.
 
@@ -2382,6 +2382,17 @@ def _pr_key(pr: dict[str, Any]) -> str:
     return f"{pr['repository']['nameWithOwner']}#{pr['number']}"
 
 
+def _primary_path(owner: str, name: str) -> Path:
+    """Filesystem location of the shared primary clone for a repo.
+
+    Companion to `_worktree_path`: this is the `WORKSPACE/owner/name` clone
+    reused across every review of the repo (shared `.git` object store +
+    remote-tracking refs), kept here so the path convention lives in one
+    place and can't drift from the `.worktrees/` layout below.
+    """
+    return WORKSPACE / owner / name
+
+
 def _worktree_path(owner: str, name: str, number: int) -> Path:
     """Filesystem location of the per-PR git worktree.
 
@@ -2393,7 +2404,7 @@ def _worktree_path(owner: str, name: str, number: int) -> Path:
 
     The dot-prefixed top-level `.worktrees/` keeps these dirs out of the
     `owner/name` namespace — so the `primary_path.exists()` clone-vs-fetch
-    check in `_launch_claude` can never be tripped by a worktree dir — and
+    check in `_launch_review_cli` can never be tripped by a worktree dir — and
     makes the whole set trivially sweepable.
     """
     return WORKSPACE / ".worktrees" / owner / name / str(number)
@@ -3375,7 +3386,7 @@ class InProgressWarnScreen(ModalScreen[bool]):
     this PR, and ask whether to proceed anyway.
 
     Dismisses with `True` to override (caller should pass
-    `force_in_progress=True` into `_launch_claude`), `False` to cancel.
+    `force_in_progress=True` into `_launch_review_cli`), `False` to cancel.
     Kept distinct from `ConfirmScreen` because the intents don't overlap:
     `ConfirmScreen` tweaks launch options after the user decided to
     review; this screen asks whether the user wants to review at all.
@@ -3941,7 +3952,7 @@ class PRReviewer(App):
         self.group_by: GroupBy = stored_group if stored_group in _GROUP_CYCLE else ""
         stored_sort = _get_setting(self.review_db, "sort_by", "")
         self.sort_by: SortBy = stored_sort if stored_sort in _SORT_CYCLE else ""
-        # When on AND `.codegraph/` is missing in the workspace, `_launch_claude`
+        # When on AND `.codegraph/` is missing in the workspace, `_launch_review_cli`
         # prompts the user once per launch to run `codegraph init --index`
         # before handing off to the agent. When off (default), missing
         # `.codegraph/` is silent — Tier 1's prompt suffix and Tier 2's sync
@@ -3949,7 +3960,7 @@ class PRReviewer(App):
         # who flips it on stays in helper mode across sessions.
         self.codegraph_assist: bool = _get_setting(self.review_db, "codegraph_assist", "0") == "1"
         # Slack incoming-webhook URL for review-complete notifications. Empty
-        # means the feature is off — `_launch_claude` skips all Slack work
+        # means the feature is off — `_launch_review_cli` skips all Slack work
         # (no extra `gh api` calls, no POST) when this is blank. Editable via
         # the Settings modal (`,`).
         self.slack_webhook_url: str = _get_setting(self.review_db, "slack_webhook_url", "")
@@ -3973,7 +3984,7 @@ class PRReviewer(App):
                 # No supported CLI on PATH at all. Keep `self.cli` as
                 # the persisted preference so the footer/status reflect
                 # what the user *wanted*; on_mount fires a high-severity
-                # toast and pre-flight in `_launch_claude` re-checks.
+                # toast and pre-flight in `_launch_review_cli` re-checks.
                 self.cli: CliChoice = persisted
                 self._no_cli_available = True
             else:
@@ -4016,7 +4027,7 @@ class PRReviewer(App):
         # Suppress the new-PR notification on the very first populate — every
         # PR would otherwise look "new". Set True at the end of `_populate`.
         self._first_load_done: bool = False
-        # Set around `_launch_claude`'s suspend window so an auto-refresh
+        # Set around `_launch_review_cli`'s suspend window so an auto-refresh
         # tick doesn't rebuild the table while the agent owns the TTY.
         self._suspended_for_review: bool = False
 
@@ -4503,7 +4514,7 @@ class PRReviewer(App):
         def _confirm(expected_holder: InProgressHolder | None) -> None:
             def _proceed(result: ConfirmResult | None) -> None:
                 if result is not None:
-                    self._launch_claude(
+                    self._launch_review_cli(
                         pr,
                         result.post_inline,
                         result.extra_prompt,
@@ -4522,7 +4533,7 @@ class PRReviewer(App):
         #      NFS-hosted workspace) — exactly the freeze the worker
         #      poll was introduced to avoid.
         #   2. The hard safety boundary is `_reserve_in_progress` inside
-        #      `_launch_claude`. If the cache misses a peer that just
+        #      `_launch_review_cli`. If the cache misses a peer that just
         #      started 200 ms ago, the reserve still raises
         #      `ReviewInProgressError` and the launch path prints a
         #      message + waits for Enter. The cache is a UX optimisation
@@ -4714,7 +4725,7 @@ class PRReviewer(App):
         change surfaces the gap for the new selection. No internal dedup
         guard; the user toggling cycle → wired → binary-only → wired is
         meant to fire and clear repeatedly. The per-workspace deep check
-        in `_launch_claude` remains the source of truth.
+        in `_launch_review_cli` remains the source of truth.
         """
         # Best-effort early-warning: never let a probe failure escape into
         # `on_mount` (no surrounding try) or `action_toggle_cli` (whose
@@ -4744,7 +4755,7 @@ class PRReviewer(App):
 
     def action_toggle_codegraph(self) -> None:
         # Render-free like `action_toggle_cli` — the table doesn't depend
-        # on this toggle. `_launch_claude` reads `self.codegraph_assist`
+        # on this toggle. `_launch_review_cli` reads `self.codegraph_assist`
         # at launch time to decide whether to prompt the user about
         # initialising CodeGraph in workspaces that don't have an index.
         self.codegraph_assist = not self.codegraph_assist
@@ -4950,7 +4961,7 @@ class PRReviewer(App):
         )
         _post_slack_webhook(webhook_url, payload)
 
-    # --- launching claude ---
+    # --- launching the review CLI ---
 
     def _preflight_cli_checks(self, cli: CliChoice) -> bool:
         """Validate the chosen CLI is launchable before suspending the TUI.
@@ -5005,7 +5016,7 @@ class PRReviewer(App):
                 )
         return True
 
-    def _launch_claude(
+    def _launch_review_cli(
         self,
         pr: dict[str, Any],
         post_inline: bool,
@@ -5023,7 +5034,7 @@ class PRReviewer(App):
         # runs in the worktree so two concurrent reviews of *different*
         # PRs in the same repo can't clobber each other's checkout — the
         # `gh pr checkout --force` race this layout exists to prevent.
-        primary_path = WORKSPACE / owner / name
+        primary_path = _primary_path(owner, name)
         worktree_path = _worktree_path(owner, name, number)
         key = _pr_key(pr)
 
@@ -5352,7 +5363,7 @@ class PRReviewer(App):
             # would still show `⟳` (we can't repaint without the DB)
             # while the gate would silently say "no holder", letting
             # the user launch a duplicate review without warning.
-            # The reserve in `_launch_claude` is still the hard
+            # The reserve in `_launch_review_cli` is still the hard
             # boundary, and the toast tells the user the snapshot is
             # stale. Dedupe so a persistent failure doesn't fire every
             # 3 s.
