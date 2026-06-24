@@ -68,6 +68,7 @@ from cc_pr_reviewer import (
     _open_review_db,
     _parse_semver,
     _pid_alive,
+    _prepare_pr_worktree,
     _record_launch_telemetry,
     _refresh_interval_label,
     _release_in_progress,
@@ -2647,6 +2648,40 @@ def test_worktree_path_separates_from_clone_namespace() -> None:
     wt = _worktree_path("o", "n", 1)
     assert wt != primary
     assert primary not in wt.parents
+
+
+# --- _prepare_pr_worktree (teardown-invariant guard) -----------------------
+
+
+def test_prepare_pr_worktree_oserror_after_add_still_reports_created(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Regression: an `OSError` from `gh pr checkout` (raised, not non-zero
+    rc) *after* `git worktree add` succeeds must still surface
+    `worktree_created=True` so the caller's `finally` tears the worktree
+    down. Before the guard, the raise escaped before the caller could
+    assign the flag, leaking the worktree.
+    """
+    primary = tmp_path / "primary"
+    primary.mkdir()  # exists → fetch path, not clone
+    worktree = tmp_path / "wt"
+
+    def fake_call(argv: list[str], **_: Any) -> int:
+        # `git worktree add` succeeds (rc 0); `gh pr checkout` then raises as
+        # if the binary vanished mid-launch (TOCTOU vs the PATH probe).
+        if "checkout" in argv:
+            raise OSError("gh vanished")
+        return 0
+
+    monkeypatch.setattr(_mod.subprocess, "call", fake_call)
+    # `input` would block on the non-zero path; the OSError path returns
+    # before reaching it, but stub it so a regression can't hang the suite.
+    monkeypatch.setattr("builtins.input", lambda *_a, **_k: "")
+
+    ok, created, head_sha = _prepare_pr_worktree("o/r", 7, primary, worktree)
+    assert ok is False
+    assert created is True  # ← the load-bearing assertion: finally must run
+    assert head_sha == ""
 
 
 # --- _seed_worktree_codegraph ----------------------------------------------

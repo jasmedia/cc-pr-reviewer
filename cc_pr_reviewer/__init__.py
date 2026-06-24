@@ -1757,8 +1757,10 @@ def _prepare_pr_worktree(
     the caller returns early. `worktree_created` flips True as soon as
     `git worktree add` succeeds and is reported *separately* from `ok` so
     the caller's `finally` still tears the worktree down when the later
-    checkout fails. `head_sha` is the resolved PR HEAD (or "" if it
-    couldn't be resolved — non-fatal).
+    checkout fails — whether it fails with a non-zero rc *or* raises
+    `OSError` (the post-add region is guarded so the raise can't escape with
+    `worktree_created` stranded inside this frame). `head_sha` is the
+    resolved PR HEAD (or "" if it couldn't be resolved — non-fatal).
     """
     worktree_created = False
     # Primary clone: shared object store + remote-tracking refs. It stays
@@ -1818,18 +1820,34 @@ def _prepare_pr_worktree(
     # without creating a local branch, so it can never collide with a
     # branch checked out in the primary clone or a sibling worktree. The
     # fresh detached tree means there's no dirty state to `--force` past.
-    print(f"\nChecking out PR #{number}…")
-    if (
-        subprocess.call(
-            ["gh", "pr", "checkout", str(number), "--detach"],
-            cwd=worktree_path,
-        )
-        != 0
-    ):
-        input("\nCheckout failed. Press Enter to return…")
-        return False, worktree_created, ""
+    #
+    # Guard the whole post-`worktree_created` region in `try/except OSError`.
+    # `subprocess.call`/`run` raise (not return non-zero) when the binary is
+    # gone — a TOCTOU vs the launch-time `codegraph`/`gh` PATH probes, or a
+    # mid-launch uninstall. Without the guard that exception would escape
+    # *before* the caller unpacks the return tuple, leaving the outer
+    # `worktree_created` at its `False` pre-init so the `finally` skips
+    # `git worktree remove` and leaks the worktree we just created. Convert
+    # the raise into the same `ok=False` early-return the non-zero-rc
+    # checkout path uses, carrying `worktree_created=True` out so teardown
+    # still fires. (Mirrors the `OSError` handling around the `codegraph`
+    # subprocess calls — an uncaught one post-`suspend()` is the bug.)
+    try:
+        print(f"\nChecking out PR #{number}…")
+        if (
+            subprocess.call(
+                ["gh", "pr", "checkout", str(number), "--detach"],
+                cwd=worktree_path,
+            )
+            != 0
+        ):
+            input("\nCheckout failed. Press Enter to return…")
+            return False, worktree_created, ""
 
-    sha_r = run(["git", "rev-parse", "HEAD"], cwd=worktree_path)
+        sha_r = run(["git", "rev-parse", "HEAD"], cwd=worktree_path)
+    except OSError as e:
+        print(f"\nFailed to check out PR #{number}: {e}")
+        return False, worktree_created, ""
     if sha_r.returncode != 0:
         err = (sha_r.stderr or sha_r.stdout).strip() or f"exit {sha_r.returncode}"
         print(f"warning: could not resolve HEAD in {worktree_path}: {err}")
