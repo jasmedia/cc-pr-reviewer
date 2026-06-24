@@ -4,6 +4,31 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.0] — 2026-06-24
+
+### Fixed
+- **Clock skew can no longer render a negative age in the "Updated" column**
+  (PR #62). GitHub stamps `updatedAt` in real time, so when the local clock
+  lags the server the machine computes a smaller "now", `now - dt` goes
+  negative, and the cell rendered a nonsensical `-1351s`. `humanise()` now
+  floors the age at zero with `max(0, …)` — a future timestamp just reads as
+  "essentially now". Display-only; it doesn't mask the underlying skew. First
+  `humanise()` unit tests added alongside (empty/unparseable passthrough, every
+  s/m/h/d boundary, and the future-timestamp clamp).
+
+### Changed
+- **Internal refactors with no behavior change**, paving the way for broader
+  test coverage:
+  - `_launch_claude` decomposed into smaller testable helpers, then renamed to
+    the CLI-agnostic `_launch_review_cli` (with a new `_primary_path` helper)
+    (PRs #61, #64).
+  - `_codegraph_mcp_registered` split into per-path checkers (PR #65).
+  - Worktree teardown now guards against `OSError` raised after a successful
+    `git worktree add` (PR #61).
+- **Expanded unit-test coverage** for previously untested pure helpers,
+  including error verdicts for the toml classifier and the MCP-probe `OSError`
+  path (PRs #63, #65).
+
 ## [0.18.2] — 2026-06-23
 
 ### Added
