@@ -2166,12 +2166,23 @@ def test_resolve_codegraph_tools_skips_probe_unless_present_and_on_path(
 
 @pytest.mark.parametrize("mcp_state,expected", [(True, True), (False, False), (None, False)])
 def test_resolve_codegraph_tools_maps_mcp_state(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mcp_state: bool | None, expected: bool
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    mcp_state: bool | None,
+    expected: bool,
 ) -> None:
     """Only an explicit True (entry present) promises tools; False (not
-    registered) and None (no/unparseable config) both yield False."""
+    registered) and None (no/unparseable config) both yield False — and each
+    falsy state surfaces a diagnostic `warning:` while True stays quiet.
+    Asserting the output also keeps the production warnings off the test log."""
     monkeypatch.setattr(_mod, "_codegraph_mcp_registered", lambda *_a, **_k: mcp_state)
     assert _resolve_codegraph_tools("claude", tmp_path, True, True) is expected
+    out = capsys.readouterr().out
+    if mcp_state is True:
+        assert out == ""
+    else:
+        assert "warning:" in out
 
 
 # --- humanise (relative-time formatting) -----------------------------------
