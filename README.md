@@ -49,7 +49,7 @@ flowchart TD
     F -- "post-inline off" --> H["Findings shown<br/>in the session"]
     G --> I([Back to the queue])
     H --> I
-    G -. "if configured" .-> S["Slack notification"]
+    I -. "if configured" .-> S["Slack notification"]
 ```
 
 Everything between picking a PR and the agent finishing is automated — the

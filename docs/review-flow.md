@@ -103,8 +103,9 @@ All symbols live in `cc_pr_reviewer/__init__.py`:
 | Node | Symbol | Line |
 | --- | --- | --- |
 | Keypress entry, in-progress gate, modal push | `action_review` | 4521 |
-| Confirm / warn modals | `ConfirmScreen` / `InProgressWarnScreen` | 3237 |
-| Per-launch choices payload | `ConfirmResult` | 3175 |
+| Per-launch choices payload | `ConfirmResult` | 3176 |
+| Confirm modal | `ConfirmScreen` | 3237 |
+| In-progress warn modal | `InProgressWarnScreen` | 3400 |
 | Launch orchestration + `finally` teardown | `_launch_review_cli` | 5035 |
 | Prompt assembly (pure) | `build_review_prompt` | 2200 |
 | Slack notification decision | `_notify_review_to_slack` | 4921 |
