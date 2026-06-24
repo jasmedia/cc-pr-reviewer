@@ -24,6 +24,8 @@ Ruff is the sole linter/formatter (configured in `pyproject.toml`); pre-commit r
 
 Single-module Textual TUI (`cc_pr_reviewer/__init__.py`) that orchestrates external coding-agent CLIs rather than talking to any API directly. Three layers matter:
 
+> For an end-to-end picture of the review keypress → modals → launch → teardown path (the layer-3 flow below), see the flow diagram in [`docs/review-flow.md`](docs/review-flow.md).
+
 1. **Data source — `gh` CLI.** `fetch_review_prs()` shells out to `gh search prs --review-requested=@me --state=open --json …`. With the `m` toggle on, `fetch_my_prs()` runs as a *second, independent* fetch merged into the same list (rows tagged `_mine=True`); a failure there surfaces as a separate warning rather than dropping the primary list. Auth/pagination/rate-limiting all piggyback on `gh api`/`gh api graphql` — the app never hits the GitHub API directly.
 
 2. **TUI — Textual `App` + `ModalScreen`.** `PRReviewer` keeps `self.prs` as the source of truth and maps table rows via `self._row_to_pr_idx: list[int | None]` (`None` = non-selectable group-header row). `_selected()` consults the map rather than indexing `self.prs[cursor_row]`, so any code that mutates row layout (grouping, sectioning) must keep the map in lockstep with `add_row` calls. Network work runs in `@work(thread=True)` workers and marshals back via `call_from_thread`.
