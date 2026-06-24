@@ -1310,6 +1310,103 @@ def fetch_existing_review_comments(repo: str, number: int) -> tuple[list[dict[st
     return data, True
 
 
+# One config candidate's contribution to the codegraph-MCP probe:
+#   "found"   — a `codegraph` MCP entry is present (→ overall True)
+#   "absent"  — a readable, well-formed config with no codegraph entry
+#   "error"   — the path exists but is unreadable / malformed / non-regular
+#   "missing" — no file at this path (contributes nothing)
+# `_codegraph_mcp_registered` folds these per-candidate verdicts into the
+# public True/None/False tristate.
+_McpProbe = Literal["found", "absent", "error", "missing"]
+
+
+def _probe_config_stat(path: Path) -> _McpProbe | None:
+    """Stat-guard shared by the JSON and TOML probes.
+
+    Returns a terminal `"missing"`/`"error"` verdict, or `None` to mean "a
+    regular file is present — go read it". `path.exists()`/`is_file()`
+    re-raise `PermissionError` (EACCES is NOT in pathlib's ignored-errno
+    set) when an ancestor dir like `~`, `~/.codex`, or `~/.gemini` lacks
+    search permission; bucket that as `"error"` so an unreadable tree
+    degrades honestly instead of bubbling a traceback out of
+    `_launch_review_cli` post-`suspend()` (or out of `on_mount` for the
+    startup path). A path that exists but isn't a regular file (accidental
+    `mkdir ~/.claude.json`, dangling symlink, device node) is also
+    `"error"`: unreadable, but distinct from "no config at all" so the
+    warning prose stays accurate.
+    """
+    try:
+        if not path.exists():
+            return "missing"
+        if not path.is_file():
+            return "error"
+    except OSError:
+        return "error"
+    return None
+
+
+def _check_json_mcp_entry(path: Path) -> _McpProbe:
+    """Classify one JSON config for an `mcpServers.codegraph` entry.
+
+    Covers claude (`~/.claude.json`, `<workspace>/.mcp.json`) and gemini
+    (`~/.gemini/settings.json`, `<workspace>/.gemini/settings.json`).
+
+    A readable-but-structurally-malformed config (top-level not a dict, or
+    `mcpServers` present but not a dict) is `"error"` ("undetectable"), not
+    `"absent"`: the file is unusable for our purpose, so the honest upstream
+    state is None — not the "config exists but lacks the entry — run
+    `codegraph install`" remediation, which won't fix a broken shape. The
+    `isinstance(mcp, dict)` check ALSO guards substring-style false
+    positives — `"codegraph" in "codegraph"` (char membership) and
+    `"codegraph" in ["codegraph"]` (list membership) are both truthy and
+    would wrongly resolve to a registration without it. `"mcpServers" not in
+    data` (vs `data.get`) keeps absent-vs-null distinct: `data.get` would
+    collapse `{}` and `{"mcpServers": None}` into the same value, hiding the
+    malformed case.
+    """
+    terminal = _probe_config_stat(path)
+    if terminal is not None:
+        return terminal
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        # File exists but unreadable/corrupt — "error" rather than "absent"
+        # so a corrupt global config can't masquerade as a confirmed
+        # no-entry state (and a valid workspace-local candidate still wins).
+        return "error"
+    if not isinstance(data, dict):
+        return "error"
+    if "mcpServers" not in data:
+        return "absent"
+    mcp = data["mcpServers"]
+    if not isinstance(mcp, dict):
+        return "error"
+    return "found" if "codegraph" in mcp else "absent"
+
+
+def _check_toml_mcp_entry(path: Path) -> _McpProbe:
+    """Classify one TOML config (codex `~/.codex/config.toml`) for a
+    `[mcp_servers.codegraph]` section.
+
+    Matches conservatively on the canonical section-header form that
+    `codegraph install` writes. Alternative shapes (inline tables under
+    `[mcp_servers]`, quoted dotted keys) classify as `"absent"` — the safer
+    outcome (the user sees a warning and can confirm wiring) over
+    regex-guessing past a malformed match. Avoids a `tomllib` dependency
+    that would bump the min Python to 3.11.
+    """
+    terminal = _probe_config_stat(path)
+    if terminal is not None:
+        return terminal
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return "error"
+    if re.search(r"^\[mcp_servers\.codegraph\]\s*$", text, re.MULTILINE):
+        return "found"
+    return "absent"
+
+
 def _codegraph_mcp_registered(
     cli: CliChoice,
     workspace: Path | None,
@@ -1344,8 +1441,12 @@ def _codegraph_mcp_registered(
     candidates fail to parse but a LATER one validly contains the
     entry, we return `True` — under-promising on a valid setup just
     because the global file was transiently malformed would be worse
-    than the warning we'd otherwise print. The `had_parse_error` flag
-    only matters when no candidate returned True.
+    than the warning we'd otherwise print. A candidate's `"error"`
+    verdict only matters when no candidate returned `"found"`.
+
+    Each candidate is classified by `_check_json_mcp_entry` /
+    `_check_toml_mcp_entry` (which share `_probe_config_stat`); this
+    function only fans out per CLI and folds the verdicts together.
 
     Why this lives between cc-reviewer and the agent: cc-reviewer's
     Tier 1 prompt suffix tells the agent "use these MCP tools". If the
@@ -1409,114 +1510,29 @@ def _codegraph_mcp_registered(
         # too, but a runtime raise is the belt-and-suspenders fallback.
         raise ValueError(f"unknown CLI choice: {cli!r}")
 
-    any_file_seen = False
-    had_parse_error = False
-    for path in json_candidates:
-        # `path.exists()`/`is_file()` reach into the filesystem and
-        # re-raise `PermissionError` (EACCES is NOT in pathlib's ignored-
-        # errno set) when an ancestor dir like `~`, `~/.codex`, or
-        # `~/.gemini` lacks search/execute permission. Wrapping the
-        # stat-level calls in the same `OSError` bucket as the `read_text`
-        # below means an unreadable tree degrades to `None`/parse-error
-        # honestly instead of bubbling a traceback out of `_launch_review_cli`
-        # post-`suspend()` (or out of `on_mount` for the startup path
-        # this PR adds).
-        try:
-            if not path.exists():
-                continue
-            is_regular_file = path.is_file()
-        except OSError:
-            had_parse_error = True
-            continue
-        if not is_regular_file:
-            # Path slot exists but isn't a regular file (accidental
-            # `mkdir ~/.claude.json`, dangling symlink, device node).
-            # Bucket as parse-failure: we can't read it, so we can't
-            # confirm — but distinct from "no config at all" so the
-            # warning prose is accurate ("couldn't find or parse").
-            had_parse_error = True
-            continue
-        any_file_seen = True
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-            # File exists but unreadable/corrupt. Continue to the next
-            # candidate rather than returning None immediately — a
-            # corrupt global config must NOT suppress a valid workspace-
-            # local one, otherwise we'd under-promise on the exact
-            # setup this probe exists to support.
-            had_parse_error = True
-            continue
-        # A readable-but-structurally-malformed config (top-level not a
-        # dict, or `mcpServers` present but not a dict) is "undetectable",
-        # not "confirmed-not-registered": the file is unusable for our
-        # purpose, so the honest state is None. Without bucketing these
-        # branches into `had_parse_error`, the helper would fall through
-        # to `return False`, and `_launch_review_cli` would print the
-        # "config exists but lacks the entry — run `codegraph install`"
-        # remediation, which won't fix a structurally broken config.
-        # `isinstance(mcp, dict)` ALSO guards against substring-style
-        # false-positives: `"codegraph" in "codegraph"` is True (char
-        # membership) and `"codegraph" in ["codegraph"]` is True (list
-        # membership), both of which would wrongly resolve to a True
-        # registration if the dict-typed check were dropped.
-        if not isinstance(data, dict):
-            had_parse_error = True
-            continue
-        if "mcpServers" not in data:
-            # Key simply absent is a valid "no entry" state, not a
-            # malformed shape — falls through to the final `return False`
-            # below if nothing else trips. Distinguishing absent-vs-null
-            # requires the `in` check; `data.get("mcpServers")` would
-            # collapse `{}` and `{"mcpServers": None}` into the same
-            # `None`, hiding the malformed case from the bucket below.
-            continue
-        mcp = data["mcpServers"]
-        if not isinstance(mcp, dict):
-            # Key present but the value is malformed (string, list, null,
-            # primitive). `isinstance(mcp, dict)` also guards against
-            # substring-style false-positives — `"codegraph" in "codegraph"`
-            # (char membership) and `"codegraph" in ["codegraph"]` (list
-            # membership) are both truthy and would wrongly resolve to a
-            # True registration if the dict-typed check were dropped.
-            had_parse_error = True
-            continue
-        if "codegraph" in mcp:
-            return True
-
-    for path in toml_candidates:
-        # Same stat-level guard as the JSON loop above — PermissionError
-        # on an unreadable ancestor (e.g. `chmod 000 ~/.codex`) must
-        # degrade cleanly to "had_parse_error" rather than crashing the
-        # caller post-`suspend()` or during `on_mount`.
-        try:
-            if not path.exists():
-                continue
-            is_regular_file = path.is_file()
-        except OSError:
-            had_parse_error = True
-            continue
-        if not is_regular_file:
-            had_parse_error = True
-            continue
-        any_file_seen = True
-        try:
-            text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            had_parse_error = True
-            continue
-        # Match conservatively on the canonical section header form
-        # `[mcp_servers.codegraph]` — that's what `codegraph install`
-        # writes. Alternative shapes (inline tables under
-        # `[mcp_servers]`, quoted dotted keys) fall through to False,
-        # which is the safer outcome (the user sees a warning and can
-        # confirm wiring) rather than us regex-guessing past a
-        # malformed match. Avoids a tomllib dependency that would bump
-        # the min Python to 3.11.
-        if re.search(r"^\[mcp_servers\.codegraph\]\s*$", text, re.MULTILINE):
-            return True
-
-    if had_parse_error or not any_file_seen:
+    # Fold each candidate's per-path verdict into the public tristate.
+    # `"found"` short-circuits to True — and earlier-candidate parse errors
+    # are intentionally lossy: a later valid hit (e.g. a workspace-local
+    # config) wins over a transiently malformed global file, since
+    # under-promising on a working setup is worse than the warning we'd
+    # print. Otherwise: None if ANY candidate was unreadable/malformed
+    # (`"error"`) OR none existed at all (no `"absent"` seen), else False
+    # (every config we read confirmed there's no codegraph entry).
+    any_seen = False
+    parse_error = False
+    for check, candidates in (
+        (_check_json_mcp_entry, json_candidates),
+        (_check_toml_mcp_entry, toml_candidates),
+    ):
+        for path in candidates:
+            verdict = check(path)
+            if verdict == "found":
+                return True
+            if verdict == "error":
+                parse_error = True
+            elif verdict == "absent":
+                any_seen = True
+    if parse_error or not any_seen:
         return None
     return False
 

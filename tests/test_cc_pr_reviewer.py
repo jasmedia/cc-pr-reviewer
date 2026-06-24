@@ -58,6 +58,8 @@ from cc_pr_reviewer import (
     _build_cli_command,
     _build_skill_based_prompt,
     _check_codegraph_setup,
+    _check_json_mcp_entry,
+    _check_toml_mcp_entry,
     _cleanup_skills,
     _codegraph_mcp_registered,
     _first_available_cli,
@@ -75,6 +77,7 @@ from cc_pr_reviewer import (
     _pr_key,
     _prepare_pr_worktree,
     _primary_path,
+    _probe_config_stat,
     _record_launch_telemetry,
     _record_review,
     _refresh_interval_label,
@@ -1300,6 +1303,126 @@ def test_mcp_registered_per_cli_isolation(tmp_path: Path) -> None:
     assert _codegraph_mcp_registered("claude", workspace, home=home) is True
     assert _codegraph_mcp_registered("codex", workspace, home=home) is False
     assert _codegraph_mcp_registered("gemini", workspace, home=home) is False
+
+
+# --- per-path MCP classifiers (_probe_config_stat / _check_*_mcp_entry) ----
+
+
+def test_probe_config_stat_missing_regular_and_nonregular(tmp_path: Path) -> None:
+    """The shared stat-guard: absent → "missing", a regular file → None
+    ("go read it"), a non-regular path (here a dir) → "error"."""
+    assert _probe_config_stat(tmp_path / "nope.json") == "missing"
+    f = tmp_path / "real.json"
+    f.write_text("{}", encoding="utf-8")
+    assert _probe_config_stat(f) is None
+    d = tmp_path / "a-dir"
+    d.mkdir()
+    assert _probe_config_stat(d) == "error"
+
+
+def test_probe_config_stat_oserror_is_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A PermissionError from the stat call (an unreadable ancestor dir —
+    EACCES isn't in pathlib's ignored-errno set) degrades to "error", not a
+    crash. Both classifiers delegate the guard here, so this covers their
+    OSError path too — without it the traceback would bubble out of
+    `_launch_review_cli` post-`suspend()`."""
+    p = tmp_path / "x.json"
+    p.write_text("{}", encoding="utf-8")
+
+    def _boom(self: Path) -> bool:
+        raise PermissionError("ancestor dir not searchable")
+
+    monkeypatch.setattr(Path, "exists", _boom)
+    assert _probe_config_stat(p) == "error"
+
+
+def test_check_json_mcp_entry_found(tmp_path: Path) -> None:
+    p = tmp_path / "c.json"
+    _write_json(p, {"mcpServers": {"codegraph": {"command": "codegraph"}}})
+    assert _check_json_mcp_entry(p) == "found"
+
+
+def test_check_json_mcp_entry_absent_variants(tmp_path: Path) -> None:
+    """Both "mcpServers present but no codegraph key" and "mcpServers key
+    absent entirely" are valid no-entry states → "absent" (→ overall False),
+    NOT "error"."""
+    p1 = tmp_path / "no-key.json"
+    _write_json(p1, {"mcpServers": {"other": {}}})
+    assert _check_json_mcp_entry(p1) == "absent"
+    p2 = tmp_path / "no-section.json"
+    _write_json(p2, {"theme": "dark"})
+    assert _check_json_mcp_entry(p2) == "absent"
+
+
+def test_check_json_mcp_entry_missing(tmp_path: Path) -> None:
+    assert _check_json_mcp_entry(tmp_path / "absent.json") == "missing"
+
+
+def test_check_json_mcp_entry_corrupt_json_is_error(tmp_path: Path) -> None:
+    p = tmp_path / "corrupt.json"
+    p.write_text("{not valid json", encoding="utf-8")
+    assert _check_json_mcp_entry(p) == "error"
+
+
+def test_check_json_mcp_entry_top_level_not_dict_is_error(tmp_path: Path) -> None:
+    """A readable but structurally-malformed config (top-level a list, not a
+    dict) is "error" → upstream None, so the user gets "couldn't parse" not
+    the "run codegraph install" remediation that won't fix a broken shape."""
+    p = tmp_path / "list.json"
+    p.write_text(json.dumps(["codegraph"]), encoding="utf-8")
+    assert _check_json_mcp_entry(p) == "error"
+
+
+def test_check_json_mcp_entry_mcpservers_string_is_error_not_found(tmp_path: Path) -> None:
+    """Substring false-positive guard: `mcpServers: "codegraph"` would make
+    `"codegraph" in "codegraph"` (char membership) truthy and wrongly read as
+    registered without the `isinstance(mcp, dict)` check. Must be "error"."""
+    p = tmp_path / "str.json"
+    _write_json(p, {"mcpServers": "codegraph"})
+    assert _check_json_mcp_entry(p) == "error"
+
+
+def test_check_json_mcp_entry_mcpservers_list_is_error_not_found(tmp_path: Path) -> None:
+    """List false-positive guard: `mcpServers: ["codegraph"]` would make
+    `"codegraph" in ["codegraph"]` (list membership) truthy. Must be "error"."""
+    p = tmp_path / "list2.json"
+    _write_json(p, {"mcpServers": ["codegraph"]})
+    assert _check_json_mcp_entry(p) == "error"
+
+
+def test_check_toml_mcp_entry_found(tmp_path: Path) -> None:
+    p = tmp_path / "ok.toml"
+    p.write_text("[mcp_servers.codegraph]\ncommand = 'codegraph'\n", encoding="utf-8")
+    assert _check_toml_mcp_entry(p) == "found"
+
+
+def test_check_toml_mcp_entry_absent(tmp_path: Path) -> None:
+    p = tmp_path / "other.toml"
+    p.write_text("[mcp_servers.other]\ncommand = 'x'\n", encoding="utf-8")
+    assert _check_toml_mcp_entry(p) == "absent"
+
+
+def test_check_toml_mcp_entry_missing(tmp_path: Path) -> None:
+    assert _check_toml_mcp_entry(tmp_path / "nope.toml") == "missing"
+
+
+def test_check_toml_mcp_entry_directory_is_error(tmp_path: Path) -> None:
+    """A non-regular path (dir at the config slot) → "error", matching the
+    JSON classifier and `_probe_config_stat`."""
+    d = tmp_path / "config.toml"
+    d.mkdir()
+    assert _check_toml_mcp_entry(d) == "error"
+
+
+def test_check_toml_mcp_entry_non_canonical_shape_is_absent(tmp_path: Path) -> None:
+    """Conservative match: an inline-table form under `[mcp_servers]` isn't
+    the canonical section header the installer writes, so it's "absent" (safe
+    warning) rather than a regex-guessed match."""
+    p = tmp_path / "inline.toml"
+    p.write_text("[mcp_servers]\ncodegraph = { command = 'codegraph' }\n", encoding="utf-8")
+    assert _check_toml_mcp_entry(p) == "absent"
 
 
 # --- workspace=None (startup) path for _codegraph_mcp_registered ----------
