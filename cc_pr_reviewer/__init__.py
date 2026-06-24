@@ -2360,7 +2360,12 @@ def humanise(iso: str) -> str:
         dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
     except ValueError:
         return iso
-    s = int((datetime.now(timezone.utc) - dt).total_seconds())
+    # Clamp to 0: when the local clock lags the server (GitHub stamps
+    # `updatedAt` in real time; a machine whose clock is behind computes a
+    # smaller "now"), `now - dt` goes negative and the cell would render a
+    # nonsensical "-1351s ago". A future timestamp just means "essentially
+    # now", so floor the age at zero rather than leaking clock skew into the UI.
+    s = max(0, int((datetime.now(timezone.utc) - dt).total_seconds()))
     if s < 60:
         return f"{s}s"
     if s < 3600:

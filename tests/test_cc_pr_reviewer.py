@@ -14,6 +14,7 @@ import re
 import socket
 import sqlite3
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -85,6 +86,7 @@ from cc_pr_reviewer import (
     fetch_my_latest_review,
     format_codegraph_affected_tests,
     format_existing_comments,
+    humanise,
     new_review_pr_keys,
     parse_refresh_interval,
 )
@@ -2023,6 +2025,63 @@ def test_check_prereqs_fails_when_gh_missing(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(_mod, "_persisted_cli", lambda: "codex")
     problems = check_prereqs()
     assert any("gh" in p and "not found" in p.lower() for p in problems)
+
+
+# --- humanise (relative-time formatting) -----------------------------------
+
+_FIXED_NOW = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+
+class _FixedDatetime(datetime):
+    """`datetime` subclass with a frozen `now()` so humanise's boundary
+    arithmetic is deterministic (real `now()` would drift between the test
+    building the input and humanise reading the clock)."""
+
+    @classmethod
+    def now(cls, tz: timezone | None = None) -> datetime:  # type: ignore[override]
+        return _FIXED_NOW if tz is None else _FIXED_NOW.astimezone(tz)
+
+
+@pytest.fixture
+def _frozen_now(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_mod, "datetime", _FixedDatetime)
+
+
+def _ago(**delta: int) -> str:
+    """ISO string for `_FIXED_NOW - delta`, in the `…Z` shape GitHub emits."""
+    return (_FIXED_NOW - timedelta(**delta)).isoformat().replace("+00:00", "Z")
+
+
+def test_humanise_empty_is_blank() -> None:
+    assert humanise("") == ""
+
+
+def test_humanise_unparseable_passes_through() -> None:
+    assert humanise("not-a-date") == "not-a-date"
+
+
+@pytest.mark.parametrize(
+    "delta,expected",
+    [
+        ({"seconds": 0}, "0s"),
+        ({"seconds": 59}, "59s"),
+        ({"seconds": 60}, "1m"),  # s/m boundary
+        ({"seconds": 3599}, "59m"),
+        ({"seconds": 3600}, "1h"),  # m/h boundary
+        ({"seconds": 86399}, "23h"),
+        ({"seconds": 86400}, "1d"),  # h/d boundary
+        ({"days": 3}, "3d"),
+    ],
+)
+def test_humanise_boundaries(_frozen_now: None, delta: dict[str, int], expected: str) -> None:
+    assert humanise(_ago(**delta)) == expected
+
+
+def test_humanise_future_timestamp_clamps_to_zero(_frozen_now: None) -> None:
+    """Clock skew (local clock behind the server) makes `updatedAt` look like
+    the future; the age must floor at `0s`, not render a negative `-1351s`."""
+    future = (_FIXED_NOW + timedelta(seconds=1351)).isoformat().replace("+00:00", "Z")
+    assert humanise(future) == "0s"
 
 
 # --- _parse_semver / _is_newer ---------------------------------------------
