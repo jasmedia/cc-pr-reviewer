@@ -1747,6 +1747,333 @@ def format_codegraph_affected_tests(paths: list[str]) -> str:
     return "\n".join(lines)
 
 
+def _prepare_pr_worktree(
+    repo_full: str, number: int, primary_path: Path, worktree_path: Path
+) -> tuple[bool, bool, str]:
+    """Clone-or-fetch the primary, carve this PR's isolated worktree, check it out.
+
+    Returns `(ok, worktree_created, head_sha)`. `ok` is False on a fatal
+    failure (clone, worktree add, or checkout) after prompting the user —
+    the caller returns early. `worktree_created` flips True as soon as
+    `git worktree add` succeeds and is reported *separately* from `ok` so
+    the caller's `finally` still tears the worktree down when the later
+    checkout fails. `head_sha` is the resolved PR HEAD (or "" if it
+    couldn't be resolved — non-fatal).
+    """
+    worktree_created = False
+    # Primary clone: shared object store + remote-tracking refs. It stays
+    # on its default branch — we never `gh pr checkout` it — so concurrent
+    # reviews never contend here.
+    if not primary_path.exists():
+        print(f"Cloning {repo_full} → {primary_path}…")
+        if subprocess.call(["gh", "repo", "clone", repo_full, str(primary_path)]) != 0:
+            input("\nClone failed. Press Enter to return…")
+            return False, worktree_created, ""
+    else:
+        print(f"Fetching latest into {primary_path}…")
+        # A failed fetch isn't fatal (`gh pr checkout` below fetches the PR
+        # ref itself), but it means the shared object store may be stale —
+        # warn loudly rather than silently reviewing against last-fetched refs.
+        if subprocess.call(["git", "fetch", "--all", "--prune"], cwd=primary_path) != 0:
+            print(
+                "warning: `git fetch` failed; continuing against last-fetched refs — "
+                "the checkout may be stale."
+            )
+
+    # Per-PR worktree off the primary clone (shares its `.git` objects, so
+    # it's cheap). `prune` reaps metadata orphaned by a previous crash; a
+    # leftover dir on disk is then force-removed so we always start from a
+    # clean tree. `--detach` starts the worktree at primary HEAD with no
+    # branch, sidestepping git's "branch already checked out in another
+    # worktree" refusal.
+    subprocess.call(["git", "worktree", "prune"], cwd=primary_path)
+    if worktree_path.exists():
+        subprocess.call(
+            ["git", "worktree", "remove", "--force", str(worktree_path)],
+            cwd=primary_path,
+        )
+        # `git worktree remove` only removes a *registered* worktree. If a
+        # crash left the directory but `prune` (or a partial prune) already
+        # reaped its admin entry, the remove exits non-zero and the dir
+        # survives — and `git worktree add` then refuses ("already exists";
+        # `--force` won't overwrite a populated dir), wedging this PR's
+        # review until manual cleanup. Force the filesystem removal so the
+        # self-heal the comment promises actually holds for an orphaned dir too.
+        if worktree_path.exists():
+            shutil.rmtree(worktree_path, ignore_errors=True)
+    worktree_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"\nCreating worktree {worktree_path}…")
+    if (
+        subprocess.call(
+            ["git", "worktree", "add", "--force", "--detach", str(worktree_path)],
+            cwd=primary_path,
+        )
+        != 0
+    ):
+        input("\nWorktree creation failed. Press Enter to return…")
+        return False, worktree_created, ""
+    worktree_created = True
+
+    # `gh pr checkout --detach` lands the PR's head commit in the worktree
+    # without creating a local branch, so it can never collide with a
+    # branch checked out in the primary clone or a sibling worktree. The
+    # fresh detached tree means there's no dirty state to `--force` past.
+    print(f"\nChecking out PR #{number}…")
+    if (
+        subprocess.call(
+            ["gh", "pr", "checkout", str(number), "--detach"],
+            cwd=worktree_path,
+        )
+        != 0
+    ):
+        input("\nCheckout failed. Press Enter to return…")
+        return False, worktree_created, ""
+
+    sha_r = run(["git", "rev-parse", "HEAD"], cwd=worktree_path)
+    if sha_r.returncode != 0:
+        err = (sha_r.stderr or sha_r.stdout).strip() or f"exit {sha_r.returncode}"
+        print(f"warning: could not resolve HEAD in {worktree_path}: {err}")
+        head_sha = ""
+    else:
+        head_sha = sha_r.stdout.strip()
+    return True, worktree_created, head_sha
+
+
+def _setup_codegraph_index(
+    primary_path: Path,
+    worktree_path: Path,
+    repo_full: str,
+    number: int,
+    codegraph_present: bool,
+    codegraph_on_path: bool,
+    assist: bool,
+) -> tuple[bool, str, int]:
+    """Seed/sync the worktree's CodeGraph index and collect affected tests.
+
+    Runs the three-stage codegraph flow: (1) seed the index from the
+    primary clone (full-init fallback) when `assist` is on and the worktree
+    has none yet, (2) incrementally `codegraph sync` the checked-out branch,
+    (3) query `codegraph affected` for tests reached by the diff. Every
+    failure is a non-fatal warning — the launch always proceeds. Returns
+    the (possibly-flipped-True) `codegraph_present`, the rendered
+    affected-tests prompt block, and the capped count of affected paths for
+    telemetry.
+    """
+    # CodeGraph anchors to the per-PR WORKTREE (the agent's `cwd`, where its
+    # MCP server resolves `.codegraph/`), but an ephemeral worktree starts
+    # empty. To avoid a ~30s full re-index — or a y/N prompt — on every
+    # launch, we maintain the index on the PRIMARY clone (a *frozen* tree:
+    # we fetch but never check it out, so it's indexed once and stays valid)
+    # and SEED each worktree from it. `codegraph.db` stores paths relative
+    # to the project root, so the index is portable between worktrees of the
+    # same repo; the sync block below then incrementally re-indexes only the
+    # PR's diff. Gated on the `codegraph_assist` (`x`) toggle, which is now
+    # full consent to manage the index automatically — no per-launch prompt
+    # (which, with ephemeral worktrees, would fire every single review).
+    if not codegraph_present and assist and codegraph_on_path:
+        primary_index = primary_path / ".codegraph"
+        if not primary_index.is_dir():
+            print(
+                f"\nBuilding CodeGraph index for {primary_path} "
+                "(one-time per repo, ~30s; reused by every future review)…"
+            )
+            init_rc = 1
+            try:
+                init_rc = subprocess.call(["codegraph", "init", str(primary_path), "--index"])
+            except OSError as e:
+                # Mirrors the `uv tool upgrade` path: ENOENT/permission
+                # errors from `subprocess.call` raise rather than returning
+                # non-zero, and an uncaught OSError post-`suspend()` drops
+                # the user into a half-restored terminal.
+                print(f"\nFailed to launch `codegraph init`: {e}")
+            if init_rc != 0:
+                print(
+                    f"warning: `codegraph init --index` exited with status {init_rc}; "
+                    "continuing without an index."
+                )
+        if primary_index.is_dir():
+            print("Seeding CodeGraph index into the worktree from the primary clone…")
+            if _seed_worktree_codegraph(primary_path, worktree_path):
+                codegraph_present = True
+            else:
+                # Seeding failed (copy error). Fall back to a full index in
+                # the worktree so the session still gets tools — just slower
+                # this once.
+                print(
+                    "warning: couldn't seed from the primary clone; "
+                    "building a fresh index in the worktree (~30s)…"
+                )
+                try:
+                    subprocess.call(["codegraph", "init", str(worktree_path), "--index"])
+                except OSError as e:
+                    print(f"\nFailed to launch `codegraph init`: {e}")
+                codegraph_present = (worktree_path / ".codegraph").is_dir()
+
+    # If the user has wired CodeGraph into this workspace (`codegraph init`
+    # writes `.codegraph/`), refresh the index incrementally for the
+    # freshly-checked-out PR branch before launching. CodeGraph's MCP server
+    # has its own file watcher, but it only runs while the CLI is alive — at
+    # this point the CLI hasn't started yet, so the index can be stale
+    # (especially after `gh pr checkout`, which can rewrite many files at
+    # once). `codegraph sync` is incremental and idempotent; no-op when the
+    # index is already current.
+    if codegraph_present and codegraph_on_path:
+        print("Syncing CodeGraph index for the checked-out branch…")
+        sync_rc = 1
+        try:
+            sync_rc = subprocess.call(["codegraph", "sync", str(worktree_path)])
+        except OSError as e:
+            print(f"warning: failed to launch `codegraph sync`: {e}")
+        if sync_rc != 0:
+            # Sync failure is non-fatal: the agent can still launch, MCP
+            # queries just hit a stale index. Loud so the user knows their
+            # answers may lag the branch.
+            print(
+                f"warning: `codegraph sync` exited with status {sync_rc} — "
+                "agent will see a possibly stale CodeGraph index."
+            )
+    elif codegraph_present:
+        print(
+            "warning: `.codegraph/` exists but `codegraph` binary not on PATH — "
+            "skipping index sync; MCP queries (if wired) will hit a stale index."
+        )
+
+    # Tier 4: query codegraph for tests whose imports transitively reach
+    # this PR's changed files, and inline the list into the prompt as a
+    # scoping hint for the test-coverage review. Runs AFTER the sync block
+    # so the index reflects the checked-out branch. Gated on the same
+    # (index-present + binary-on-PATH) precondition as sync — without both,
+    # the affected-tests query can't run.
+    codegraph_affected_block = ""
+    affected_count = 0  # paths actually injected into the prompt; for telemetry
+    if codegraph_present and codegraph_on_path:
+        print("Querying CodeGraph for tests affected by this PR's diff…")
+        affected = _collect_codegraph_affected(worktree_path, repo_full, number)
+        codegraph_affected_block = format_codegraph_affected_tests(affected)
+        # Record what the agent actually saw, not the raw query count:
+        # `format_codegraph_affected_tests` caps the block at
+        # CODEGRAPH_AFFECTED_TESTS_CAP, so storing the uncapped
+        # `len(affected)` would let `affected_paths` keep climbing while
+        # `approx_prompt_tokens` plateaus — a spurious decorrelation in the
+        # very cost analysis this column feeds.
+        affected_count = min(len(affected), CODEGRAPH_AFFECTED_TESTS_CAP)
+        if codegraph_affected_block:
+            # Visible count: `_collect_codegraph_affected` now returns
+            # dedup'd output, so `len(affected)` matches the number of
+            # bullets the agent sees in the prompt block — no pre/post-dedup
+            # mismatch.
+            print(f"CodeGraph reports {len(affected)} affected file(s) for the diff.")
+    return codegraph_present, codegraph_affected_block, affected_count
+
+
+def _resolve_codegraph_tools(
+    cli: CliChoice, worktree_path: Path, codegraph_present: bool, codegraph_on_path: bool
+) -> bool:
+    """Probe whether the codegraph MCP server is registered for `cli`.
+
+    Composes every signal the agent's session actually needs before
+    promising MCP tools in the prompt suffix:
+      1. `.codegraph/` index exists in the workspace
+      2. `codegraph` binary is on PATH (server can spawn)
+      3. The selected CLI's config has a `codegraph` MCP entry
+    Skipping (3) was the root cause of the original "tools weren't
+    registered in this session" report — the binary-on-PATH check is a
+    strong proxy but doesn't catch `npm i -g` installs that never ran
+    `codegraph install` to write per-CLI MCP entries, nor the case where
+    the user switched CLIs via the `c` toggle to one they hadn't wired up.
+    We only probe the MCP config when (1) and (2) already hold — otherwise
+    the warning would be noise for users who don't have CodeGraph at all.
+    Returns True only when the MCP entry is present.
+    """
+    codegraph_tools_available = False
+    if codegraph_present and codegraph_on_path:
+        mcp_state = _codegraph_mcp_registered(cli, worktree_path)
+        codegraph_tools_available = mcp_state is True
+        install_hint = _CODEGRAPH_INSTALL_HINT[cli]
+        if mcp_state is False:
+            print(
+                f"warning: codegraph MCP server is not registered for "
+                f"{_CLI_DISPLAY[cli]} (no `codegraph` entry under "
+                f"`mcpServers` / `[mcp_servers.codegraph]` in its config). "
+                f"Skipping the MCP-tools prompt hint — the agent's session "
+                f"won't have codegraph tools loaded. {install_hint}"
+            )
+        elif mcp_state is None:
+            # `mcp_state == None` means either NO config file at any standard
+            # location OR a file existed but we couldn't parse it (corrupt
+            # JSON, unreadable TOML, permission error, non-regular file at
+            # the config path). Phrasing it as "couldn't find or parse"
+            # covers both cases honestly — earlier prose said "couldn't find"
+            # only, which misdirected users with a corrupt config at the
+            # standard path.
+            print(
+                f"warning: couldn't find or parse a {_CLI_DISPLAY[cli]} "
+                f"config to verify codegraph MCP registration. Skipping "
+                f"the MCP-tools prompt hint. If your config lives at a "
+                f"non-standard path, the agent may still see the tools at "
+                f"runtime. {install_hint}"
+            )
+    return codegraph_tools_available
+
+
+def _format_launch_banner_parts(
+    post_inline: bool,
+    built: BuiltPrompt,
+    fetch_ok: bool,
+    my_login: str | None,
+    selected_agents: tuple[str, ...],
+    extra_prompt: str,
+) -> list[str]:
+    """Assemble the human-readable launch-banner fragments (pure).
+
+    Mirrors the banner the user sees just before the CLI takes over: the
+    post-inline mode (with rereview / detection-unavailable annotations),
+    the existing-comments summary (or fetch-failed marker), the agent
+    subset when it diverges from the default, and a capped, repr'd preview
+    of any extra prompt. No I/O — the caller joins these into the
+    `Launching …` line and prints it.
+    """
+    if not fetch_ok:
+        existing_desc = "existing comments: fetch failed"
+    else:
+        existing_desc = (
+            f"existing comments: {built.existing_shown} in prompt of {built.existing_total} fetched"
+        )
+    post_inline_desc = "on" if post_inline else "off"
+    if post_inline and built.rereview:
+        post_inline_desc += ", rereview"
+    elif post_inline and my_login is None:
+        post_inline_desc += ", rereview-detection-unavailable"
+    parts = [f"post-inline: {post_inline_desc}", existing_desc]
+    # Only call out the agent subset when it diverges from the default — the
+    # banner is already crowded, and "agents: all" would be noise on every
+    # default-shape launch. Compare as SETS rather than tuples:
+    # `build_review_prompt` normalises order before assembling, so a
+    # reordered-but-full subset produces the default prompt and shouldn't
+    # trip this gate. The friendly labels mirror what the user just saw on
+    # the modal checkboxes — raw kebab-case ids would diverge from the
+    # modal's label text.
+    if set(selected_agents) != set(REVIEW_SKILLS):
+        if not selected_agents:
+            parts.append("agents: none (generic review)")
+        elif len(selected_agents) <= 3:
+            parts.append("agents: " + ", ".join(REVIEW_SKILL_LABELS[n] for n in selected_agents))
+        else:
+            parts.append(f"agents: {len(selected_agents)}/{len(REVIEW_SKILLS)}")
+    if extra_prompt:
+        # `!r` keeps newlines/control chars visible so a misclick paste
+        # (e.g. a secret) is spottable before the CLI consumes it. The
+        # explicit `(+N more chars)` suffix is the load-bearing piece:
+        # without it, a 201-char paste renders identically to a clean
+        # 200-char one while the full text still flows into argv, defeating
+        # the whole point of the preview.
+        shown = extra_prompt[:EXTRA_PROMPT_BANNER_CAP]
+        hidden = len(extra_prompt) - len(shown)
+        suffix = f" (+{hidden} more chars)" if hidden else ""
+        parts.append(f"extra prompt: {shown!r}{suffix}")
+    return parts
+
+
 def format_existing_comments(comments: list[dict[str, Any]]) -> tuple[str, int]:
     """Compact prompt block listing up to `EXISTING_COMMENT_LIST_CAP` most
     recent inline review comments (bodies truncated to
@@ -4602,6 +4929,59 @@ class PRReviewer(App):
 
     # --- launching claude ---
 
+    def _preflight_cli_checks(self, cli: CliChoice) -> bool:
+        """Validate the chosen CLI is launchable before suspending the TUI.
+
+        Returns False (and emits a toast) if the launch should abort. Run
+        while the TUI is alive so failures show as notifications rather than
+        dropping into a suspended terminal.
+        """
+        # Surface a missing CLI binary as a toast in the TUI rather than
+        # suspending and immediately failing at exec. This primarily catches
+        # the per-launch override case (user toggles CLI from the modal to
+        # one they don't have installed). Startup `check_prereqs` only
+        # verifies that at least one CLI exists — not the specific one being
+        # launched — so this check is the one that catches "you toggled to
+        # claude but it's not here".
+        if shutil.which(cli) is None:
+            self.notify(
+                f"`{cli}` not found on PATH — install it or pick a different CLI",
+                severity="error",
+                timeout=8,
+            )
+            return False
+
+        # Claude additionally needs the PR Review Toolkit plugin (the base
+        # prompt invokes the toolkit's agents by name). Codex and Gemini load
+        # the bundled skills from `.agents/skills/` instead (materialised per
+        # launch), so no extra check applies to them. The plugin check is the
+        # slow one — it shells out to `claude plugin list --json` — so it
+        # stays gated behind the binary check above. `None` (undetectable) is
+        # surfaced separately so a hung/crashed `claude plugin list` doesn't
+        # silently pass-through into a review where the prompt refers to
+        # agents the plugin can't load.
+        if cli == "claude":
+            plugin_state = _pr_review_toolkit_enabled()
+            if plugin_state is False:
+                self.notify(
+                    "PR Review Toolkit plugin not enabled — run "
+                    f"`claude plugin install {PR_REVIEW_TOOLKIT_PLUGIN}` "
+                    "or pick a different CLI",
+                    severity="error",
+                    timeout=10,
+                )
+                return False
+            if plugin_state is None:
+                self.notify(
+                    "couldn't determine PR Review Toolkit plugin status "
+                    "(`claude plugin list --json` failed or timed out) — "
+                    "proceeding; if the review can't reach the toolkit "
+                    "agents, run that command manually to diagnose",
+                    severity="warning",
+                    timeout=10,
+                )
+        return True
+
     def _launch_claude(
         self,
         pr: dict[str, Any],
@@ -4624,51 +5004,11 @@ class PRReviewer(App):
         worktree_path = _worktree_path(owner, name, number)
         key = _pr_key(pr)
 
-        # Pre-flight: surface a missing CLI binary as a toast in the TUI
-        # rather than suspending and immediately failing at exec. This
-        # primarily catches the per-launch override case (user toggles
-        # CLI from the modal to one they don't have installed). Startup
-        # `check_prereqs` only verifies that at least one CLI exists —
-        # not the specific one being launched — so this check is the
-        # one that catches "you toggled to claude but it's not here".
-        if shutil.which(cli) is None:
-            self.notify(
-                f"`{cli}` not found on PATH — install it or pick a different CLI",
-                severity="error",
-                timeout=8,
-            )
+        # Pre-flight CLI/plugin checks run while the TUI is still alive so
+        # failures surface as toasts (not a half-suspended terminal). A
+        # False return means "abort, already notified".
+        if not self._preflight_cli_checks(cli):
             return
-
-        # Claude additionally needs the PR Review Toolkit plugin (the
-        # base prompt invokes the toolkit's agents by name). Codex and
-        # Gemini load the bundled skills from `.agents/skills/` instead
-        # (materialised below per launch), so no extra check applies to
-        # them. The plugin check is the slow one — it shells out to
-        # `claude plugin list --json` — so it stays gated behind the
-        # binary check above. `None` (undetectable) is surfaced
-        # separately so a hung/crashed `claude plugin list` doesn't
-        # silently pass-through into a review where the prompt refers
-        # to agents the plugin can't load.
-        if cli == "claude":
-            plugin_state = _pr_review_toolkit_enabled()
-            if plugin_state is False:
-                self.notify(
-                    "PR Review Toolkit plugin not enabled — run "
-                    f"`claude plugin install {PR_REVIEW_TOOLKIT_PLUGIN}` "
-                    "or pick a different CLI",
-                    severity="error",
-                    timeout=10,
-                )
-                return
-            if plugin_state is None:
-                self.notify(
-                    "couldn't determine PR Review Toolkit plugin status "
-                    "(`claude plugin list --json` failed or timed out) — "
-                    "proceeding; if the review can't reach the toolkit "
-                    "agents, run that command manually to diagnose",
-                    severity="warning",
-                    timeout=10,
-                )
 
         # Suspend the TUI so the coding-agent CLI can take over stdin/stdout.
         with self.suspend():
@@ -4715,84 +5055,15 @@ class PRReviewer(App):
                 # leak (a `mkdir`/`reserve` failure above never sets it, so
                 # auto-refresh can't silently die for the session).
                 self._suspended_for_review = True
-                # Primary clone: shared object store + remote-tracking refs.
-                # It stays on its default branch — we never `gh pr checkout`
-                # it — so concurrent reviews never contend here.
-                if not primary_path.exists():
-                    print(f"Cloning {repo_full} → {primary_path}…")
-                    if subprocess.call(["gh", "repo", "clone", repo_full, str(primary_path)]) != 0:
-                        input("\nClone failed. Press Enter to return…")
-                        return
-                else:
-                    print(f"Fetching latest into {primary_path}…")
-                    # A failed fetch isn't fatal (`gh pr checkout` below fetches
-                    # the PR ref itself), but it means the shared object store
-                    # may be stale — warn loudly rather than silently reviewing
-                    # against last-fetched refs.
-                    if subprocess.call(["git", "fetch", "--all", "--prune"], cwd=primary_path) != 0:
-                        print(
-                            "warning: `git fetch` failed; continuing against last-fetched refs — "
-                            "the checkout may be stale."
-                        )
-
-                # Per-PR worktree off the primary clone (shares its `.git`
-                # objects, so it's cheap). `prune` reaps metadata orphaned by
-                # a previous crash; a leftover dir on disk is then force-removed
-                # so we always start from a clean tree. `--detach` starts the
-                # worktree at primary HEAD with no branch, sidestepping git's
-                # "branch already checked out in another worktree" refusal.
-                subprocess.call(["git", "worktree", "prune"], cwd=primary_path)
-                if worktree_path.exists():
-                    subprocess.call(
-                        ["git", "worktree", "remove", "--force", str(worktree_path)],
-                        cwd=primary_path,
-                    )
-                    # `git worktree remove` only removes a *registered* worktree.
-                    # If a crash left the directory but `prune` (or a partial
-                    # prune) already reaped its admin entry, the remove exits
-                    # non-zero and the dir survives — and `git worktree add`
-                    # then refuses ("already exists"; `--force` won't overwrite
-                    # a populated dir), wedging this PR's review until manual
-                    # cleanup. Force the filesystem removal so the self-heal the
-                    # comment promises actually holds for an orphaned dir too.
-                    if worktree_path.exists():
-                        shutil.rmtree(worktree_path, ignore_errors=True)
-                worktree_path.parent.mkdir(parents=True, exist_ok=True)
-                print(f"\nCreating worktree {worktree_path}…")
-                if (
-                    subprocess.call(
-                        ["git", "worktree", "add", "--force", "--detach", str(worktree_path)],
-                        cwd=primary_path,
-                    )
-                    != 0
-                ):
-                    input("\nWorktree creation failed. Press Enter to return…")
+                # Clone/fetch the primary, carve this PR's worktree, check it
+                # out, resolve HEAD. `worktree_created` is assigned BEFORE the
+                # `if not ok` early-return so the `finally` tears the worktree
+                # down even when `gh pr checkout` failed after a successful add.
+                ok, worktree_created, head_sha = _prepare_pr_worktree(
+                    repo_full, number, primary_path, worktree_path
+                )
+                if not ok:
                     return
-                worktree_created = True
-
-                # `gh pr checkout --detach` lands the PR's head commit in the
-                # worktree without creating a local branch, so it can never
-                # collide with a branch checked out in the primary clone or a
-                # sibling worktree. The fresh detached tree means there's no
-                # dirty state to `--force` past.
-                print(f"\nChecking out PR #{number}…")
-                if (
-                    subprocess.call(
-                        ["gh", "pr", "checkout", str(number), "--detach"],
-                        cwd=worktree_path,
-                    )
-                    != 0
-                ):
-                    input("\nCheckout failed. Press Enter to return…")
-                    return
-
-                sha_r = run(["git", "rev-parse", "HEAD"], cwd=worktree_path)
-                if sha_r.returncode != 0:
-                    err = (sha_r.stderr or sha_r.stdout).strip() or f"exit {sha_r.returncode}"
-                    print(f"warning: could not resolve HEAD in {worktree_path}: {err}")
-                    head_sha = ""
-                else:
-                    head_sha = sha_r.stdout.strip()
 
                 # Hoist the `codegraph` PATH probe once: the Tier 2/3/4
                 # blocks below all share this gate, and three separate
@@ -4804,122 +5075,22 @@ class PRReviewer(App):
                 codegraph_on_path = shutil.which("codegraph") is not None
                 codegraph_present = (worktree_path / ".codegraph").is_dir()
 
-                # CodeGraph anchors to the per-PR WORKTREE (the agent's
-                # `cwd`, where its MCP server resolves `.codegraph/`), but
-                # an ephemeral worktree starts empty. To avoid a ~30s full
-                # re-index — or a y/N prompt — on every launch, we maintain
-                # the index on the PRIMARY clone (a *frozen* tree: we fetch
-                # but never check it out, so it's indexed once and stays
-                # valid) and SEED each worktree from it. `codegraph.db`
-                # stores paths relative to the project root, so the index
-                # is portable between worktrees of the same repo; the sync
-                # block below then incrementally re-indexes only the PR's
-                # diff. Gated on the `codegraph_assist` (`x`) toggle, which
-                # is now full consent to manage the index automatically —
-                # no per-launch prompt (which, with ephemeral worktrees,
-                # would fire every single review).
-                if not codegraph_present and self.codegraph_assist and codegraph_on_path:
-                    primary_index = primary_path / ".codegraph"
-                    if not primary_index.is_dir():
-                        print(
-                            f"\nBuilding CodeGraph index for {primary_path} "
-                            "(one-time per repo, ~30s; reused by every future review)…"
-                        )
-                        init_rc = 1
-                        try:
-                            init_rc = subprocess.call(
-                                ["codegraph", "init", str(primary_path), "--index"]
-                            )
-                        except OSError as e:
-                            # Mirrors the `uv tool upgrade` path: ENOENT/
-                            # permission errors from `subprocess.call`
-                            # raise rather than returning non-zero, and
-                            # an uncaught OSError post-`suspend()` drops
-                            # the user into a half-restored terminal.
-                            print(f"\nFailed to launch `codegraph init`: {e}")
-                        if init_rc != 0:
-                            print(
-                                f"warning: `codegraph init --index` exited with status {init_rc}; "
-                                "continuing without an index."
-                            )
-                    if primary_index.is_dir():
-                        print("Seeding CodeGraph index into the worktree from the primary clone…")
-                        if _seed_worktree_codegraph(primary_path, worktree_path):
-                            codegraph_present = True
-                        else:
-                            # Seeding failed (copy error). Fall back to a full
-                            # index in the worktree so the session still gets
-                            # tools — just slower this once.
-                            print(
-                                "warning: couldn't seed from the primary clone; "
-                                "building a fresh index in the worktree (~30s)…"
-                            )
-                            try:
-                                subprocess.call(
-                                    ["codegraph", "init", str(worktree_path), "--index"]
-                                )
-                            except OSError as e:
-                                print(f"\nFailed to launch `codegraph init`: {e}")
-                            codegraph_present = (worktree_path / ".codegraph").is_dir()
-
-                # If the user has wired CodeGraph into this workspace
-                # (`codegraph init` writes `.codegraph/`), refresh the
-                # index incrementally for the freshly-checked-out PR
-                # branch before launching. CodeGraph's MCP server has its
-                # own file watcher, but it only runs while the CLI is
-                # alive — at this point the CLI hasn't started yet, so
-                # the index can be stale (especially after `gh pr
-                # checkout`, which can rewrite many files at once).
-                # `codegraph sync` is incremental and idempotent;
-                # no-op when the index is already current.
-                if codegraph_present and codegraph_on_path:
-                    print("Syncing CodeGraph index for the checked-out branch…")
-                    sync_rc = 1
-                    try:
-                        sync_rc = subprocess.call(["codegraph", "sync", str(worktree_path)])
-                    except OSError as e:
-                        print(f"warning: failed to launch `codegraph sync`: {e}")
-                    if sync_rc != 0:
-                        # Sync failure is non-fatal: the agent can
-                        # still launch, MCP queries just hit a stale
-                        # index. Loud so the user knows their answers
-                        # may lag the branch.
-                        print(
-                            f"warning: `codegraph sync` exited with status {sync_rc} — "
-                            "agent will see a possibly stale CodeGraph index."
-                        )
-                elif codegraph_present:
-                    print(
-                        "warning: `.codegraph/` exists but `codegraph` binary not on PATH — "
-                        "skipping index sync; MCP queries (if wired) will hit a stale index."
+                # Seed/sync the worktree's CodeGraph index (gated on the `x`
+                # toggle) and collect the affected-tests scoping block. All
+                # failures inside are non-fatal warnings — the launch proceeds
+                # regardless. `codegraph_present` can flip True after a
+                # successful seed.
+                codegraph_present, codegraph_affected_block, affected_count = (
+                    _setup_codegraph_index(
+                        primary_path,
+                        worktree_path,
+                        repo_full,
+                        number,
+                        codegraph_present,
+                        codegraph_on_path,
+                        self.codegraph_assist,
                     )
-
-                # Tier 4: query codegraph for tests whose imports transitively
-                # reach this PR's changed files, and inline the list into the
-                # prompt as a scoping hint for the test-coverage review.
-                # Runs AFTER the sync block so the index reflects the
-                # checked-out branch. Gated on the same (index-present +
-                # binary-on-PATH) precondition as sync — without both, the
-                # affected-tests query can't run.
-                codegraph_affected_block = ""
-                affected_count = 0  # paths actually injected into the prompt; for telemetry
-                if codegraph_present and codegraph_on_path:
-                    print("Querying CodeGraph for tests affected by this PR's diff…")
-                    affected = _collect_codegraph_affected(worktree_path, repo_full, number)
-                    codegraph_affected_block = format_codegraph_affected_tests(affected)
-                    # Record what the agent actually saw, not the raw query
-                    # count: `format_codegraph_affected_tests` caps the block at
-                    # CODEGRAPH_AFFECTED_TESTS_CAP, so storing the uncapped
-                    # `len(affected)` would let `affected_paths` keep climbing
-                    # while `approx_prompt_tokens` plateaus — a spurious
-                    # decorrelation in the very cost analysis this column feeds.
-                    affected_count = min(len(affected), CODEGRAPH_AFFECTED_TESTS_CAP)
-                    if codegraph_affected_block:
-                        # Visible count: `_collect_codegraph_affected` now
-                        # returns dedup'd output, so `len(affected)` matches
-                        # the number of bullets the agent sees in the
-                        # prompt block — no pre/post-dedup mismatch.
-                        print(f"CodeGraph reports {len(affected)} affected file(s) for the diff.")
+                )
 
                 # Materialise the bundled review skills into the PR
                 # workspace so the skill-based CLIs (see _SKILL_BASED_CLIS)
@@ -4961,50 +5132,14 @@ class PRReviewer(App):
                         repo_full, number, my_login or ""
                     )
 
-                # Compose every signal the agent's session actually needs
-                # before promising MCP tools in the prompt suffix:
-                #   1. `.codegraph/` index exists in the workspace
-                #   2. `codegraph` binary is on PATH (server can spawn)
-                #   3. The selected CLI's config has a `codegraph` MCP entry
-                # Skipping (3) was the root cause of the original
-                # "tools weren't registered in this session" report — the
-                # binary-on-PATH check is a strong proxy but doesn't catch
-                # `npm i -g` installs that never ran `codegraph install` to
-                # write per-CLI MCP entries, nor the case where the user
-                # switched CLIs via the `c` toggle to one they hadn't
-                # wired up. We only probe the MCP config when (1) and (2)
-                # already hold — otherwise the warning would be noise for
-                # users who don't have CodeGraph at all.
-                codegraph_tools_available = False
-                if codegraph_present and codegraph_on_path:
-                    mcp_state = _codegraph_mcp_registered(cli, worktree_path)
-                    codegraph_tools_available = mcp_state is True
-                    install_hint = _CODEGRAPH_INSTALL_HINT[cli]
-                    if mcp_state is False:
-                        print(
-                            f"warning: codegraph MCP server is not registered for "
-                            f"{_CLI_DISPLAY[cli]} (no `codegraph` entry under "
-                            f"`mcpServers` / `[mcp_servers.codegraph]` in its config). "
-                            f"Skipping the MCP-tools prompt hint — the agent's session "
-                            f"won't have codegraph tools loaded. {install_hint}"
-                        )
-                    elif mcp_state is None:
-                        # `mcp_state == None` means either NO config file
-                        # at any standard location OR a file existed but
-                        # we couldn't parse it (corrupt JSON, unreadable
-                        # TOML, permission error, non-regular file at the
-                        # config path). Phrasing it as "couldn't find or
-                        # parse" covers both cases honestly — earlier
-                        # prose said "couldn't find" only, which
-                        # misdirected users with a corrupt config at the
-                        # standard path.
-                        print(
-                            f"warning: couldn't find or parse a {_CLI_DISPLAY[cli]} "
-                            f"config to verify codegraph MCP registration. Skipping "
-                            f"the MCP-tools prompt hint. If your config lives at a "
-                            f"non-standard path, the agent may still see the tools at "
-                            f"runtime. {install_hint}"
-                        )
+                # Probe whether codegraph MCP tools will actually be loaded in
+                # the agent's session before the prompt promises them (index
+                # present + binary on PATH + a `codegraph` MCP entry in the
+                # CLI's config). Prints a diagnostic for the not-registered /
+                # unparseable-config states.
+                codegraph_tools_available = _resolve_codegraph_tools(
+                    cli, worktree_path, codegraph_present, codegraph_on_path
+                )
                 built = build_review_prompt(
                     post_inline=post_inline,
                     extra_prompt=extra_prompt,
@@ -5018,50 +5153,10 @@ class PRReviewer(App):
                     selected_agents=selected_agents,
                 )
 
-                if not fetch_ok:
-                    existing_desc = "existing comments: fetch failed"
-                else:
-                    existing_desc = (
-                        f"existing comments: {built.existing_shown} in prompt of "
-                        f"{built.existing_total} fetched"
-                    )
-
                 cmd = _build_cli_command(cli, built.text)
-                post_inline_desc = "on" if post_inline else "off"
-                if post_inline and built.rereview:
-                    post_inline_desc += ", rereview"
-                elif post_inline and my_login is None:
-                    post_inline_desc += ", rereview-detection-unavailable"
-                parts = [f"post-inline: {post_inline_desc}", existing_desc]
-                # Only call out the agent subset when it diverges from the
-                # default — the banner is already crowded, and "agents: all"
-                # would be noise on every default-shape launch. Compare as
-                # SETS rather than tuples: `build_review_prompt` normalises
-                # order before assembling, so a reordered-but-full subset
-                # produces the default prompt and shouldn't trip this gate.
-                # The friendly labels mirror what the user just saw on the
-                # modal checkboxes — raw kebab-case ids would diverge from
-                # the modal's label text.
-                if set(selected_agents) != set(REVIEW_SKILLS):
-                    if not selected_agents:
-                        parts.append("agents: none (generic review)")
-                    elif len(selected_agents) <= 3:
-                        parts.append(
-                            "agents: " + ", ".join(REVIEW_SKILL_LABELS[n] for n in selected_agents)
-                        )
-                    else:
-                        parts.append(f"agents: {len(selected_agents)}/{len(REVIEW_SKILLS)}")
-                if extra_prompt:
-                    # `!r` keeps newlines/control chars visible so a misclick paste
-                    # (e.g. a secret) is spottable before the CLI consumes it. The
-                    # explicit `(+N more chars)` suffix is the load-bearing piece:
-                    # without it, a 201-char paste renders identically to a clean
-                    # 200-char one while the full text still flows into argv,
-                    # defeating the whole point of the preview.
-                    shown = extra_prompt[:EXTRA_PROMPT_BANNER_CAP]
-                    hidden = len(extra_prompt) - len(shown)
-                    suffix = f" (+{hidden} more chars)" if hidden else ""
-                    parts.append(f"extra prompt: {shown!r}{suffix}")
+                parts = _format_launch_banner_parts(
+                    post_inline, built, fetch_ok, my_login, selected_agents, extra_prompt
+                )
                 print(
                     f"\nLaunching {_CLI_DISPLAY[cli]} ({', '.join(parts)})"
                     " — exit the CLI when you're done.\n"
