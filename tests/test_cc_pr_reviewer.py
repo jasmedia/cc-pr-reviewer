@@ -721,7 +721,7 @@ def test_codegraph_suffix_absent_by_default(cli: str) -> None:
 
 @pytest.mark.parametrize("cli", ["claude", "codex", "gemini"])
 def test_codegraph_suffix_present_when_flag_set(cli: str) -> None:
-    """When `_launch_review_cli` detects `.codegraph/` and sets the flag, the
+    """When `_review_setup_worker` detects `.codegraph/` and sets the flag, the
     suffix must land in the prompt for every CLI — the MCP tool surface
     is identical across claude/codex/gemini, so the gate is presence of
     the index, not the CLI in use."""
@@ -988,7 +988,7 @@ def test_affected_tests_block_absent_when_kwarg_empty() -> None:
 
 def test_affected_tests_block_can_render_without_codegraph_hint() -> None:
     """Edge case: `codegraph_present=False` with a non-empty affected
-    block can't happen in normal `_launch_review_cli` flow (the orchestration
+    block can't happen in normal `_review_setup_worker` flow (the orchestration
     gates both on the same precondition), but the prompt builder
     shouldn't enforce that coupling — each section is independently
     gated so a future caller (e.g. a CI driver that ships a pre-computed
@@ -1206,8 +1206,8 @@ def test_mcp_registered_returns_none_on_corrupt_toml(tmp_path: Path) -> None:
     since `read_text` doesn't raise on a syntactically-broken TOML body
     — that just causes the regex to not match and the helper returns
     False). A refactor that drops or narrows the except tuple would let
-    OSError escape into `_launch_review_cli` and crash the launch
-    post-suspend; this test pins the silent-degrade behaviour."""
+    OSError escape into `_review_setup_worker` and crash the launch
+    setup; this test pins the silent-degrade behaviour."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     home = tmp_path / "home"
@@ -1327,7 +1327,7 @@ def test_probe_config_stat_oserror_is_error(
     EACCES isn't in pathlib's ignored-errno set) degrades to "error", not a
     crash. Both classifiers delegate the guard here, so this covers their
     OSError path too — without it the traceback would bubble out of
-    `_launch_review_cli` post-`suspend()`."""
+    `_review_setup_worker`."""
     p = tmp_path / "x.json"
     p.write_text("{}", encoding="utf-8")
 
@@ -3673,3 +3673,177 @@ def test_notify_stays_quiet_on_dismiss_revealing_older_review(
         pre_review={"id": 10, "state": "APPROVED", "submitted_at": "t10"},
     )
     assert posted == []
+
+
+# --- Embedded terminal (PTY + pyte) helpers --------------------------------
+#
+# Pure, IO-free cores of `TerminalPane`: the key->bytes translation, the
+# pyte-cell -> Rich-style mapping / line rendering, the teardown ordering,
+# and the tab-title formatter. The PTY spawn / asyncio pump / render_line
+# wiring is integration-tested separately (needs a real subprocess + a
+# running Textual app), out of scope for these unit tests.
+
+import pyte  # noqa: E402
+from rich.segment import Segment  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "key,character,app_cursor,expected",
+    [
+        ("enter", "\r", False, b"\r"),
+        ("backspace", None, False, b"\x7f"),
+        ("tab", "\t", False, b"\t"),
+        ("shift+tab", None, False, b"\x1b[Z"),
+        ("escape", None, False, b"\x1b"),
+        ("space", " ", False, b" "),
+        ("ctrl+c", None, False, b"\x03"),
+        ("ctrl+d", None, False, b"\x04"),
+        ("ctrl+a", None, False, b"\x01"),
+        ("ctrl+z", None, False, b"\x1a"),
+        ("a", "a", False, b"a"),
+        ("A", "A", False, b"A"),
+        ("1", "1", False, b"1"),
+        # Arrows depend on DECCKM (application cursor keys).
+        ("up", None, False, b"\x1b[A"),
+        ("up", None, True, b"\x1bOA"),
+        ("left", None, False, b"\x1b[D"),
+        ("left", None, True, b"\x1bOD"),
+        ("home", None, False, b"\x1b[H"),
+        ("home", None, True, b"\x1bOH"),
+        # Unicode printable falls through to the character bytes.
+        ("é", "é", False, "é".encode()),
+        # No representation -> None (ignored by the caller).
+        ("f13", None, False, None),
+    ],
+)
+def test_key_to_bytes(key, character, app_cursor, expected) -> None:
+    assert _mod._key_to_bytes(key, character, app_cursor) == expected
+
+
+def test_pyte_color_to_rich() -> None:
+    assert _mod._pyte_color_to_rich("default") is None
+    assert _mod._pyte_color_to_rich("red") == "red"
+    assert _mod._pyte_color_to_rich("brown") == "yellow"  # pyte 33 -> Rich yellow
+    assert _mod._pyte_color_to_rich("ff5f00") == "#ff5f00"  # 256/truecolor as hex
+    assert _mod._pyte_color_to_rich("00FF00") == "#00FF00"
+
+
+def test_pyte_char_style_maps_attributes() -> None:
+    char = pyte.screens.Char(data="X", fg="red", bg="blue", bold=True, underscore=True)
+    style = _mod._pyte_char_style(char)
+    assert style.color.name == "red"
+    assert style.bgcolor.name == "blue"
+    assert style.bold is True
+    assert style.underline is True
+    assert bool(style.reverse) is False
+
+
+def test_pyte_char_style_cursor_flips_reverse() -> None:
+    plain = pyte.screens.Char(data="X")
+    assert bool(_mod._pyte_char_style(plain, cursor=False).reverse) is False
+    assert bool(_mod._pyte_char_style(plain, cursor=True).reverse) is True
+    # A cell already in reverse video flips back off under the cursor.
+    rev = pyte.screens.Char(data="X", reverse=True)
+    assert bool(_mod._pyte_char_style(rev, cursor=True).reverse) is False
+
+
+def test_render_pyte_line_coalesces_and_pads() -> None:
+    screen = pyte.Screen(10, 1)
+    stream = pyte.ByteStream(screen)
+    stream.feed(b"hi")
+    strip = _mod._render_pyte_line(screen.buffer[0], 10, cursor_x=None)
+    text = "".join(seg.text for seg in strip)
+    assert text == "hi" + " " * 8  # padded to width
+    assert strip.cell_length == 10
+
+
+def test_render_pyte_line_marks_cursor() -> None:
+    screen = pyte.Screen(5, 1)
+    pyte.ByteStream(screen).feed(b"ab")
+    strip = _mod._render_pyte_line(screen.buffer[0], 5, cursor_x=0)
+    # The cursor cell is a standalone reversed segment.
+    first = list(strip)[0]
+    assert isinstance(first, Segment)
+    assert first.text == "a"
+    assert bool(first.style.reverse) is True
+
+
+def test_review_teardown_sequence_runs_in_order() -> None:
+    calls: list[str] = []
+    _mod._review_teardown_sequence(
+        cleanup_skills=lambda: calls.append("skills"),
+        remove_worktree=lambda: calls.append("worktree"),
+        release_reservation=lambda: calls.append("release"),
+    )
+    assert calls == ["skills", "worktree", "release"]
+
+
+def test_review_teardown_sequence_best_effort(capsys) -> None:
+    calls: list[str] = []
+
+    def boom() -> None:
+        raise RuntimeError("worktree remove failed")
+
+    # A failure mid-sequence must NOT skip the release (the load-bearing
+    # invariant: never yield the reservation while the worktree lingers, but
+    # also never leak the reservation because an earlier step raised).
+    _mod._review_teardown_sequence(
+        cleanup_skills=lambda: calls.append("skills"),
+        remove_worktree=boom,
+        release_reservation=lambda: calls.append("release"),
+    )
+    assert calls == ["skills", "release"]
+
+
+def test_review_tab_title() -> None:
+    pr = {"repository": {"nameWithOwner": "octo/widgets"}, "number": 42}
+    title = _mod._review_tab_title(pr, "claude")
+    assert "widgets#42" in title
+    assert _mod._CLI_DISPLAY["claude"] in title
+
+
+def test_strip_unsupported_csi_removes_private_gt_sequences() -> None:
+    # XTMODKEYS / modifyOtherKeys negotiation pyte mis-reads as SGR underline.
+    clean, pending = _mod._strip_unsupported_csi(b"a\x1b[>4;2mb\x1b[>1u\x1b[>0qc")
+    assert clean == b"abc"
+    assert pending == b""
+
+
+def test_strip_unsupported_csi_preserves_real_sgr() -> None:
+    # A genuine underline SGR and truecolor must pass through untouched.
+    payload = b"\x1b[4mUNDER\x1b[24m \x1b[38;2;1;2;3mX\x1b[0m"
+    clean, pending = _mod._strip_unsupported_csi(payload)
+    assert clean == payload
+    assert pending == b""
+
+
+def test_strip_unsupported_csi_handles_split_sequence() -> None:
+    # The `>4;2m` sequence split across two reads must still be stripped whole.
+    clean1, pending = _mod._strip_unsupported_csi(b"hi\x1b[>4")
+    assert clean1 == b"hi"
+    assert pending == b"\x1b[>4"
+    clean2, pending = _mod._strip_unsupported_csi(b";2mthere", pending)
+    assert clean2 == b"there"
+    assert pending == b""
+
+
+def test_strip_unsupported_csi_holds_partial_escape_tail() -> None:
+    # A bare trailing ESC/CSI is held so the next chunk can complete it.
+    clean, pending = _mod._strip_unsupported_csi(b"data\x1b[38;2;1")
+    assert clean == b"data"
+    assert pending == b"\x1b[38;2;1"
+
+
+def test_strip_unsupported_csi_no_false_underscore_through_pyte() -> None:
+    # End-to-end: the poisoning sequence yields no underscore after stripping,
+    # while a real underline sequence still does.
+    poison = b"\x1b[>4;2mplain text"
+    clean, _ = _mod._strip_unsupported_csi(poison)
+    s = pyte.Screen(20, 1)
+    pyte.ByteStream(s).feed(clean)
+    assert all(not s.buffer[0].get(x, pyte.screens.Char(" ")).underscore for x in range(20))
+
+    s2 = pyte.Screen(20, 1)
+    real, _ = _mod._strip_unsupported_csi(b"\x1b[4mU")
+    pyte.ByteStream(s2).feed(real)
+    assert s2.buffer[0][0].underscore is True

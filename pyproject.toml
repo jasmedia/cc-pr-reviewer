@@ -25,6 +25,7 @@ classifiers = [
     "Topic :: Utilities",
 ]
 dependencies = [
+    "pyte>=0.8.2",
     "textual>=0.60",
 ]
 

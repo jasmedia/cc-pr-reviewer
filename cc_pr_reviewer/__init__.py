@@ -6,13 +6,18 @@ requested reviewer and hands any selected PR off to a coding-agent CLI
 Toolkit (Claude) or the bundled `.agents/skills/` (Codex/Gemini) driving
 the review.
 
-Flow when you pick a PR and press Enter:
-    1. Clone the repo into $GH_PR_WORKSPACE (if not already there)
-    2. `gh pr checkout <N>` so the CLI sees the PR's working tree
-    3. For codex/gemini: materialise the six bundled review skills into
-       `<workspace>/.agents/skills/` for auto-discovery (cleaned up on exit)
-    4. Launch the chosen CLI with a prompt that drives the six review dimensions
-    5. When you /exit the CLI, the TUI resumes
+Flow when you pick a PR and press Enter (POSIX):
+    1. Clone the repo into $GH_PR_WORKSPACE (if not already there) and carve a
+       per-PR git worktree; `gh pr checkout <N>` inside it
+    2. For codex/gemini: materialise the six bundled review skills into
+       `<worktree>/.agents/skills/` for auto-discovery (restored on exit)
+    3. Open a new in-app tab and launch the chosen CLI in it — an embedded
+       terminal (PTY + pyte), with a prompt that drives the six review dimensions
+    4. The app never suspends: several reviews run concurrently in switchable
+       tabs (F2/F3 switch, F4 close). When the CLI exits, its worktree is
+       removed and the tab is left open (✓/✗) until you close it.
+(Windows has no PTY, so it falls back to suspending the whole TUI for one
+review at a time.)
 
 Prerequisites:
     • gh CLI, authenticated                     https://cli.github.com
@@ -29,14 +34,17 @@ Run:
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import errno
 import json
 import os
 import re
 import shutil
+import signal
 import socket
 import sqlite3
+import struct
 import subprocess
 import sys
 import time
@@ -45,22 +53,28 @@ import webbrowser
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import partial
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
 from typing import Any, Literal
 
+import pyte
 from rich.markup import escape
+from rich.segment import Segment
+from rich.style import Style
 from rich.text import Text
-from textual import work
+from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
 from textual.content import Content
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen
+from textual.strip import Strip
 from textual.theme import Theme
 from textual.timer import Timer
+from textual.widget import Widget
 from textual.widgets import (
     Checkbox,
     DataTable,
@@ -72,12 +86,30 @@ from textual.widgets import (
     OptionList,
     Select,
     Static,
+    TabbedContent,
+    TabPane,
     TextArea,
 )
 from textual.widgets._footer import FooterKey
 from textual.widgets._header import HeaderClock, HeaderClockSpace, HeaderIcon, HeaderTitle
 from textual.widgets.data_table import CellDoesNotExist
 from textual.widgets.option_list import Option
+
+# PTY-backed embedded terminals need POSIX-only stdlib modules. Guard the
+# imports so the package still imports on Windows, where the in-app review
+# terminals are unavailable and the launcher falls back to the legacy
+# `suspend()`-based single-review path (`_launch_review_suspend`). This
+# mirrors the file's existing "Windows = degraded, no crash-recovery"
+# posture (`_pid_alive`).
+_POSIX = sys.platform != "win32"
+if _POSIX:
+    import fcntl
+    import pty
+    import termios
+else:  # pragma: no cover - Windows fallback
+    fcntl = None  # type: ignore[assignment]
+    pty = None  # type: ignore[assignment]
+    termios = None  # type: ignore[assignment]
 
 # --- Configuration ---------------------------------------------------------
 
@@ -476,7 +508,7 @@ POST_INLINE_PROMPT = (
 )
 
 # Appended to POST_INLINE_PROMPT only when we actually have existing comments
-# to cross-reference (see `_launch_review_cli`). Without that list the instruction
+# to cross-reference (see `build_review_prompt`). Without that list the instruction
 # is meaningless and can cause hallucinated caution.
 POST_INLINE_DEDUP_SUFFIX = (
     " Before submitting, cross-check each finding against the list of existing "
@@ -850,8 +882,8 @@ def _pr_review_toolkit_enabled() -> bool | None:
     `None` as `True` (or as `False`) is exactly the silent-fallback
     anti-pattern called out in CLAUDE.md.
 
-    The 5 s timeout guards the TUI thread: this runs synchronously
-    before `self.suspend()` inside `_launch_review_cli`, so a stalled
+    The 5 s timeout guards the TUI thread: this runs synchronously on
+    the main thread during `_begin_review`'s pre-flight, so a stalled
     `claude` (slow disk, hung child, network-mounted plugin dir, an
     unresponsive marketplace probe) would otherwise freeze the entire
     TUI indefinitely with no frame updates and no Ctrl-C handling.
@@ -940,7 +972,7 @@ def check_prereqs() -> list[str]:
     The toolkit-plugin check is intentionally NOT here: it only matters
     when cli=claude, and a Codex/Gemini user shouldn't be blocked from
     starting the TUI because the Claude plugin isn't installed. The
-    pre-flight check inside `_launch_review_cli` covers it.
+    pre-flight check inside `_begin_review` covers it.
     """
     problems: list[str] = []
     if shutil.which("gh") is None:
@@ -1329,7 +1361,7 @@ def _probe_config_stat(path: Path) -> _McpProbe | None:
     set) when an ancestor dir like `~`, `~/.codex`, or `~/.gemini` lacks
     search permission; bucket that as `"error"` so an unreadable tree
     degrades honestly instead of bubbling a traceback out of
-    `_launch_review_cli` post-`suspend()` (or out of `on_mount` for the
+    `_review_setup_worker` (or out of `on_mount` for the
     startup path). A path that exists but isn't a regular file (accidental
     `mkdir ~/.claude.json`, dangling symlink, device node) is also
     `"error"`: unreadable, but distinct from "no config at all" so the
@@ -1575,7 +1607,7 @@ def _check_codegraph_setup(
         doesn't know about it, so the per-launch suffix would be
         suppressed.
 
-    Per-launch verification stays in `_launch_review_cli` and remains the
+    Per-launch verification stays in `_review_setup_worker` and remains the
     source of truth for "does this specific review have MCP tools?".
     Startup is an early-warning surface, not a replacement.
     """
@@ -1721,7 +1753,7 @@ def _collect_codegraph_affected(local_path: Path, repo: str, number: int) -> lis
 def format_codegraph_affected_tests(paths: list[str]) -> str:
     """Render the affected-tests prompt block from `codegraph affected` output.
 
-    Pure — `_launch_review_cli` does the shell-out (gh→git→codegraph) and
+    Pure — `_review_setup_worker` does the shell-out (gh→git→codegraph) and
     feeds the resulting path list in here so the rendering decisions
     (dedup, sort, cap, header phrasing) stay unit-testable in isolation.
 
@@ -2212,7 +2244,7 @@ def build_review_prompt(
 ) -> BuiltPrompt:
     """Assemble the user message for the selected coding-agent CLI. Pure — no I/O.
 
-    Isolated from `_launch_review_cli` so the conditional `POST_INLINE_*`
+    Isolated from `_review_setup_worker` so the conditional `POST_INLINE_*`
     suffix matrix (locked by `tests/test_cc_pr_reviewer.py`) is
     unit-testable in isolation; that matrix is the most regression-prone
     part of the file.
@@ -2221,13 +2253,13 @@ def build_review_prompt(
     plugin-driven `REVIEW_PROMPT_CLAUDE`, while `codex` and `gemini`
     share `REVIEW_PROMPT_SKILL_BASED` (which references the six bundled
     skills by name; materialisation into `.agents/skills/` happens in
-    `_launch_review_cli`). All `POST_INLINE_*` suffixes apply identically
+    `_review_setup_worker`). All `POST_INLINE_*` suffixes apply identically
     to every CLI — they're about `gh` CLI usage, not the reviewing
     agent. `cli` defaults to `"claude"` so existing callers and tests
     remain valid without churn.
 
     `codegraph_present` should be `True` only when the agent will
-    actually have CodeGraph MCP tools available in-session — `_launch_review_cli`
+    actually have CodeGraph MCP tools available in-session — `_review_setup_worker`
     composes three signals: `.codegraph/` exists in the workspace, the
     `codegraph` binary is on PATH, AND the selected CLI's config
     (`~/.claude.json` / `~/.codex/config.toml` / `~/.gemini/settings.json`,
@@ -2255,7 +2287,7 @@ def build_review_prompt(
     presence. This intentionally diverges from the `fetch_ok`/`existing`
     invariant below — that pair has a strict producer contract
     (`fetch_existing_review_comments`), while these two are derived from
-    independent shell-outs in `_launch_review_cli`. Empty string (the default)
+    independent shell-outs in `_review_setup_worker`. Empty string (the default)
     skips the section entirely — that covers both "no index" and "empty
     diff / no affected files" without callers needing to disambiguate.
 
@@ -2420,7 +2452,7 @@ def _worktree_path(owner: str, name: str, number: int) -> Path:
 
     The dot-prefixed top-level `.worktrees/` keeps these dirs out of the
     `owner/name` namespace — so the `primary_path.exists()` clone-vs-fetch
-    check in `_launch_review_cli` can never be tripped by a worktree dir — and
+    check in `_review_setup_worker` can never be tripped by a worktree dir — and
     makes the whole set trivially sweepable.
     """
     return WORKSPACE / ".worktrees" / owner / name / str(number)
@@ -3401,8 +3433,8 @@ class InProgressWarnScreen(ModalScreen[bool]):
     """Warn that another `cc-pr-reviewer` instance is already reviewing
     this PR, and ask whether to proceed anyway.
 
-    Dismisses with `True` to override (caller should pass
-    `force_in_progress=True` into `_launch_review_cli`), `False` to cancel.
+    Dismisses with `True` to override (caller passes the captured
+    `expected_holder` into `_begin_review`), `False` to cancel.
     Kept distinct from `ConfirmScreen` because the intents don't overlap:
     `ConfirmScreen` tweaks launch options after the user decided to
     review; this screen asks whether the user wants to review at all.
@@ -3697,6 +3729,568 @@ class SettingsScreen(ModalScreen[SettingsResult | None]):
         self.dismiss(None)
 
 
+# --- Embedded terminal (PTY + pyte) ----------------------------------------
+#
+# `TerminalPane` runs one interactive coding-agent CLI inside the TUI: it
+# forks the CLI under a pseudo-terminal, feeds the child's output through a
+# `pyte` VT emulator, and paints the emulator's screen buffer via
+# `render_line`. Keystrokes on the focused pane are translated back to the
+# byte sequences a real terminal would send and written to the PTY master.
+# This is what lets several reviews run concurrently in switchable tabs
+# instead of the old whole-app `suspend()` + blocking `subprocess.call`.
+#
+# Rendering fidelity is bounded by `pyte` (no sixel/kitty graphics, no
+# scrollback on the plain `Screen`), and full Python VT emulation is not
+# free — see the module's design notes / plan for the accepted trade-offs.
+
+# pyte stores private DEC modes left-shifted by 5 in `Screen.mode`. DECCKM
+# (application cursor keys, `ESC [ ? 1 h`) is private mode 1, so it appears
+# as `1 << 5`. When set, arrow/Home/End keys must send `ESC O x` rather than
+# `ESC [ x`. pyte has no named constant for it (only DECTCEM/DECAWM/…).
+_DECCKM = 1 << 5
+
+# A blank cell to substitute for columns pyte hasn't written. `Screen.buffer`
+# rows are default-dicts, so a plain `.get(x)` misses return `None` (the
+# factory only fires on `__getitem__`) — we map those to this without
+# mutating the buffer.
+_BLANK_PYTE_CHAR = pyte.screens.Char(data=" ")
+
+# pyte names SGR 33 "brown"; Rich has no "brown" (it is really yellow).
+_PYTE_COLOR_ALIASES = {"brown": "yellow"}
+
+# Non-cursor-key single-byte / fixed escape sequences, keyed by Textual key
+# name. Arrows/Home/End are handled separately because they depend on DECCKM.
+_KEY_SEQUENCES: dict[str, bytes] = {
+    "enter": b"\r",
+    "tab": b"\t",
+    "shift+tab": b"\x1b[Z",
+    "escape": b"\x1b",
+    "backspace": b"\x7f",
+    "delete": b"\x1b[3~",
+    "insert": b"\x1b[2~",
+    "pageup": b"\x1b[5~",
+    "pagedown": b"\x1b[6~",
+    "space": b" ",
+    "f1": b"\x1bOP",
+    "f2": b"\x1bOQ",
+    "f3": b"\x1bOR",
+    "f4": b"\x1bOS",
+    "f5": b"\x1b[15~",
+    "f6": b"\x1b[17~",
+    "f7": b"\x1b[18~",
+    "f8": b"\x1b[19~",
+    "f9": b"\x1b[20~",
+    "f10": b"\x1b[21~",
+    "f11": b"\x1b[23~",
+    "f12": b"\x1b[24~",
+}
+
+_CURSOR_KEYS_NORMAL: dict[str, bytes] = {
+    "up": b"\x1b[A",
+    "down": b"\x1b[B",
+    "right": b"\x1b[C",
+    "left": b"\x1b[D",
+    "home": b"\x1b[H",
+    "end": b"\x1b[F",
+}
+
+_CURSOR_KEYS_APP: dict[str, bytes] = {
+    "up": b"\x1bOA",
+    "down": b"\x1bOB",
+    "right": b"\x1bOC",
+    "left": b"\x1bOD",
+    "home": b"\x1bOH",
+    "end": b"\x1bOF",
+}
+
+# Ctrl-combos that aren't a plain letter (ctrl+a..z is computed).
+_CTRL_EXTRA: dict[str, bytes] = {
+    "space": b"\x00",
+    "@": b"\x00",
+    "[": b"\x1b",
+    "]": b"\x1d",
+    "backslash": b"\x1c",
+    "^": b"\x1e",
+    "_": b"\x1f",
+}
+
+
+def _key_to_bytes(key: str, character: str | None, app_cursor: bool) -> bytes | None:
+    """Translate a Textual key event into the bytes a terminal would send.
+
+    `key` is the Textual key name (e.g. "enter", "ctrl+c", "up", "a"),
+    `character` its printable character (or None), and `app_cursor` whether
+    the child has DECCKM (application cursor keys) enabled. Returns None for
+    keys with no terminal representation (so the caller can ignore them).
+    Pure and side-effect free so it can be unit-tested without a PTY.
+    """
+    if key in _KEY_SEQUENCES:
+        return _KEY_SEQUENCES[key]
+    cursor_keys = _CURSOR_KEYS_APP if app_cursor else _CURSOR_KEYS_NORMAL
+    if key in cursor_keys:
+        return cursor_keys[key]
+    if key.startswith("ctrl+"):
+        rest = key[5:]
+        if len(rest) == 1 and "a" <= rest <= "z":
+            return bytes([ord(rest) - ord("a") + 1])
+        if rest in _CTRL_EXTRA:
+            return _CTRL_EXTRA[rest]
+    # Fall back to the literal character for printable keys (covers letters,
+    # digits, punctuation, and anything with a Unicode representation).
+    if character:
+        return character.encode("utf-8")
+    return None
+
+
+def _pyte_color_to_rich(color: str) -> str | None:
+    """Map a pyte `Char` colour token to a Rich colour string (or None).
+
+    pyte emits "default", an ANSI name ("red"), or a 6-hex-digit string for
+    256/true-colour. Rich wants a name or "#rrggbb"; "default" means inherit.
+    """
+    if color == "default":
+        return None
+    if len(color) == 6 and all(c in "0123456789abcdefABCDEF" for c in color):
+        return "#" + color
+    return _PYTE_COLOR_ALIASES.get(color, color)
+
+
+def _pyte_char_style(char: Any, *, cursor: bool = False) -> Style:
+    """Build a Rich `Style` from a pyte `Char`.
+
+    `cursor=True` flips reverse-video so the cell reads as the cursor block.
+    Pure so it can be unit-tested against hand-built pyte cells.
+    """
+    reverse = bool(char.reverse) ^ cursor
+    return Style(
+        color=_pyte_color_to_rich(char.fg),
+        bgcolor=_pyte_color_to_rich(char.bg),
+        bold=bool(char.bold),
+        italic=bool(char.italics),
+        underline=bool(char.underscore),
+        strike=bool(char.strikethrough),
+        blink=bool(char.blink),
+        reverse=reverse,
+    )
+
+
+def _render_pyte_line(row: Any, width: int, cursor_x: int | None) -> Strip:
+    """Render one pyte buffer row into a Textual `Strip`.
+
+    `row` is a `Screen.buffer[y]` mapping (int -> Char), `width` the column
+    count to emit, and `cursor_x` the cursor column if the cursor is visible
+    on this line (else None). Equal-style adjacent cells are coalesced into a
+    single `Segment`. Pure/testable — no widget or PTY required.
+    """
+    segments: list[Segment] = []
+    run_text: list[str] = []
+    run_style: Style | None = None
+    have_run = False
+    for x in range(width):
+        char = row.get(x)
+        if char is None:
+            char = _BLANK_PYTE_CHAR
+        style = _pyte_char_style(char, cursor=(x == cursor_x))
+        if have_run and style == run_style:
+            run_text.append(char.data)
+        else:
+            if have_run:
+                segments.append(Segment("".join(run_text), run_style))
+            run_text = [char.data]
+            run_style = style
+            have_run = True
+    if have_run:
+        segments.append(Segment("".join(run_text), run_style))
+    return Strip(segments, width)
+
+
+# CSI sequences with a `>` private marker (XTMODKEYS `CSI > Ps ; Ps m`,
+# secondary-DA, the modifyOtherKeys/kitty-keyboard negotiation every modern
+# CLI emits). pyte 0.8.2 swallows the `>` and dispatches the params as a real
+# SGR — so `ESC [ > 4 ; 2 m` flips underline+faint ON and it bleeds across the
+# whole screen. A real terminal ignores `CSI > … <final>`, so we strip it.
+_CSI_PRIVATE_GT_RE = re.compile(rb"\x1b\[>[0-9;:? ]*[\x40-\x7e]")
+# A trailing partial escape that could still become a stripped sequence once
+# the next read arrives — held back so a chunk split can't smuggle one through.
+_CSI_PARTIAL_TAIL_RE = re.compile(rb"\x1b(?:\[[0-9;:?<> ]*)?$")
+
+
+def _strip_unsupported_csi(data: bytes, pending: bytes = b"") -> tuple[bytes, bytes]:
+    """Drop `CSI > … <final>` sequences pyte 0.8.2 mis-parses as SGR.
+
+    `pending` carries any partial sequence split across reads. Returns
+    `(cleaned, new_pending)`; feed `cleaned` to pyte and keep `new_pending`
+    for the next call. Pure/side-effect-free so it's unit-testable.
+    """
+    buf = pending + data
+    buf = _CSI_PRIVATE_GT_RE.sub(b"", buf)
+    m = _CSI_PARTIAL_TAIL_RE.search(buf)
+    if m:
+        return buf[: m.start()], buf[m.start() :]
+    return buf, b""
+
+
+def _set_pty_winsize(fd: int, rows: int, cols: int) -> None:
+    """Push a window size onto a PTY fd via TIOCSWINSZ (POSIX only).
+
+    Setting it on the master propagates to the slave and makes the kernel
+    deliver SIGWINCH to the child's session, so the CLI re-renders at the
+    new dimensions.
+    """
+    if not _POSIX:  # pragma: no cover - Windows fallback
+        return
+    winsize = struct.pack("HHHH", rows, cols, 0, 0)
+    with contextlib.suppress(OSError):
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, winsize)
+
+
+class TerminalPane(Widget, can_focus=True):
+    """A live, interactive terminal running one command under a PTY.
+
+    Spawns `argv` in `cwd` under a pseudo-terminal, emulates its output with
+    `pyte`, and paints it via `render_line`. Keystrokes on the focused pane
+    are forwarded to the child. When the child exits (or `kill()` is called),
+    `on_exit(returncode)` fires once on the main thread so the owner can run
+    teardown.
+    """
+
+    DEFAULT_CSS = """
+    TerminalPane {
+        width: 1fr;
+        height: 1fr;
+    }
+    """
+
+    # Fallback geometry used only if the widget is spawned before layout has
+    # given it a real size; `on_resize` corrects it immediately after.
+    _DEFAULT_COLS = 80
+    _DEFAULT_ROWS = 24
+    # Lines of scrollback kept by the `HistoryScreen`. Enough to page back
+    # through a whole review's findings; cheap (deque of trimmed rows).
+    _HISTORY_LINES = 5000
+
+    def __init__(
+        self,
+        argv: list[str],
+        cwd: Path,
+        on_exit: Callable[[int], None] | None = None,
+        *,
+        id: str | None = None,
+    ) -> None:
+        super().__init__(id=id)
+        self._argv = argv
+        self._cwd = cwd
+        self._on_exit = on_exit
+        cols, rows = self._DEFAULT_COLS, self._DEFAULT_ROWS
+        # HistoryScreen (not plain Screen) so output that scrolls off the top
+        # is retained and can be paged back through (mouse wheel / Shift+PageUp)
+        # — essential for re-reading a long review's findings.
+        self._screen = pyte.HistoryScreen(cols, rows, history=self._HISTORY_LINES, ratio=0.5)
+        self._stream = pyte.ByteStream(self._screen)
+        self._proc: subprocess.Popen[bytes] | None = None
+        self._master_fd: int | None = None
+        self._started = False
+        self._exited = False
+        self._exit_code: int | None = None
+        # Carries a partial escape sequence split across `os.read` boundaries
+        # for `_strip_unsupported_csi` (see the CSI-`>` pyte workaround).
+        self._pending = b""
+
+    # --- lifecycle ---
+
+    def on_mount(self) -> None:
+        self._ensure_started()
+
+    def on_show(self) -> None:
+        # A tab that mounts while inactive can have zero size until first
+        # shown; try again here so the child always spawns.
+        self._ensure_started()
+
+    def on_resize(self, event: events.Resize) -> None:
+        cols = max(1, event.size.width)
+        rows = max(1, event.size.height)
+        self._ensure_started(cols, rows)
+        if self._started and not self._exited:
+            self._screen.resize(rows, cols)
+            if self._master_fd is not None:
+                _set_pty_winsize(self._master_fd, rows, cols)
+            self.refresh()
+
+    def _ensure_started(self, cols: int | None = None, rows: int | None = None) -> None:
+        if self._started or self._exited:
+            return
+        if cols is None or rows is None:
+            size = self.size
+            cols = size.width or self._DEFAULT_COLS
+            rows = size.height or self._DEFAULT_ROWS
+        if cols <= 0 or rows <= 0:
+            return
+        if not _POSIX:  # pragma: no cover - Windows fallback
+            return
+        self._screen.resize(rows, cols)
+        self._spawn(cols, rows)
+
+    def _spawn(self, cols: int, rows: int) -> None:
+        env = dict(os.environ)
+        env["TERM"] = "xterm-256color"
+        env.setdefault("COLORTERM", "truecolor")
+        # A fresh COLUMNS/LINES pair keeps the child from trusting stale
+        # inherited values before its first SIGWINCH.
+        env["COLUMNS"] = str(cols)
+        env["LINES"] = str(rows)
+        master_fd, slave_fd = pty.openpty()
+        _set_pty_winsize(slave_fd, rows, cols)
+        try:
+            proc = subprocess.Popen(
+                self._argv,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                cwd=str(self._cwd),
+                env=env,
+                # New session so the child is a process-group leader: killpg
+                # then reaps any agent subprocesses it spawns.
+                start_new_session=True,
+                close_fds=True,
+            )
+        except OSError as e:
+            os.close(master_fd)
+            os.close(slave_fd)
+            self._started = True  # prevent a retry loop
+            self._fail_to_start(e)
+            return
+        os.close(slave_fd)
+        # Non-blocking so the loop reader never stalls the UI thread; a
+        # spurious readiness wakeup surfaces as BlockingIOError, handled below.
+        os.set_blocking(master_fd, False)
+        self._master_fd = master_fd
+        self._proc = proc
+        self._started = True
+        self._loop = asyncio.get_event_loop()
+        self._loop.add_reader(master_fd, self._on_readable)
+
+    def _fail_to_start(self, exc: OSError) -> None:
+        # Surface the failure in-pane and drive the same exit path so the
+        # owner's teardown still runs.
+        self._stream.feed(f"failed to launch: {exc}\r\n".encode())
+        self.refresh()
+        self._handle_child_exit(rc=127)
+
+    # --- I/O pump ---
+
+    def _on_readable(self) -> None:
+        assert self._master_fd is not None
+        try:
+            data = os.read(self._master_fd, 65536)
+        except BlockingIOError:
+            return
+        except OSError:
+            # EIO on the master means the slave side closed (child gone).
+            self._handle_child_exit()
+            return
+        if not data:
+            self._handle_child_exit()
+            return
+        # Strip CSI-`>` sequences pyte mis-reads as SGR (the stuck-underline
+        # bug) before feeding, carrying any split-across-reads tail in
+        # `_pending`.
+        clean, self._pending = _strip_unsupported_csi(data, self._pending)
+        self._stream.feed(clean)
+        # Coalesced by Textual's frame scheduler — one repaint per frame even
+        # under a burst of reads. Never repaint per byte.
+        self.refresh()
+
+    def _handle_child_exit(self, rc: int | None = None) -> None:
+        if self._exited:
+            return
+        self._exited = True
+        if self._master_fd is not None:
+            with contextlib.suppress(Exception):
+                self._loop.remove_reader(self._master_fd)
+        if rc is None and self._proc is not None:
+            try:
+                rc = self._proc.wait(timeout=5)
+            except Exception:  # noqa: BLE001
+                rc = self._proc.returncode
+        self._exit_code = rc if rc is not None else -1
+        if self._master_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(self._master_fd)
+            self._master_fd = None
+        self.refresh()
+        if self._on_exit is not None:
+            self._on_exit(self._exit_code)
+
+    def kill(self) -> None:
+        """Force the child (and its process group) down, then run teardown.
+
+        Safe to call when already exited. Used for user-initiated tab close
+        and app-quit reaping.
+        """
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            with contextlib.suppress(ProcessLookupError, OSError):
+                proc.terminate()
+            try:
+                proc.wait(timeout=0.5)
+            except Exception:  # noqa: BLE001
+                with contextlib.suppress(ProcessLookupError, OSError):
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                with contextlib.suppress(Exception):
+                    proc.wait(timeout=1)
+        self._handle_child_exit()
+
+    @property
+    def exit_code(self) -> int | None:
+        return self._exit_code
+
+    @property
+    def is_running(self) -> bool:
+        return self._started and not self._exited
+
+    # --- scrollback ---
+
+    def _scroll_up(self) -> None:
+        self._screen.prev_page()
+        self.refresh()
+
+    def _scroll_down(self) -> None:
+        self._screen.next_page()
+        self.refresh()
+
+    def _scroll_to_bottom(self) -> None:
+        """Return the view to the live tail (after paging back through history)."""
+        moved = False
+        while getattr(self._screen, "history", None) and self._screen.history.bottom:
+            self._screen.next_page()
+            moved = True
+        if moved:
+            self.refresh()
+
+    def on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
+        self._scroll_up()
+        event.stop()
+
+    def on_mouse_scroll_down(self, event: events.MouseScrollDown) -> None:
+        self._scroll_down()
+        event.stop()
+
+    # --- input ---
+
+    def on_key(self, event: events.Key) -> None:
+        if self._master_fd is None or self._exited:
+            return
+        # Shift+PageUp/Down scroll the emulator's history (the terminal
+        # convention) while plain PageUp/Down still flow through to the child.
+        if event.key == "shift+pageup":
+            self._scroll_up()
+            event.stop()
+            event.prevent_default()
+            return
+        if event.key == "shift+pagedown":
+            self._scroll_down()
+            event.stop()
+            event.prevent_default()
+            return
+        data = _key_to_bytes(event.key, event.character, _DECCKM in self._screen.mode)
+        if data is None:
+            return
+        # Typing jumps back to the live tail so the child's echo is visible.
+        self._scroll_to_bottom()
+        with contextlib.suppress(OSError):
+            os.write(self._master_fd, data)
+        event.stop()
+        event.prevent_default()
+
+    # --- render ---
+
+    def render_line(self, y: int) -> Strip:
+        screen = self._screen
+        width = screen.columns
+        if y >= screen.lines:
+            return Strip.blank(width)
+        cursor_x = None
+        if not screen.cursor.hidden and screen.cursor.y == y:
+            cursor_x = screen.cursor.x
+        return _render_pyte_line(screen.buffer[y], width, cursor_x)
+
+
+@dataclass
+class _ReviewContext:
+    """Everything the spawn + teardown phases of a review need.
+
+    Assembled off the main thread by `_review_setup_worker` and handed back
+    for `_spawn_review_tab`; `_on_review_exit` reads it to record telemetry /
+    the review and to tear the worktree + reservation down in the same order
+    the old `suspend()` `finally` did.
+    """
+
+    pr: dict[str, Any]
+    key: str
+    repo_full: str
+    number: int
+    cli: CliChoice
+    post_inline: bool
+    primary_path: Path
+    worktree_path: Path
+    head_sha: str
+    worktree_created: bool
+    skills_manifest: _MaterialisedSkills | None
+    my_login: str | None
+    slack_webhook: str
+    pre_review: dict[str, Any] | None
+    pre_review_ok: bool
+    built: BuiltPrompt
+    affected_count: int
+    codegraph_tools: bool
+    cmd: list[str]
+    launch_start: float = 0.0
+
+
+@dataclass
+class _ReviewSession:
+    """A review tab's lifecycle record, keyed by tab id in `_active_reviews`.
+
+    `state` gates behaviour: only preparing/running sessions block a second
+    review of the same PR and count as "live" for app-quit reaping; ended
+    (done/failed) sessions are just tabs the user hasn't closed yet.
+    """
+
+    pr_key: str
+    tab_id: str
+    title: str
+    state: str = "preparing"  # preparing | running | done | failed
+    pane: TerminalPane | None = None
+    ctx: _ReviewContext | None = None
+
+
+def _review_teardown_sequence(
+    cleanup_skills: Callable[[], None],
+    remove_worktree: Callable[[], None],
+    release_reservation: Callable[[], None],
+) -> None:
+    """Run the review teardown steps in their load-bearing order.
+
+    Order matters: restore materialised skills, THEN remove the worktree,
+    THEN release the reservation — the slot must not be yielded while the
+    worktree still exists (a peer could re-reserve and collide on it). Each
+    step is best-effort so one failure can't skip the rest. Pure over its
+    injected callables so the ordering is unit-testable without git/sqlite.
+    """
+    for step in (cleanup_skills, remove_worktree, release_reservation):
+        try:
+            step()
+        except Exception as e:  # noqa: BLE001
+            print(f"warning: review teardown step failed: {e}", file=sys.stderr)
+
+
+def _review_tab_title(pr: dict[str, Any], cli: CliChoice) -> str:
+    """Short tab label for a review, e.g. "repo#123 · Claude Code"."""
+    repo_full = pr["repository"]["nameWithOwner"]
+    name = repo_full.split("/", 1)[-1]
+    return f"{name}#{pr['number']} · {_CLI_DISPLAY[cli]}"
+
+
 # --- Main app --------------------------------------------------------------
 
 
@@ -3910,6 +4504,16 @@ class PRReviewer(App):
     #settings-container Checkbox:focus {
         background: $boost;
     }
+    /* Embedded review terminals. The pane fills its tab; the placeholder
+       shown while the worktree is being prepared is muted. */
+    TerminalPane {
+        height: 1fr;
+        width: 1fr;
+    }
+    .review-preparing {
+        padding: 1 2;
+        color: $text-muted;
+    }
     """
 
     TITLE = "CC PR Reviewer"
@@ -3942,6 +4546,15 @@ class PRReviewer(App):
         Binding("a", "cycle_refresh", "Auto-refresh", show=False),
         Binding("comma", "settings", "Settings"),
         Binding("u", "upgrade", "Upgrade", show=False),
+        # Review-terminal tab navigation. `priority=True` so a focused
+        # `TerminalPane` (which swallows nearly every key into its PTY) can't
+        # trap the user — these always reach the app. `ctrl+q` quits from
+        # anywhere for the same reason; plain `q` stays non-priority so it
+        # types into a focused terminal and only quits from the PR table.
+        Binding("f2", "prev_tab", "Prev tab", show=False, priority=True),
+        Binding("f3", "next_tab", "Next tab", show=False, priority=True),
+        Binding("f4", "close_tab", "Close tab", show=False, priority=True),
+        Binding("ctrl+q", "quit", "Quit", show=False, priority=True),
         Binding("q", "quit", "Quit"),
     ]
 
@@ -3968,7 +4581,7 @@ class PRReviewer(App):
         self.group_by: GroupBy = stored_group if stored_group in _GROUP_CYCLE else ""
         stored_sort = _get_setting(self.review_db, "sort_by", "")
         self.sort_by: SortBy = stored_sort if stored_sort in _SORT_CYCLE else ""
-        # When on AND `.codegraph/` is missing in the workspace, `_launch_review_cli`
+        # When on AND `.codegraph/` is missing in the workspace, `_review_setup_worker`
         # prompts the user once per launch to run `codegraph init --index`
         # before handing off to the agent. When off (default), missing
         # `.codegraph/` is silent — Tier 1's prompt suffix and Tier 2's sync
@@ -3976,8 +4589,8 @@ class PRReviewer(App):
         # who flips it on stays in helper mode across sessions.
         self.codegraph_assist: bool = _get_setting(self.review_db, "codegraph_assist", "0") == "1"
         # Slack incoming-webhook URL for review-complete notifications. Empty
-        # means the feature is off — `_launch_review_cli` skips all Slack work
-        # (no extra `gh api` calls, no POST) when this is blank. Editable via
+        # means the feature is off — `_review_setup_worker`/`_on_review_exit` skip
+        # all Slack work (no extra `gh api` calls, no POST) when this is blank. Editable via
         # the Settings modal (`,`).
         self.slack_webhook_url: str = _get_setting(self.review_db, "slack_webhook_url", "")
         stored_cli = _get_setting(self.review_db, "cli", DEFAULT_CLI)
@@ -4000,7 +4613,7 @@ class PRReviewer(App):
                 # No supported CLI on PATH at all. Keep `self.cli` as
                 # the persisted preference so the footer/status reflect
                 # what the user *wanted*; on_mount fires a high-severity
-                # toast and pre-flight in `_launch_review_cli` re-checks.
+                # toast and pre-flight in `_begin_review` re-checks.
                 self.cli: CliChoice = persisted
                 self._no_cli_available = True
             else:
@@ -4043,15 +4656,35 @@ class PRReviewer(App):
         # Suppress the new-PR notification on the very first populate — every
         # PR would otherwise look "new". Set True at the end of `_populate`.
         self._first_load_done: bool = False
-        # Set around `_launch_review_cli`'s suspend window so an auto-refresh
-        # tick doesn't rebuild the table while the agent owns the TTY.
+        # Set around the legacy `_launch_review_suspend` window (Windows
+        # fallback only) so an auto-refresh tick doesn't rebuild the table
+        # while the agent owns the TTY. On POSIX the review runs in an
+        # embedded terminal tab instead and never suspends, so this stays
+        # False and auto-refresh keeps ticking during reviews (harmless — it
+        # only rebuilds the PRs tab).
         self._suspended_for_review: bool = False
+        # --- embedded review terminals (POSIX) ---
+        # Live and ended review tabs keyed by tab id. Replaces the old
+        # single-review `suspend()` model: each entry owns a `TerminalPane`
+        # running one coding-agent CLI, so several reviews run concurrently
+        # and switchably.
+        self._active_reviews: dict[str, _ReviewSession] = {}
+        # Monotonic counter for unique review-tab ids. A PR can be reviewed
+        # again after an earlier tab ended, so ids can't key off pr_key.
+        self._review_tab_counter: int = 0
+        # Set while the app is tearing down so per-pane exit callbacks defer
+        # to the bulk reaper instead of double-running teardown or touching
+        # widgets mid-unmount.
+        self._quitting: bool = False
 
     def compose(self) -> ComposeResult:
         yield HeaderWithChangelog(show_clock=True)
         yield Static("", id="version-badge")
-        yield PRDataTable(id="pr-table", cursor_type="row", zebra_stripes=True)
-        yield Static("Loading…", id="status", markup=False)
+        # The PR list is the permanent first tab; each launched review mounts
+        # its own `TerminalPane` as an additional, closable tab.
+        with TabbedContent(id="main-tabs"), TabPane("PRs", id="tab-prs"):
+            yield PRDataTable(id="pr-table", cursor_type="row", zebra_stripes=True)
+            yield Static("Loading…", id="status", markup=False)
         yield StateAwareFooter()
 
     def on_mount(self) -> None:
@@ -4257,8 +4890,7 @@ class PRReviewer(App):
         sort_desc = self._sort_desc()
         if not data:
             self._set_status(
-                f"No PRs awaiting your review 🎉{mode}{filter_desc}{group_desc}{sort_desc}   "
-                "(f: filter, m: mine, g: group, s: sort, r: refresh, u: upgrade, q: quit)",
+                f"No PRs awaiting your review 🎉{mode}{filter_desc}{group_desc}{sort_desc}",
                 error=bool(mine_error),
             )
             return
@@ -4355,12 +4987,11 @@ class PRReviewer(App):
                 self._row_to_pr_idx.append(None)
                 for i in idxs:
                     _emit_pr_row(i, data[i])
-        self._set_status(
-            f"{len(data)} PR(s){mode}{filter_desc}{group_desc}{sort_desc}   "
-            "•  enter: review  •  d: diff  •  o: browser  •  f: filter  •  m: mine  "
-            "•  g: group  •  s: sort  •  r: refresh  •  u: upgrade  •  q: quit",
-            error=bool(mine_error),
-        )
+        # Nothing to report on a normal populate — the count lives in the
+        # header title and the keys live in the Footer, so collapse the bar
+        # (empty msg -> hidden) rather than repeat either here. It only
+        # resurfaces for Refreshing…/errors/empty-list states.
+        self._set_status("", error=bool(mine_error))
         if auto:
             # Background tick: restore the cursor onto the PR it was on before
             # the rebuild so an auto refresh isn't disruptive. A no-op if the
@@ -4527,10 +5158,19 @@ class PRReviewer(App):
         prompt = f"Launch review for {repo}#{pr['number']}?\n{title}"
         pr_label = f"{repo}#{pr['number']}"
 
+        # If this app already has a live review tab for the PR, don't stack a
+        # second one (the per-PR reservation would reject it anyway with a
+        # confusing self-pid warning) — just surface the existing tab.
+        existing = self._find_running_session_for_key(_pr_key(pr))
+        if existing is not None:
+            self._activate_tab(existing.tab_id)
+            self.notify(f"Already reviewing {pr_label} in a tab.", severity="information")
+            return
+
         def _confirm(expected_holder: InProgressHolder | None) -> None:
             def _proceed(result: ConfirmResult | None) -> None:
                 if result is not None:
-                    self._launch_review_cli(
+                    self._begin_review(
                         pr,
                         result.post_inline,
                         result.extra_prompt,
@@ -4549,10 +5189,10 @@ class PRReviewer(App):
         #      NFS-hosted workspace) — exactly the freeze the worker
         #      poll was introduced to avoid.
         #   2. The hard safety boundary is `_reserve_in_progress` inside
-        #      `_launch_review_cli`. If the cache misses a peer that just
+        #      `_review_setup_worker`. If the cache misses a peer that just
         #      started 200 ms ago, the reserve still raises
-        #      `ReviewInProgressError` and the launch path prints a
-        #      message + waits for Enter. The cache is a UX optimisation
+        #      `ReviewInProgressError` and the setup worker surfaces a
+        #      warning toast. The cache is a UX optimisation
         #      to show the warn modal early, not the actual gate.
         holder = self._in_progress.get(_pr_key(pr))
         if holder is None:
@@ -4741,7 +5381,7 @@ class PRReviewer(App):
         change surfaces the gap for the new selection. No internal dedup
         guard; the user toggling cycle → wired → binary-only → wired is
         meant to fire and clear repeatedly. The per-workspace deep check
-        in `_launch_review_cli` remains the source of truth.
+        in `_review_setup_worker` remains the source of truth.
         """
         # Best-effort early-warning: never let a probe failure escape into
         # `on_mount` (no surrounding try) or `action_toggle_cli` (whose
@@ -4771,7 +5411,7 @@ class PRReviewer(App):
 
     def action_toggle_codegraph(self) -> None:
         # Render-free like `action_toggle_cli` — the table doesn't depend
-        # on this toggle. `_launch_review_cli` reads `self.codegraph_assist`
+        # on this toggle. `_review_setup_worker` reads `self.codegraph_assist`
         # at launch time to decide whether to prompt the user about
         # initialising CodeGraph in workspaces that don't have an index.
         self.codegraph_assist = not self.codegraph_assist
@@ -5032,7 +5672,17 @@ class PRReviewer(App):
                 )
         return True
 
-    def _launch_review_cli(
+    # --- Review launch: embedded terminal tabs (POSIX) ---------------------
+    #
+    # `_begin_review` is the single entry point from `action_review`. On
+    # POSIX it opens a "Preparing…" tab, runs the blocking setup off the main
+    # thread (`_review_setup_worker`), then spawns the CLI in an embedded
+    # `TerminalPane` (`_spawn_review_tab`). When the child exits,
+    # `_on_review_exit` records the review + telemetry and tears down in the
+    # same order the old suspend path's `finally` did. On Windows (no PTY) it
+    # falls back to the legacy `_launch_review_suspend` below.
+
+    def _begin_review(
         self,
         pr: dict[str, Any],
         post_inline: bool,
@@ -5041,24 +5691,470 @@ class PRReviewer(App):
         selected_agents: tuple[str, ...] = REVIEW_SKILLS,
         expected_holder: InProgressHolder | None = None,
     ) -> None:
+        # Pre-flight CLI/plugin checks run on the main thread while the TUI is
+        # alive so failures surface as toasts. A False return means "abort,
+        # already notified".
+        if not self._preflight_cli_checks(cli):
+            return
+        if not _POSIX:  # pragma: no cover - Windows fallback
+            # No PTY on Windows: keep the legacy suspend-based single review.
+            self._launch_review_suspend(
+                pr, post_inline, extra_prompt, cli, selected_agents, expected_holder
+            )
+            return
+
+        key = _pr_key(pr)
+        existing = self._find_running_session_for_key(key)
+        if existing is not None:
+            self._activate_tab(existing.tab_id)
+            return
+
+        self._review_tab_counter += 1
+        tab_id = f"review-{self._review_tab_counter}"
+        title = _review_tab_title(pr, cli)
+        self._active_reviews[tab_id] = _ReviewSession(pr_key=key, tab_id=tab_id, title=title)
+        self._add_preparing_tab(tab_id, title, key)
+        self._review_setup_worker(
+            pr, post_inline, extra_prompt, cli, selected_agents, expected_holder, tab_id
+        )
+
+    @work(thread=True)
+    def _review_setup_worker(
+        self,
+        pr: dict[str, Any],
+        post_inline: bool,
+        extra_prompt: str,
+        cli: CliChoice,
+        selected_agents: tuple[str, ...],
+        expected_holder: InProgressHolder | None,
+        tab_id: str,
+    ) -> None:
+        """Blocking review setup, off the main thread (mirrors the old suspend
+        block's setup half). Reserves the PR, prepares the worktree + codegraph
+        + skills, fetches existing comments + Slack baseline, and builds the
+        prompt + argv, then marshals `_spawn_review_tab` back to the UI thread.
+        Any failure after reserving runs the ordered compensating teardown."""
         repo_full = pr["repository"]["nameWithOwner"]
         owner, name = repo_full.split("/", 1)
         number = pr["number"]
-        # `primary_path` is the shared clone (git object store + remote
-        # refs) reused across every review of this repo; `worktree_path`
-        # is this PR's isolated checkout. Everything the agent touches
-        # runs in the worktree so two concurrent reviews of *different*
-        # PRs in the same repo can't clobber each other's checkout — the
-        # `gh pr checkout --force` race this layout exists to prevent.
+        # `primary_path` is the shared clone (git object store + remote refs)
+        # reused across every review of this repo; `worktree_path` is this
+        # PR's isolated checkout. Everything the agent touches runs in the
+        # worktree so two concurrent reviews of *different* PRs in the same
+        # repo can't clobber each other's checkout.
         primary_path = _primary_path(owner, name)
         worktree_path = _worktree_path(owner, name, number)
         key = _pr_key(pr)
+        WORKSPACE.mkdir(parents=True, exist_ok=True)
 
-        # Pre-flight CLI/plugin checks run while the TUI is still alive so
-        # failures surface as toasts (not a half-suspended terminal). A
-        # False return means "abort, already notified".
-        if not self._preflight_cli_checks(cli):
+        # Reserve BEFORE clone/checkout — the per-PR hard boundary against two
+        # tabs (here or in another instance) racing on the same worktree.
+        try:
+            _reserve_in_progress(self.review_db, key, expected_holder=expected_holder)
+        except ReviewInProgressError as e:
+            self.call_from_thread(
+                self.notify,
+                f"Another review of {repo_full}#{number} is in progress "
+                f"(pid {e.holder.pid} on {e.holder.hostname}).",
+                severity="warning",
+            )
+            self.call_from_thread(self._discard_preparing_tab, tab_id)
             return
+
+        skills_manifest: _MaterialisedSkills | None = None
+        worktree_created = False
+        try:
+            ok, worktree_created, head_sha = _prepare_pr_worktree(
+                repo_full, number, primary_path, worktree_path
+            )
+            if not ok:
+                self.call_from_thread(
+                    self.notify,
+                    f"Failed to prepare worktree for {repo_full}#{number}.",
+                    severity="error",
+                )
+                self._teardown_review_io(
+                    key=key,
+                    skills_manifest=None,
+                    worktree_created=worktree_created,
+                    primary_path=primary_path,
+                    worktree_path=worktree_path,
+                )
+                self.call_from_thread(self._discard_preparing_tab, tab_id)
+                return
+
+            codegraph_on_path = shutil.which("codegraph") is not None
+            codegraph_present = (worktree_path / ".codegraph").is_dir()
+            codegraph_present, codegraph_affected_block, affected_count = _setup_codegraph_index(
+                primary_path,
+                worktree_path,
+                repo_full,
+                number,
+                codegraph_present,
+                codegraph_on_path,
+                self.codegraph_assist,
+            )
+            if cli in _SKILL_BASED_CLIS:
+                skills_manifest = _materialise_skills(worktree_path, selected=selected_agents)
+            existing, fetch_ok = fetch_existing_review_comments(repo_full, number)
+            my_login = _current_gh_login()
+            slack_webhook = self.slack_webhook_url.strip()
+            pre_review: dict[str, Any] | None = None
+            pre_review_ok = False
+            if slack_webhook:
+                pre_review, pre_review_ok = fetch_my_latest_review(
+                    repo_full, number, my_login or ""
+                )
+            codegraph_tools_available = _resolve_codegraph_tools(
+                cli, worktree_path, codegraph_present, codegraph_on_path
+            )
+            built = build_review_prompt(
+                post_inline=post_inline,
+                extra_prompt=extra_prompt,
+                existing=existing,
+                fetch_ok=fetch_ok,
+                my_login=my_login,
+                author_login=(pr.get("author") or {}).get("login"),
+                cli=cli,
+                codegraph_present=codegraph_tools_available,
+                codegraph_affected_tests=codegraph_affected_block,
+                selected_agents=selected_agents,
+            )
+            cmd = _build_cli_command(cli, built.text)
+        except Exception as e:  # noqa: BLE001
+            self.call_from_thread(
+                self.notify,
+                f"Review setup failed for {repo_full}#{number}: {e}",
+                severity="error",
+            )
+            self._teardown_review_io(
+                key=key,
+                skills_manifest=skills_manifest,
+                worktree_created=worktree_created,
+                primary_path=primary_path,
+                worktree_path=worktree_path,
+            )
+            self.call_from_thread(self._discard_preparing_tab, tab_id)
+            return
+
+        ctx = _ReviewContext(
+            pr=pr,
+            key=key,
+            repo_full=repo_full,
+            number=number,
+            cli=cli,
+            post_inline=post_inline,
+            primary_path=primary_path,
+            worktree_path=worktree_path,
+            head_sha=head_sha,
+            worktree_created=worktree_created,
+            skills_manifest=skills_manifest,
+            my_login=my_login,
+            slack_webhook=slack_webhook,
+            pre_review=pre_review,
+            pre_review_ok=pre_review_ok,
+            built=built,
+            affected_count=affected_count,
+            codegraph_tools=codegraph_tools_available,
+            cmd=cmd,
+        )
+        self.call_from_thread(self._spawn_review_tab, tab_id, ctx)
+
+    def _spawn_review_tab(self, tab_id: str, ctx: _ReviewContext) -> None:
+        """Mount the `TerminalPane` into the prepared tab and fork the CLI."""
+        session = self._active_reviews.get(tab_id)
+        if session is None:
+            # Tab was closed while preparing — undo what setup reserved.
+            self._teardown_review_io(
+                key=ctx.key,
+                skills_manifest=ctx.skills_manifest,
+                worktree_created=ctx.worktree_created,
+                primary_path=ctx.primary_path,
+                worktree_path=ctx.worktree_path,
+            )
+            return
+        try:
+            tab = self.query_one(f"#{tab_id}", TabPane)
+        except NoMatches:
+            return
+        ctx.launch_start = time.monotonic()
+        pane = TerminalPane(
+            ctx.cmd,
+            ctx.worktree_path,
+            on_exit=partial(self._on_review_exit, tab_id),
+            id=f"{tab_id}-term",
+        )
+        session.pane = pane
+        session.ctx = ctx
+        session.state = "running"
+        tab.mount(pane)
+        # Drop the "Preparing…" placeholder now the terminal is mounted.
+        tab.query(".review-preparing").remove()
+        self._activate_tab(tab_id)
+
+    def _on_review_exit(self, tab_id: str, rc: int) -> None:
+        """Child exited: record telemetry/review, notify Slack, tear down.
+
+        Runs on the main thread (from the pane's reader callback). Mirrors the
+        old suspend path's post-`subprocess.call` block + `finally`, in order.
+        During app-quit the bulk reaper owns teardown, so this defers to it.
+        """
+        if self._quitting:
+            return
+        session = self._active_reviews.get(tab_id)
+        if session is None or session.ctx is None:
+            return
+        ctx = session.ctx
+        launch_duration = time.monotonic() - ctx.launch_start
+
+        # Append-only telemetry for EVERY exit (success and rc != 0), before
+        # `_record_review`, best-effort.
+        _record_launch_telemetry(
+            self.review_db,
+            pr_key=ctx.key,
+            cli=ctx.cli,
+            codegraph_tools=ctx.codegraph_tools,
+            affected_paths=ctx.affected_count,
+            existing_in_prompt=ctx.built.existing_shown,
+            post_inline=ctx.post_inline,
+            rereview=ctx.built.rereview,
+            approx_prompt_tokens=ctx.built.approx_tokens,
+            duration_seconds=launch_duration,
+            exit_code=rc,
+        )
+
+        if rc == 0:
+            # Only a clean exit counts as a review — Ctrl-C/crash (rc != 0)
+            # must not inflate the count or reset staleness.
+            self.review_state[ctx.key] = _record_review(
+                self.review_db,
+                ctx.key,
+                ctx.pr.get("updatedAt", ""),
+                ctx.head_sha,
+            )
+            if ctx.slack_webhook:
+                # Offload the Slack POST + its `gh api` verdict lookup so a
+                # slow network can't hitch the UI as the tab closes.
+                self._slack_notify_worker(ctx)
+        else:
+            self.notify(
+                f"{_CLI_DISPLAY[ctx.cli]} exited with status {rc}; not recorded as a review.",
+                severity="warning",
+            )
+
+        self._teardown_review_io(
+            key=ctx.key,
+            skills_manifest=ctx.skills_manifest,
+            worktree_created=ctx.worktree_created,
+            primary_path=ctx.primary_path,
+            worktree_path=ctx.worktree_path,
+            warn=lambda m: self.notify(m, severity="warning"),
+        )
+        session.state = "done" if rc == 0 else "failed"
+        self._mark_tab_ended(session, rc)
+        # Review state may have changed (e.g. you approved the PR).
+        self.action_refresh()
+
+    @work(thread=True)
+    def _slack_notify_worker(self, ctx: _ReviewContext) -> None:
+        self._notify_review_to_slack(
+            webhook_url=ctx.slack_webhook,
+            pr=ctx.pr,
+            repo=ctx.repo_full,
+            number=ctx.number,
+            reviewer_login=ctx.my_login,
+            pre_review=ctx.pre_review,
+            pre_review_ok=ctx.pre_review_ok,
+        )
+
+    # --- teardown + tab helpers ---
+
+    def _teardown_review_io(
+        self,
+        *,
+        key: str,
+        skills_manifest: _MaterialisedSkills | None,
+        worktree_created: bool,
+        primary_path: Path,
+        worktree_path: Path,
+        warn: Callable[[str], None] | None = None,
+    ) -> None:
+        """Run the ordered review teardown (skills → worktree → reservation).
+
+        `warn` reports worktree-removal trouble; defaults to stderr so this is
+        safe to call off the main thread (setup-failure paths) where `notify`
+        would need marshalling.
+        """
+        if warn is None:
+            warn = lambda m: print(f"warning: {m}", file=sys.stderr)  # noqa: E731
+        _review_teardown_sequence(
+            cleanup_skills=(
+                (lambda: _cleanup_skills(skills_manifest))
+                if skills_manifest is not None
+                else (lambda: None)
+            ),
+            remove_worktree=lambda: self._remove_worktree_io(
+                worktree_created, primary_path, worktree_path, warn
+            ),
+            release_reservation=lambda: _release_in_progress(self.review_db, key),
+        )
+
+    def _remove_worktree_io(
+        self,
+        worktree_created: bool,
+        primary_path: Path,
+        worktree_path: Path,
+        warn: Callable[[str], None],
+    ) -> None:
+        if not worktree_created:
+            return
+        try:
+            rc_wt = subprocess.call(
+                ["git", "worktree", "remove", "--force", str(worktree_path)],
+                cwd=primary_path,
+            )
+        except OSError as e:
+            warn(f"failed to launch `git worktree remove`: {e}")
+            return
+        if worktree_path.exists():
+            warn(
+                f"worktree dir survived removal at {worktree_path} "
+                f"(`git worktree remove` rc={rc_wt}); it will be reaped on the next launch."
+            )
+
+    def _find_running_session_for_key(self, key: str) -> _ReviewSession | None:
+        for session in self._active_reviews.values():
+            if session.pr_key == key and session.state in ("preparing", "running"):
+                return session
+        return None
+
+    def _add_preparing_tab(self, tab_id: str, title: str, key: str) -> None:
+        tabbed = self.query_one("#main-tabs", TabbedContent)
+        pane = TabPane(
+            title,
+            Static(f"Preparing worktree for {key}…", classes="review-preparing"),
+            id=tab_id,
+        )
+        tabbed.add_pane(pane)
+        tabbed.active = tab_id
+
+    def _discard_preparing_tab(self, tab_id: str) -> None:
+        """Remove a still-preparing tab whose setup aborted, focus the PRs tab."""
+        self._active_reviews.pop(tab_id, None)
+        self._remove_tab_widget(tab_id)
+
+    def _mark_tab_ended(self, session: _ReviewSession, rc: int) -> None:
+        glyph = "✓" if rc == 0 else "✗"
+        # Best-effort tab-bar relabel to a ✓/✗ + title; the exact runtime
+        # relabel API is version-sensitive, so never let it break teardown.
+        with contextlib.suppress(Exception):
+            tab = self.query_one("#main-tabs", TabbedContent).get_tab(session.tab_id)
+            tab.label = Content(f"{glyph} {session.title}")
+        self.notify(
+            f"Review of {session.pr_key} ended (rc={rc}). Press F4 to close its tab.",
+            severity="information" if rc == 0 else "warning",
+        )
+
+    def _remove_tab_widget(self, tab_id: str) -> None:
+        tabbed = self.query_one("#main-tabs", TabbedContent)
+        with contextlib.suppress(Exception):
+            tabbed.remove_pane(tab_id)
+        self._activate_tab("tab-prs")
+
+    def _activate_tab(self, tab_id: str) -> None:
+        try:
+            tabbed = self.query_one("#main-tabs", TabbedContent)
+        except NoMatches:
+            return
+        with contextlib.suppress(Exception):
+            tabbed.active = tab_id
+        session = self._active_reviews.get(tab_id)
+        if session is not None and session.pane is not None:
+            session.pane.focus()
+        elif tab_id == "tab-prs":
+            with contextlib.suppress(NoMatches):
+                self.query_one("#pr-table", DataTable).focus()
+
+    def action_prev_tab(self) -> None:
+        self._cycle_tab(-1)
+
+    def action_next_tab(self) -> None:
+        self._cycle_tab(1)
+
+    def _cycle_tab(self, delta: int) -> None:
+        try:
+            tabbed = self.query_one("#main-tabs", TabbedContent)
+        except NoMatches:
+            return
+        ids = [pane.id for pane in tabbed.query(TabPane) if pane.id]
+        if len(ids) < 2:
+            return
+        current = tabbed.active
+        idx = ids.index(current) if current in ids else 0
+        self._activate_tab(ids[(idx + delta) % len(ids)])
+
+    def action_close_tab(self) -> None:
+        try:
+            tabbed = self.query_one("#main-tabs", TabbedContent)
+        except NoMatches:
+            return
+        active = tabbed.active
+        if active == "tab-prs" or not active:
+            return  # the PR list is permanent
+        session = self._active_reviews.get(active)
+        if session is not None and session.pane is not None and session.pane.is_running:
+            # Kill runs teardown synchronously via the pane's exit callback;
+            # then we drop the tab.
+            session.pane.kill()
+        self._active_reviews.pop(active, None)
+        self._remove_tab_widget(active)
+
+    def _reap_active_reviews(self) -> None:
+        """Kill every live review pane on app quit and run its teardown.
+
+        `kill()` SIGKILLs the child's process group (agents included). Each
+        session tears down independently so one failure can't strand others.
+        Runs with `_quitting` set so per-pane exit callbacks defer here.
+        """
+        self._quitting = True
+        for session in list(self._active_reviews.values()):
+            ctx = session.ctx
+            try:
+                if session.pane is not None:
+                    session.pane.kill()
+                if ctx is not None:
+                    self._teardown_review_io(
+                        key=ctx.key,
+                        skills_manifest=ctx.skills_manifest,
+                        worktree_created=ctx.worktree_created,
+                        primary_path=ctx.primary_path,
+                        worktree_path=ctx.worktree_path,
+                    )
+            except Exception as e:  # noqa: BLE001
+                print(f"warning: failed to reap review {session.tab_id}: {e}", file=sys.stderr)
+        self._active_reviews.clear()
+
+    def on_unmount(self) -> None:
+        self._reap_active_reviews()
+
+    def _launch_review_suspend(
+        self,
+        pr: dict[str, Any],
+        post_inline: bool,
+        extra_prompt: str,
+        cli: CliChoice = DEFAULT_CLI,
+        selected_agents: tuple[str, ...] = REVIEW_SKILLS,
+        expected_holder: InProgressHolder | None = None,
+    ) -> None:
+        """Legacy single-review path used on Windows (no PTY for embedded
+        tabs). Suspends the whole TUI and hands the terminal to one CLI. The
+        POSIX path is `_begin_review`; preflight already ran there."""
+        repo_full = pr["repository"]["nameWithOwner"]
+        owner, name = repo_full.split("/", 1)
+        number = pr["number"]
+        primary_path = _primary_path(owner, name)
+        worktree_path = _worktree_path(owner, name, number)
+        key = _pr_key(pr)
 
         # Suspend the TUI so the coding-agent CLI can take over stdin/stdout.
         with self.suspend():
@@ -5324,6 +6420,11 @@ class PRReviewer(App):
         w = self.query_one("#status", Static)
         w.update(msg)
         w.set_class(error, "-error")
+        # Collapse the bar entirely when there's nothing to say, so it isn't a
+        # persistent redundant row under the header (which already shows the
+        # count). It reappears only for transient states — Refreshing…,
+        # errors, the empty-list message.
+        w.display = bool(msg)
 
     def _set_pr_count(self, msg: str) -> None:
         # Reactive on the App; HeaderTitle re-renders automatically. The
@@ -5379,7 +6480,7 @@ class PRReviewer(App):
             # would still show `⟳` (we can't repaint without the DB)
             # while the gate would silently say "no holder", letting
             # the user launch a duplicate review without warning.
-            # The reserve in `_launch_review_cli` is still the hard
+            # The reserve in `_review_setup_worker` is still the hard
             # boundary, and the toast tells the user the snapshot is
             # stale. Dedupe so a persistent failure doesn't fire every
             # 3 s.

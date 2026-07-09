@@ -138,7 +138,10 @@ before checking out the PR.
 | `c`           | Cycle CLI: claude → codex → gemini → claude (persisted)      |
 | `r` / `F5`    | Refresh the list                                             |
 | `u`           | Upgrade `cc-pr-reviewer` via `uv tool upgrade`               |
-| `q`           | Quit                                                         |
+| `F2` / `F3`   | Switch to the previous / next tab (PR list + review tabs)    |
+| `F4`          | Close the current review tab                                 |
+| `Ctrl+Q`      | Quit from anywhere (incl. a focused review terminal)         |
+| `q`           | Quit (from the PR list)                                      |
 
 The `c` key highlights green in the footer whenever the active CLI is
 non-default (i.e. anything other than Claude Code).
@@ -164,14 +167,24 @@ and restored on the next launch.
 
 When you press **Enter** on a row, a confirmation modal shows the target
 PR (`repo#N` + title) plus the current CLI selection. On **Enter/y** the
-TUI suspends itself and runs, in order:
+review opens in its **own in-app tab** — an embedded terminal running the
+CLI — and the setup runs off the main thread, in order:
 
 ```sh
 gh repo clone <owner>/<repo>                      # only if not already cloned
 git fetch --all --prune                           # otherwise
-gh pr checkout <N> --force
-<selected-cli> <auto-approve flags> "<review prompt>"
+git worktree add --force --detach <worktree>      # per-PR isolated checkout
+gh pr checkout <N> --force                         # inside the worktree
+<selected-cli> <auto-approve flags> "<review prompt>"   # in the tab's terminal
 ```
+
+The TUI **does not suspend**: you can open several reviews at once and
+switch between their live terminals with **F2**/**F3** (**F4** closes a
+tab, **Ctrl+Q** quits). Each review runs in its own git worktree, which is
+removed when the CLI exits; the tab is left open (marked ✓/✗) until you
+close it. Scroll a terminal's history with the mouse wheel or
+**Shift+PageUp/PageDown**. (On Windows, which has no pseudo-terminal, the
+app falls back to suspending the whole TUI for one review at a time.)
 
 The exact CLI invocation depends on which backend is active:
 
