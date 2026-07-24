@@ -4,6 +4,34 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Seventh review dimension: Security Reviewer.** A bundled
+  `security-reviewer` skill (`cc_pr_reviewer/skills/security-reviewer/SKILL.md`)
+  joins the six pr-review-toolkit-derived dimensions — **off by default**
+  (listed in the new `DEFAULT_OFF_SKILLS`): its confirm-modal checkbox ships
+  unchecked and it only runs when explicitly ticked for a launch. Its prose
+  is locally authored,
+  adapted from Anthropic's MIT-licensed
+  [claude-code-security-review](https://github.com/anthropics/claude-code-security-review)
+  audit prompt: data-flow tracing from untrusted inputs to sensitive sinks,
+  a vulnerability taxonomy (injection, authn/authz, crypto & secrets, unsafe
+  deserialization/XSS, SSRF, data exposure), a >= 80 exploitability-confidence
+  gate, and an explicit do-not-report list (DoS/rate-limiting/theoretical
+  hardening). Scope is diff-anchored — only vulnerabilities the PR introduces
+  or enables are reported.
+  - Codex/Gemini discover it like the other skills via
+    `.agents/skills/security-reviewer/SKILL.md`. Claude has no toolkit-plugin
+    counterpart for it, so claude launches materialise the same bytes as a
+    project subagent at `<worktree>/.claude/agents/security-reviewer.md`
+    (new `layout="claude-agents"` variant of the snapshot/restore
+    materialisation machinery; the worktree is restored byte-for-byte on
+    exit as before).
+  - New `LOCAL_SKILLS` marker distinguishes locally-authored skills;
+    `scripts/sync_pr_review_agents.py` exempts them from the upstream drift
+    check (they have no upstream file or baseline snapshot).
+
 ## [0.19.0] — 2026-06-24
 
 ### Fixed

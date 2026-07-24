@@ -19,6 +19,44 @@ from sync_pr_review_agents import (
     strip_bundled_frontmatter,
 )
 
+# --- UPSTREAM_SKILLS manifest ----------------------------------------------
+
+
+def test_upstream_skills_excludes_local_skills() -> None:
+    """Locally-authored skills (`LOCAL_SKILLS`, e.g. security-reviewer)
+    have no upstream pr-review-toolkit file. If they leaked into the
+    sync manifest, every run would report `MISSING UPSTREAM`, flip
+    `baseline_exists` to False, and exit non-zero forever — the drift
+    check would become permanently red."""
+    import cc_pr_reviewer as _mod
+
+    assert set(sync.UPSTREAM_SKILLS) == set(_mod.REVIEW_SKILLS) - _mod.LOCAL_SKILLS
+    assert not set(sync.UPSTREAM_SKILLS) & _mod.LOCAL_SKILLS
+
+
+def test_every_upstream_skill_has_committed_baseline() -> None:
+    """`baseline_exists` requires a `scripts/upstream_baseline/<name>.md`
+    for every UPSTREAM_SKILLS entry; a missing one silently disables the
+    upstream-changed detection for all skills. Catch it in CI rather
+    than on the maintainer's next manual run."""
+    for name in sync.UPSTREAM_SKILLS:
+        assert (sync.BASELINE_DIR / f"{name}.md").is_file(), (
+            f"missing baseline snapshot for upstream skill: {name}"
+        )
+
+
+def test_local_skills_have_no_baseline_snapshot() -> None:
+    """The baseline dir mirrors *upstream* — a stray snapshot for a
+    locally-authored skill implies someone re-added it to the sync flow
+    (or `--save-baseline` regressed its exemption)."""
+    import cc_pr_reviewer as _mod
+
+    for name in _mod.LOCAL_SKILLS:
+        assert not (sync.BASELINE_DIR / f"{name}.md").exists(), (
+            f"unexpected baseline snapshot for local skill: {name}"
+        )
+
+
 # --- normalise_upstream ----------------------------------------------------
 
 

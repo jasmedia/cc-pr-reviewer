@@ -1,9 +1,12 @@
 """Compare bundled review skills against the upstream Claude plugin.
 
 The bundled SKILL.md files in `cc_pr_reviewer/skills/<name>/SKILL.md`
-are a static fork of the `pr-review-toolkit` Claude plugin's agent
-prompts, adapted for Codex/Gemini Skills (which auto-discover under
-`.agents/skills/<name>/SKILL.md` at session start).
+are (mostly) a static fork of the `pr-review-toolkit` Claude plugin's
+agent prompts, adapted for Codex/Gemini Skills (which auto-discover
+under `.agents/skills/<name>/SKILL.md` at session start). Skills in
+`cc_pr_reviewer.LOCAL_SKILLS` (e.g. `security-reviewer`) are authored
+in this repo with no upstream counterpart — they are exempt from every
+check here and carry no baseline snapshot.
 
 `claude plugin update pr-review-toolkit@claude-plugins-official` reports
 the plugin version as `unknown`, so the only way to detect upstream
@@ -61,7 +64,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-from cc_pr_reviewer import REVIEW_SKILLS, SKILL_FILE_NAME, _skills_dir
+from cc_pr_reviewer import LOCAL_SKILLS, REVIEW_SKILLS, SKILL_FILE_NAME, _skills_dir
+
+# Skills authored in this repo (see `LOCAL_SKILLS`) have no upstream
+# pr-review-toolkit counterpart, so the drift machinery skips them —
+# there is nothing to diff against and no baseline to capture. Only the
+# upstream-forked subset participates in every check below.
+UPSTREAM_SKILLS: tuple[str, ...] = tuple(n for n in REVIEW_SKILLS if n not in LOCAL_SKILLS)
 
 # Upstream agents are still flat `<name>.md` files in the plugin's
 # `agents/` dir; the renaming-to-SKILL.md only happens on our side
@@ -212,7 +221,7 @@ def _save_baseline(args: argparse.Namespace) -> int:
     """
     BASELINE_DIR.mkdir(parents=True, exist_ok=True)
     wrote = skipped = 0
-    for name in REVIEW_SKILLS:
+    for name in UPSTREAM_SKILLS:
         upstream_file = name + UPSTREAM_FILE_SUFFIX
         upstream_path = args.upstream / upstream_file
         if not upstream_path.is_file():
@@ -307,13 +316,16 @@ def main() -> int:
 
     local_dir = _skills_dir()
     baseline_exists = BASELINE_DIR.is_dir() and all(
-        (BASELINE_DIR / (name + UPSTREAM_FILE_SUFFIX)).is_file() for name in REVIEW_SKILLS
+        (BASELINE_DIR / (name + UPSTREAM_FILE_SUFFIX)).is_file() for name in UPSTREAM_SKILLS
     )
 
     in_sync = drifted = rewrote = missing = 0
     upstream_changed: list[tuple[str, str, str]] = []  # (name, baseline_text, normalised)
 
-    for name in REVIEW_SKILLS:
+    for name in sorted(LOCAL_SKILLS):
+        print(f"  local (no upstream) {name}")
+
+    for name in UPSTREAM_SKILLS:
         upstream_file = name + UPSTREAM_FILE_SUFFIX
         upstream_path = args.upstream / upstream_file
         local_path = local_dir / name / SKILL_FILE_NAME
@@ -387,7 +399,7 @@ def main() -> int:
     # Surface any upstream files that aren't in our manifest — they'd
     # represent a new agent the toolkit added since we forked, which is
     # worth a human deciding whether to bundle.
-    bundled_files = {name + UPSTREAM_FILE_SUFFIX for name in REVIEW_SKILLS}
+    bundled_files = {name + UPSTREAM_FILE_SUFFIX for name in UPSTREAM_SKILLS}
     extras = sorted(p.name for p in args.upstream.glob("*.md") if p.name not in bundled_files)
 
     # ---- final report ----

@@ -9,9 +9,15 @@ the review.
 Flow when you pick a PR and press Enter:
     1. Clone the repo into $GH_PR_WORKSPACE (if not already there)
     2. `gh pr checkout <N>` so the CLI sees the PR's working tree
-    3. For codex/gemini: materialise the six bundled review skills into
-       `<workspace>/.agents/skills/` for auto-discovery (cleaned up on exit)
-    4. Launch the chosen CLI with a prompt that drives the six review dimensions
+    3. For codex/gemini: materialise the selected bundled review skills into
+       `<workspace>/.agents/skills/` for auto-discovery (cleaned up on exit).
+       For claude: materialise the locally-authored security-reviewer (when
+       selected — it's opt-in per launch) as a project subagent at
+       `<workspace>/.claude/agents/` (the other six come from the PR Review
+       Toolkit plugin)
+    4. Launch the chosen CLI with a prompt that drives the selected review
+       dimensions (six by default; the security reviewer joins when its
+       checkbox is ticked in the confirm modal)
     5. When you /exit the CLI, the TUI resumes
 
 Prerequisites:
@@ -94,18 +100,21 @@ _APP_HOSTNAME = socket.gethostname()
 
 # Codex and Gemini don't have a plugin marketplace, but both natively
 # auto-discover skills at `<workspace>/.agents/skills/<name>/SKILL.md`. The
-# six toolkit agents ship as bundled SKILL.md files (see
-# `cc_pr_reviewer/skills/`); at launch we materialise them into the
-# checked-out PR's workspace and clean up on exit. Names appear in the
-# review prompt prefixed with `$` to force explicit activation — we want
-# every dimension to run, not have the model implicitly pick a subset.
+# six toolkit agents plus our locally-authored security-reviewer ship as
+# bundled SKILL.md files (see `cc_pr_reviewer/skills/`); at launch we
+# materialise them into the checked-out PR's workspace and clean up on
+# exit. Names appear in the review prompt prefixed with `$` to force
+# explicit activation — we want every dimension to run, not have the
+# model implicitly pick a subset.
 #
 # The order here is the order the prompt asks for them — code-reviewer
 # first sets project-guideline context, then the targeted checks (silent
 # failures, type design, tests), then the cleanup-oriented passes
-# (comments, simplification). Changing the order is a behaviour change,
-# so the tuple is the single source of truth consulted by both the
-# prompt builder and the materialise/cleanup helpers.
+# (comments, simplification), and finally the security sweep (a
+# deliberately separate last pass so its exploitability-focused lens
+# isn't diluted by the general-quality passes). Changing the order is a
+# behaviour change, so the tuple is the single source of truth consulted
+# by both the prompt builder and the materialise/cleanup helpers.
 REVIEW_SKILLS: tuple[str, ...] = (
     "code-reviewer",
     "silent-failure-hunter",
@@ -113,6 +122,33 @@ REVIEW_SKILLS: tuple[str, ...] = (
     "pr-test-analyzer",
     "comment-analyzer",
     "code-simplifier",
+    "security-reviewer",
+)
+
+# Skills authored in this repo with NO counterpart in the upstream
+# pr-review-toolkit plugin. Two consumers rely on the distinction:
+# `scripts/sync_pr_review_agents.py` exempts these from the upstream
+# drift check (there is no upstream file to diff against), and the
+# claude launch path materialises exactly these as project subagents
+# under `.claude/agents/` (the toolkit agents already reach claude via
+# the installed plugin, so only local skills need delivering by file).
+LOCAL_SKILLS: frozenset[str] = frozenset({"security-reviewer"})
+
+# Skills whose ConfirmScreen checkbox ships UNCHECKED — opt-in per
+# launch. security-reviewer is deliberately here: a dedicated security
+# pass adds prompt tokens and review time most routine PRs don't need,
+# so it runs only when the reviewer explicitly ticks it for a launch.
+# Distinct from LOCAL_SKILLS (authorship provenance) even though the
+# two currently coincide — a future local skill could be default-on,
+# and an upstream one default-off.
+DEFAULT_OFF_SKILLS: frozenset[str] = frozenset({"security-reviewer"})
+
+# The per-launch default selection: REVIEW_SKILLS minus the opt-in set,
+# order preserved. Seeds the ConfirmScreen checkboxes and serves as the
+# `selected_agents` default on launch-shaped APIs (`ConfirmResult`,
+# `_launch_review_cli`) so no path silently includes an opt-in skill.
+DEFAULT_REVIEW_SKILLS: tuple[str, ...] = tuple(
+    n for n in REVIEW_SKILLS if n not in DEFAULT_OFF_SKILLS
 )
 
 # Friendly labels for each skill — used in the ConfirmScreen agent
@@ -126,6 +162,7 @@ REVIEW_SKILL_LABELS: dict[str, str] = {
     "pr-test-analyzer": "PR Test Analyzer",
     "comment-analyzer": "Comment Analyzer",
     "code-simplifier": "Code Simplifier",
+    "security-reviewer": "Security Reviewer",
 }
 
 # Topic phrase per skill — assembled into the skill-based prompt's "they
@@ -139,6 +176,7 @@ _SKILL_COVERAGE: dict[str, str] = {
     "pr-test-analyzer": "test coverage",
     "comment-analyzer": "comments",
     "code-simplifier": "code simplification",
+    "security-reviewer": "security vulnerabilities",
 }
 
 SKILL_FILE_NAME = "SKILL.md"
@@ -175,6 +213,7 @@ _COUNT_WORDS: dict[int, str] = {
     4: "four",
     5: "five",
     6: "six",
+    7: "seven",
 }
 
 
@@ -256,14 +295,44 @@ def _build_skill_based_prompt(selected: tuple[str, ...] = REVIEW_SKILLS) -> str:
 REVIEW_PROMPT_SKILL_BASED = _build_skill_based_prompt()
 
 
+# Materialisation layouts. "agents-skills" is the Codex/Gemini Skills
+# convention (`.agents/skills/<name>/SKILL.md`); "claude-agents" is the
+# Claude Code project-subagent convention (`.claude/agents/<name>.md`).
+# The bundled SKILL.md shape (`name:` + `description:` frontmatter plus
+# prose body) is valid in both — Claude reads the same bytes as a
+# subagent definition — so one authored file serves every CLI.
+SkillLayout = Literal["agents-skills", "claude-agents"]
+
+
+def _skill_layout_dirs(workspace: Path, layout: SkillLayout) -> tuple[Path, Path]:
+    """Return `(outer_dir, skills_root)` for a layout.
+
+    e.g. `(.agents, .agents/skills)` or `(.claude, .claude/agents)` —
+    the two directory levels whose pre-existence the manifest tracks so
+    cleanup only removes what materialise created.
+    """
+    if layout == "claude-agents":
+        return workspace / ".claude", workspace / ".claude" / "agents"
+    return workspace / ".agents", workspace / ".agents" / "skills"
+
+
+def _skill_target_path(skills_root: Path, layout: SkillLayout, name: str) -> Path:
+    """Target file for one skill: `<root>/<name>/SKILL.md` or `<root>/<name>.md`."""
+    if layout == "claude-agents":
+        return skills_root / f"{name}.md"
+    return skills_root / name / SKILL_FILE_NAME
+
+
 @dataclass(frozen=True)
 class _SkillSnapshot:
-    """Pre-materialise state of one `.agents/skills/<name>/` dir.
+    """Pre-materialise state of one skill's target path.
 
-    `original_skill_md` is the byte content of any pre-existing
-    `SKILL.md` at the target (or `None` if the file didn't exist).
-    `skill_dir_existed` records whether the parent skill dir was
-    already there — so cleanup only `rmdir`s the dirs we created.
+    `original_skill_md` is the byte content of any pre-existing file at
+    the target (or `None` if the file didn't exist). `skill_dir_existed`
+    records whether the per-skill parent dir was already there — so
+    cleanup only `rmdir`s the dirs we created. The flat "claude-agents"
+    layout has no per-skill dir, so it pins the field to True (nothing
+    to remove).
     """
 
     original_skill_md: bytes | None
@@ -276,29 +345,41 @@ class _MaterialisedSkills:
 
     Captures pre-launch workspace state so `_cleanup_skills` can restore
     the worktree byte-for-byte even when the PR happens to ship its own
-    `.agents/skills/<our-name>/SKILL.md`. Without this, materialise
+    file colliding with a materialise target (e.g.
+    `.agents/skills/<our-name>/SKILL.md`). Without this, materialise
     would overwrite a tracked file and cleanup would `unlink` it,
     leaving the working tree dirty after every review.
+
+    `skills_root_existed` / `agents_dir_existed` track the two parent
+    directory levels of the layout (see `_skill_layout_dirs`) —
+    `.agents/skills` + `.agents`, or `.claude/agents` + `.claude`.
     """
 
     workspace: Path
     skills: dict[str, _SkillSnapshot]
     skills_root_existed: bool
     agents_dir_existed: bool
+    layout: SkillLayout = "agents-skills"
 
 
 def _materialise_skills(
-    workspace: Path, selected: tuple[str, ...] | None = None
+    workspace: Path,
+    selected: tuple[str, ...] | None = None,
+    layout: SkillLayout = "agents-skills",
 ) -> _MaterialisedSkills:
-    """Copy each bundled SKILL.md into `<workspace>/.agents/skills/<name>/SKILL.md`.
+    """Copy each bundled SKILL.md into the workspace at the given layout.
 
-    Codex and Gemini auto-discover skills under `.agents/skills/`. We
-    write the bundled skills there so they're picked up by the CLI at
-    session start. Pre-existing content at every target path (SKILL.md
-    bytes, parent-dir presence) is snapshotted into the returned
-    `_MaterialisedSkills` manifest BEFORE the write, so `_cleanup_skills`
-    can restore the worktree exactly — including the rare case where a
-    reviewed repo ships its own competing skill of the same name.
+    The default "agents-skills" layout targets
+    `<workspace>/.agents/skills/<name>/SKILL.md`, where Codex and Gemini
+    auto-discover skills at session start. The "claude-agents" layout
+    targets `<workspace>/.claude/agents/<name>.md`, where Claude Code
+    discovers project subagents — used to deliver `LOCAL_SKILLS` (which
+    have no plugin agent) to claude. Pre-existing content at every
+    target path (file bytes, parent-dir presence) is snapshotted into
+    the returned `_MaterialisedSkills` manifest BEFORE the write, so
+    `_cleanup_skills` can restore the worktree exactly — including the
+    rare case where a reviewed repo ships its own competing file of the
+    same name.
 
     `selected` defaults to all of `REVIEW_SKILLS`. When the caller passes a
     subset (e.g. ConfirmScreen lets the reviewer skip the code-review and
@@ -324,30 +405,30 @@ def _materialise_skills(
                 f"expected subset of {list(REVIEW_SKILLS)!r}"
             )
 
-    skills_root = workspace / ".agents" / "skills"
-    agents_dir = workspace / ".agents"
+    outer_dir, skills_root = _skill_layout_dirs(workspace, layout)
 
-    agents_dir_existed = agents_dir.is_dir()
+    agents_dir_existed = outer_dir.is_dir()
     skills_root_existed = skills_root.is_dir()
 
     snapshots: dict[str, _SkillSnapshot] = {}
     src_dir = _skills_dir()
 
     for name in selected:
-        skill_dir = skills_root / name
-        skill_md = skill_dir / SKILL_FILE_NAME
+        target = _skill_target_path(skills_root, layout, name)
 
-        skill_dir_existed = skill_dir.is_dir()
-        original_bytes = skill_md.read_bytes() if skill_md.is_file() else None
+        # The flat claude-agents layout has no per-skill dir — pin the
+        # flag True so cleanup's `rmdir` branch is a no-op for it.
+        skill_dir_existed = (skills_root / name).is_dir() if layout == "agents-skills" else True
+        original_bytes = target.read_bytes() if target.is_file() else None
 
         snapshots[name] = _SkillSnapshot(
             original_skill_md=original_bytes,
             skill_dir_existed=skill_dir_existed,
         )
 
-        skill_dir.mkdir(parents=True, exist_ok=True)
+        target.parent.mkdir(parents=True, exist_ok=True)
         try:
-            shutil.copy2(src_dir / name / SKILL_FILE_NAME, skill_md)
+            shutil.copy2(src_dir / name / SKILL_FILE_NAME, target)
         except OSError as e:
             # Disk full, permission denied, read-only FS — surface which
             # skill failed so the user has a clear diagnostic instead of
@@ -361,6 +442,7 @@ def _materialise_skills(
         skills=snapshots,
         skills_root_existed=skills_root_existed,
         agents_dir_existed=agents_dir_existed,
+        layout=layout,
     )
 
 
@@ -381,10 +463,10 @@ def _rmdir_if_empty(path: Path) -> None:
 def _cleanup_skills(manifest: _MaterialisedSkills) -> None:
     """Reverse of `_materialise_skills` using the manifest it returned.
 
-    For each skill: if a SKILL.md existed before materialise, restore
-    those exact bytes; otherwise unlink the one we wrote. Then `rmdir`
-    any parent dir we created (`rmdir` only succeeds on empty dirs, so
-    sibling content the user owns is preserved automatically).
+    For each skill: if a file existed at the target before materialise,
+    restore those exact bytes; otherwise unlink the one we wrote. Then
+    `rmdir` any parent dir we created (`rmdir` only succeeds on empty
+    dirs, so sibling content the user owns is preserved automatically).
 
     The byte restore uses `write_bytes` rather than swallowing errors —
     if we can't put the user's tracked file back, that's a data-loss
@@ -394,21 +476,21 @@ def _cleanup_skills(manifest: _MaterialisedSkills) -> None:
     instead of masking the originating launch exception when this
     runs inside `finally`.
     """
-    skills_root = manifest.workspace / ".agents" / "skills"
+    outer_dir, skills_root = _skill_layout_dirs(manifest.workspace, manifest.layout)
     for name, snap in manifest.skills.items():
-        skill_md = skills_root / name / SKILL_FILE_NAME
+        target = _skill_target_path(skills_root, manifest.layout, name)
         if snap.original_skill_md is not None:
-            skill_md.write_bytes(snap.original_skill_md)
+            target.write_bytes(snap.original_skill_md)
         else:
             with contextlib.suppress(FileNotFoundError):
-                skill_md.unlink()
+                target.unlink()
         if not snap.skill_dir_existed:
             _rmdir_if_empty(skills_root / name)
 
     if not manifest.skills_root_existed:
         _rmdir_if_empty(skills_root)
     if not manifest.agents_dir_existed:
-        _rmdir_if_empty(manifest.workspace / ".agents")
+        _rmdir_if_empty(outer_dir)
 
 
 def _build_cli_command(cli: CliChoice, prompt_text: str) -> list[str]:
@@ -2274,7 +2356,9 @@ def build_review_prompt(
     # Normalise the agent subset against REVIEW_SKILLS so the prompt's
     # agent enumeration order is stable regardless of the order/shape the
     # caller passed (set, list, tuple, mismatched case). `None` is the
-    # back-compat default = all six.
+    # back-compat default = the full REVIEW_SKILLS set (note: real launch
+    # paths always pass an explicit subset from ConfirmResult, whose
+    # default excludes the opt-in DEFAULT_OFF_SKILLS).
     if selected_agents is None:
         normalised_agents: tuple[str, ...] = REVIEW_SKILLS
     else:
@@ -2299,8 +2383,8 @@ def build_review_prompt(
     not_self_authored = bool(my_login) and author_login != my_login
     rereview_can_approve = rereview and not_self_authored
 
-    # Default subset → use the precomputed all-six constants (also what the
-    # public `REVIEW_PROMPT_*` symbols document); any non-default subset
+    # Full set → use the precomputed all-skills constants (also what the
+    # public `REVIEW_PROMPT_*` symbols document); any proper subset
     # rebuilds from the same builders so the wording stays consistent.
     if normalised_agents == REVIEW_SKILLS:
         base = REVIEW_PROMPT_CLAUDE if cli == "claude" else REVIEW_PROMPT_SKILL_BASED
@@ -3190,8 +3274,10 @@ class ConfirmResult:
     extra_prompt: str = ""
     cli: CliChoice = DEFAULT_CLI
     # Subset of REVIEW_SKILLS the reviewer wants to run for this launch.
-    # Default = all six; the ConfirmScreen lets the user uncheck individual
-    # agents (e.g. drop code-reviewer + pr-test-analyzer for a doc-only PR).
+    # Default = everything except the opt-in `DEFAULT_OFF_SKILLS`; the
+    # ConfirmScreen lets the user check/uncheck individual agents (e.g.
+    # drop code-reviewer + pr-test-analyzer for a doc-only PR, or tick
+    # security-reviewer on for a security-sensitive one).
     # Order isn't load-bearing: `build_review_prompt` re-iterates
     # `REVIEW_SKILLS` and filters by membership so the prompt enumeration
     # is stable; `_materialise_skills` doesn't care about order (it just
@@ -3199,7 +3285,7 @@ class ConfirmResult:
     # `ValueError`. Today every caller produces a canonical-order subset
     # (`ConfirmScreen._selected_agents` iterates `REVIEW_SKILLS`), but the
     # downstream contract doesn't depend on that.
-    selected_agents: tuple[str, ...] = REVIEW_SKILLS
+    selected_agents: tuple[str, ...] = DEFAULT_REVIEW_SKILLS
 
     def __post_init__(self) -> None:
         # `frozen=True` blocks attribute assignment; bypass via __setattr__
@@ -3288,17 +3374,19 @@ class ConfirmScreen(ModalScreen[ConfirmResult | None]):
             "• [b]Tab[/]/[b]Space[/] agents • [b]Ctrl+A[/] (on agents) toggle all "
             "• [b]Shift+Enter[/] newline"
         )
-        # Agent checkboxes: one per REVIEW_SKILLS entry, all checked by
-        # default. Tab moves focus through them and Space toggles; bound
-        # `Ctrl+A` flips them all at once. Numeric / single-letter keys
-        # weren't an option because they collide with typing into the
-        # auto-focused extra-prompt textarea — Checkbox widgets are the
-        # idiomatic Textual way to expose per-item toggles without that
-        # priority-binding conflict.
+        # Agent checkboxes: one per REVIEW_SKILLS entry, checked by
+        # default unless the skill is in the opt-in `DEFAULT_OFF_SKILLS`
+        # (security-reviewer ships unchecked — tick it explicitly for a
+        # security-sensitive PR). Tab moves focus through them and Space
+        # toggles; bound `Ctrl+A` flips them all at once. Numeric /
+        # single-letter keys weren't an option because they collide with
+        # typing into the auto-focused extra-prompt textarea — Checkbox
+        # widgets are the idiomatic Textual way to expose per-item
+        # toggles without that priority-binding conflict.
         agent_checkboxes = [
             Checkbox(
                 REVIEW_SKILL_LABELS[name],
-                value=True,
+                value=name not in DEFAULT_OFF_SKILLS,
                 id=self._agent_checkbox_id(name),
                 classes="confirm-agent",
             )
@@ -5038,7 +5126,7 @@ class PRReviewer(App):
         post_inline: bool,
         extra_prompt: str,
         cli: CliChoice = DEFAULT_CLI,
-        selected_agents: tuple[str, ...] = REVIEW_SKILLS,
+        selected_agents: tuple[str, ...] = DEFAULT_REVIEW_SKILLS,
         expected_holder: InProgressHolder | None = None,
     ) -> None:
         repo_full = pr["repository"]["nameWithOwner"]
@@ -5152,9 +5240,26 @@ class PRReviewer(App):
                 # skill of the same name. Cleanup runs in `finally` so
                 # Ctrl-C, crashes, and clean exits all leave the workspace
                 # byte-identical to its pre-launch state.
+                #
+                # Claude gets the six toolkit dimensions from the installed
+                # PR Review Toolkit plugin, so only the locally-authored
+                # `LOCAL_SKILLS` (no plugin counterpart) are materialised
+                # for it — as project subagents under `.claude/agents/`,
+                # which Claude Code discovers natively. Same snapshot/
+                # restore manifest, different layout.
                 if cli in _SKILL_BASED_CLIS:
                     print(f"Materialising review skills under {worktree_path}/.agents/skills/…")
                     skills_manifest = _materialise_skills(worktree_path, selected=selected_agents)
+                else:
+                    local_selected = tuple(n for n in selected_agents if n in LOCAL_SKILLS)
+                    if local_selected:
+                        print(
+                            f"Materialising local review agents under "
+                            f"{worktree_path}/.claude/agents/…"
+                        )
+                        skills_manifest = _materialise_skills(
+                            worktree_path, selected=local_selected, layout="claude-agents"
+                        )
 
                 print("Fetching existing review comments…")
                 existing, fetch_ok = fetch_existing_review_comments(repo_full, number)
