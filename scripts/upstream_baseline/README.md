@@ -25,6 +25,11 @@ our bundled `skills/<name>/SKILL.md` layout — the baseline is a copy
 of upstream's content as we'd want it (sans frontmatter / WTI), so
 the contributor can compare like-for-like.
 
+Locally-authored skills (`cc_pr_reviewer.LOCAL_SKILLS`, e.g.
+`security-reviewer`) have **no** baseline file: there is no upstream
+counterpart to snapshot, and the sync script exempts them from every
+check via its `UPSTREAM_SKILLS` manifest.
+
 These files are **not** shipped in the wheel — `pyproject.toml` scopes
 the build to the `cc_pr_reviewer/` package directory, which excludes
 everything under `scripts/`.

@@ -8,11 +8,12 @@ A small Textual TUI that lists every open GitHub PR where you are a
 requested reviewer, and hands the selected PR off to a coding-agent CLI
 of your choice — **Claude Code**, **OpenAI Codex CLI**, or **Google
 Gemini CLI** — to perform the review. Claude Code uses the
-[PR Review Toolkit](https://claude.com/plugins/pr-review-toolkit) plugin;
-Codex and Gemini load the same six review criteria as native **Skills**
-that ship with this package (`cc_pr_reviewer/skills/<name>/SKILL.md`),
-materialised into the checked-out PR workspace under `.agents/skills/`
-for the duration of each review.
+[PR Review Toolkit](https://claude.com/plugins/pr-review-toolkit) plugin
+plus a bundled security-review agent; Codex and Gemini load the same
+seven review criteria as native **Skills** that ship with this package
+(`cc_pr_reviewer/skills/<name>/SKILL.md`), materialised into the
+checked-out PR workspace under `.agents/skills/` for the duration of
+each review.
 
 ![cc-pr-reviewer screenshot](assets/cc-reviewer.png)
 
@@ -25,10 +26,11 @@ for the duration of each review.
 - Keyboard-driven: pick a PR and press **Enter** to open a confirmation
   modal; on **Enter/y** it clones the repo (if needed), checks out the PR
   branch via `gh pr checkout`, and launches the selected coding-agent CLI
-  inside that working tree with a prompt that drives a six-dimension PR
+  inside that working tree with a prompt that drives a multi-dimension PR
   review (code-quality, silent-failure hunting, type design, test
-  coverage, comment quality, simplification opportunities). See
-  [Keybindings](#keybindings) for the full list.
+  coverage, comment quality, simplification opportunities, and — opt-in
+  per launch — security vulnerabilities). See [Keybindings](#keybindings)
+  for the full list.
 - **Three CLI backends, switchable from the TUI.** Press `c` to cycle
   the global default (`claude → codex → gemini → claude`, persisted
   across sessions), or `Ctrl+L` inside the confirm modal to override
@@ -167,13 +169,17 @@ network by default; the `-c sandbox_workspace_write.network_access=true`
 override restores it so the post-inline review path can reach GitHub
 via `gh api`.
 
-The review prompt drives the same six review dimensions across all three
-CLIs:
+The review prompt drives the same seven review dimensions across all
+three CLIs:
 
 - **Claude Code** delegates to the PR Review Toolkit plugin's six
   sub-agents (Comment Analyzer, PR Test Analyzer, Silent Failure Hunter,
-  Type Design Analyzer, Code Reviewer, Code Simplifier).
-- **Codex** and **Gemini** load the same six review criteria as native
+  Type Design Analyzer, Code Reviewer, Code Simplifier), plus the
+  bundled **Security Reviewer** — which has no plugin counterpart, so
+  it's materialised as a project subagent at
+  `<workspace>/.claude/agents/security-reviewer.md` for the duration of
+  the review (removed on exit).
+- **Codex** and **Gemini** load the same seven review criteria as native
   Skills. The bundled `SKILL.md` files
   (`cc_pr_reviewer/skills/<name>/SKILL.md`) are an adapted fork of the
   upstream toolkit's agent prompts with Codex/Gemini Skills frontmatter
@@ -184,6 +190,14 @@ CLIs:
   [Gemini Skills](https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/skills.md))
   and removed on exit. Per those docs, only metadata is loaded
   eagerly — full instructions are pulled in on activation.
+
+The seventh dimension, **Security Reviewer**
+(`cc_pr_reviewer/skills/security-reviewer/SKILL.md`), is authored in
+this repo — adapted from Anthropic's MIT-licensed
+[claude-code-security-review](https://github.com/anthropics/claude-code-security-review)
+audit prompt — and is not part of the upstream toolkit fork. It is
+**off by default**: its checkbox in the review confirm modal ships
+unchecked, so it runs only when you explicitly tick it for a launch.
 
 If the modal's **post-inline** toggle (`Ctrl+T`) is on, the prompt is
 extended to ask the CLI to publish each finding as an inline review
@@ -197,8 +211,9 @@ When you exit the CLI, press Enter and the TUI returns.
 
 ### Keeping the bundled review prompts in sync with upstream
 
-The bundled `cc_pr_reviewer/skills/<name>/SKILL.md` files are a static
-fork of the [PR Review Toolkit](https://claude.com/plugins/pr-review-toolkit)
+The bundled `cc_pr_reviewer/skills/<name>/SKILL.md` files are (except
+for the locally-authored `security-reviewer`) a static fork of the
+[PR Review Toolkit](https://claude.com/plugins/pr-review-toolkit)
 plugin's agent prompts (with Codex/Gemini Skills frontmatter prepended).
 To check for upstream changes:
 

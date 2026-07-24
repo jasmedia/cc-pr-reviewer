@@ -32,9 +32,12 @@ from cc_pr_reviewer import (
     CODEGRAPH_AFFECTED_TESTS_CAP,
     CODEGRAPH_HINT_SUFFIX,
     CODEGRAPH_IMPACT_NUDGE,
+    DEFAULT_OFF_SKILLS,
+    DEFAULT_REVIEW_SKILLS,
     DEFAULT_THEME,
     EXISTING_COMMENT_BODY_CAP,
     EXISTING_COMMENT_LIST_CAP,
+    LOCAL_SKILLS,
     POST_INLINE_APPROVE_SUFFIX,
     POST_INLINE_DEDUP_SUFFIX,
     POST_INLINE_FETCH_FAILED_SUFFIX,
@@ -50,6 +53,7 @@ from cc_pr_reviewer import (
     SKILL_FILE_NAME,
     WORKSPACE,
     BuiltPrompt,
+    ConfirmResult,
     InProgressHolder,
     ReviewInProgressError,
     SettingsScreen,
@@ -1680,6 +1684,60 @@ def test_skill_prompt_mentions_every_skill_with_dollar_prefix() -> None:
         )
 
 
+def test_claude_prompt_names_security_reviewer() -> None:
+    """The claude prompt enumerates agents by label; security-reviewer is
+    NOT a toolkit plugin agent — it's delivered as a `.claude/agents/`
+    project subagent at launch — but the router matches it by name the
+    same way. If the label drops out of the enumeration, claude silently
+    skips the security dimension."""
+    assert "Security Reviewer" in REVIEW_PROMPT_CLAUDE
+
+
+def test_skill_prompt_counts_seven_review_skills() -> None:
+    """`_COUNT_WORDS` needs an entry for the full skill count or the
+    prompt degrades to a digit ("7 review skills") — functional but a
+    wording regression this pins down."""
+    assert "seven review skills" in REVIEW_PROMPT_SKILL_BASED
+
+
+def test_local_skills_is_subset_of_review_skills() -> None:
+    """LOCAL_SKILLS marks members of REVIEW_SKILLS that have no upstream
+    toolkit counterpart (sync-script exemption + claude subagent
+    delivery). A LOCAL_SKILLS entry outside REVIEW_SKILLS would never be
+    materialised or prompted — it's a dead registration."""
+    assert set(REVIEW_SKILLS) >= LOCAL_SKILLS
+
+
+def test_security_reviewer_is_opt_in_by_default() -> None:
+    """security-reviewer must NOT run unless explicitly checked in the
+    confirm modal: it ships in DEFAULT_OFF_SKILLS, so the checkbox seeds
+    unchecked and the default selection excludes it. If it fell out of
+    DEFAULT_OFF_SKILLS, every routine review would silently pay for a
+    security pass nobody asked for."""
+    assert "security-reviewer" in DEFAULT_OFF_SKILLS
+    assert "security-reviewer" not in DEFAULT_REVIEW_SKILLS
+
+
+def test_default_review_skills_partitions_review_skills() -> None:
+    """DEFAULT_REVIEW_SKILLS must be exactly REVIEW_SKILLS minus the
+    opt-in DEFAULT_OFF_SKILLS, in canonical order — it seeds the
+    ConfirmScreen checkboxes and the `selected_agents` defaults, so a
+    drifted derivation would desync the modal from the launch payload."""
+    assert set(REVIEW_SKILLS) >= DEFAULT_OFF_SKILLS
+    expected = tuple(n for n in REVIEW_SKILLS if n not in DEFAULT_OFF_SKILLS)
+    assert expected == DEFAULT_REVIEW_SKILLS
+
+
+def test_confirm_result_default_selection_excludes_opt_in_skills() -> None:
+    """A ConfirmResult built without an explicit `selected_agents` (any
+    future call path that skips the modal) must inherit the opt-in
+    exclusion — otherwise the default-off contract only holds for
+    launches that went through the checkboxes."""
+    result = ConfirmResult(post_inline=False)
+    assert set(result.selected_agents) == set(DEFAULT_REVIEW_SKILLS)
+    assert not set(result.selected_agents) & DEFAULT_OFF_SKILLS
+
+
 def test_skill_prompt_does_not_name_pr_review_toolkit() -> None:
     """The PR Review Toolkit is a Claude-plugin concept. Codex and gemini
     have no plugin marketplace; they auto-discover skills under
@@ -1831,7 +1889,7 @@ def test_cleanup_preserves_preexisting_agents_dir(tmp_path: Any) -> None:
     manifest = _materialise_skills(tmp_path)
     _cleanup_skills(manifest)
 
-    # Our six skill dirs are gone; user's stays.
+    # Our skill dirs are gone; user's stays.
     for name in REVIEW_SKILLS:
         assert not (tmp_path / ".agents" / "skills" / name).exists()
     assert user_skill.is_file()
@@ -1851,6 +1909,72 @@ def test_materialise_raises_clear_error_when_copy_fails(
     monkeypatch.setattr(_mod.shutil, "copy2", fail_copy)
     with pytest.raises(RuntimeError, match=r"failed to materialise skill '.*'"):
         _materialise_skills(tmp_path)
+
+
+# --- claude-agents layout (LOCAL_SKILLS delivery for claude) ---------------
+
+
+def test_materialise_claude_layout_writes_flat_agent_files(tmp_path: Any) -> None:
+    """The claude launch path delivers LOCAL_SKILLS as project subagents
+    at `<workspace>/.claude/agents/<name>.md` (flat file, not the
+    `.agents/skills/<name>/SKILL.md` dir layout). Same bundled bytes —
+    the SKILL.md frontmatter doubles as Claude subagent frontmatter."""
+    selected = tuple(sorted(LOCAL_SKILLS))
+    _materialise_skills(tmp_path, selected=selected, layout="claude-agents")
+    for name in selected:
+        dst = tmp_path / ".claude" / "agents" / f"{name}.md"
+        assert dst.is_file(), f"materialise didn't write {dst.relative_to(tmp_path)}"
+        assert dst.read_bytes() == (_skills_dir() / name / SKILL_FILE_NAME).read_bytes()
+    # The codex/gemini tree must be untouched by the claude layout.
+    assert not (tmp_path / ".agents").exists()
+
+
+def test_claude_layout_cleanup_round_trips(tmp_path: Any) -> None:
+    """A clean materialise/cleanup cycle in the claude layout must leave
+    the workspace untouched — `.claude/` removed when we created it."""
+    manifest = _materialise_skills(tmp_path, selected=tuple(LOCAL_SKILLS), layout="claude-agents")
+    _cleanup_skills(manifest)
+    assert not (tmp_path / ".claude").exists(), (
+        "cleanup left `.claude/` behind — should be removed if we created it empty"
+    )
+
+
+def test_claude_layout_cleanup_restores_colliding_agent_file(tmp_path: Any) -> None:
+    """If the reviewed PR ships its own `.claude/agents/<our-name>.md`
+    (project subagents are commonly committed), materialise overwrites
+    it and cleanup must restore the original bytes exactly — same
+    snapshot/restore contract as the skills layout."""
+    name = next(iter(LOCAL_SKILLS))
+    agent_md = tmp_path / ".claude" / "agents" / f"{name}.md"
+    agent_md.parent.mkdir(parents=True)
+    original_bytes = b"---\nname: user-own-version\n---\n\nOriginal \x80 prose.\n"
+    agent_md.write_bytes(original_bytes)
+
+    manifest = _materialise_skills(tmp_path, selected=(name,), layout="claude-agents")
+    assert agent_md.read_bytes() != original_bytes
+    _cleanup_skills(manifest)
+
+    assert agent_md.read_bytes() == original_bytes
+
+
+def test_claude_layout_cleanup_preserves_preexisting_claude_dir(tmp_path: Any) -> None:
+    """Many repos commit `.claude/` content (settings.json, their own
+    agents). Cleanup must remove only the files we wrote — pre-existing
+    siblings and the `.claude/` tree itself stay intact."""
+    settings = tmp_path / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text("{}", encoding="utf-8")
+    user_agent = tmp_path / ".claude" / "agents" / "user-own-agent.md"
+    user_agent.parent.mkdir(parents=True)
+    user_agent.write_text("---\nname: user-own-agent\n---\n", encoding="utf-8")
+
+    manifest = _materialise_skills(tmp_path, selected=tuple(LOCAL_SKILLS), layout="claude-agents")
+    _cleanup_skills(manifest)
+
+    for name in LOCAL_SKILLS:
+        assert not (tmp_path / ".claude" / "agents" / f"{name}.md").exists()
+    assert user_agent.is_file()
+    assert settings.is_file()
 
 
 # --- check_prereqs malformed-skill detection -------------------------------
