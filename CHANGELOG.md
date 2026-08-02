@@ -4,6 +4,33 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Choose the model the review runs on.** Previously the reviewing agent
+  always ran on whatever model the coding-agent CLI had configured as its own
+  default, with no way to say "Opus for this heavy PR, Sonnet for a doc typo"
+  from cc-pr-reviewer. Each CLI now gets its own persisted model override in
+  the Settings modal (`,`), and the confirm modal pre-fills the active CLI's
+  value so it can be changed for a single launch. Overrides are per-CLI
+  because model names aren't portable between backends; cycling the CLI with
+  `Ctrl+L` re-seeds the field rather than carrying a half-typed name across.
+  All three CLIs take the same `--model <value>` flag, inserted just before
+  the prompt. **Leaving the field blank — the default — emits no flag at all,
+  so nothing changes for anyone who ignores this.**
+- The chosen model is recorded in the `review_telemetry` table alongside the
+  existing per-launch cost/outcome columns, so model, prompt size, duration
+  and exit code can be compared from the local DB. Workspace DBs created
+  before this release pick the column up via an additive migration on open;
+  their existing rows read back blank.
+
+### Fixed
+- **The Settings and confirm modals no longer overflow a short terminal.**
+  Both were plain `Vertical` containers, which don't scroll — on an 80x24 the
+  confirm modal's title was pushed off the top of the screen and the Settings
+  modal's save hint off the bottom, with no key that could bring them back.
+  Both scroll now.
+
 ## [0.19.0] — 2026-06-24
 
 ### Fixed

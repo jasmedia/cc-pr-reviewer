@@ -61,6 +61,7 @@ from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.theme import Theme
 from textual.timer import Timer
+from textual.widget import Widget
 from textual.widgets import (
     Checkbox,
     DataTable,
@@ -411,12 +412,24 @@ def _cleanup_skills(manifest: _MaterialisedSkills) -> None:
         _rmdir_if_empty(manifest.workspace / ".agents")
 
 
-def _build_cli_command(cli: CliChoice, prompt_text: str) -> list[str]:
+def _build_cli_command(cli: CliChoice, prompt_text: str, model: str = "") -> list[str]:
     """Build the subprocess argv for handing control to the selected CLI.
 
-    Flag picks minimise manual permission prompts so the review runs
-    end-to-end with little intervention, while keeping edits scoped to the
-    cloned PR workspace and no broader host access:
+    `model` selects the model the reviewing agent runs on. All three CLIs
+    happen to spell it the same way (`--model <value>`; codex and gemini
+    also accept `-m`), so one uniform insertion covers every backend — but
+    it's spliced inside each branch rather than appended once, to preserve
+    this function's invariant of being the *only* place that knows any
+    CLI's flag surface. Empty (the default) emits no flag at all, so the
+    argv is byte-identical to the pre-model behaviour and the CLI's own
+    configured default model wins. The value is never validated against a
+    known-model list: upstream model names churn constantly, and letting
+    the CLI reject a bad name (non-zero exit, which the launcher already
+    declines to record as a review) beats a hardcoded list going stale.
+
+    The remaining flag picks minimise manual permission prompts so the
+    review runs end-to-end with little intervention, while keeping edits
+    scoped to the cloned PR workspace and no broader host access:
 
     * `claude --permission-mode auto`. Auto mode lets Claude Code's
       classifier auto-approve the actions a review needs — edits plus the
@@ -438,8 +451,11 @@ def _build_cli_command(cli: CliChoice, prompt_text: str) -> list[str]:
     code path is CLI-agnostic, so flag-name churn in either upstream CLI
     is a one-function change.
     """
+    # Every branch places these immediately before the positional prompt,
+    # so the prompt stays the final argv element on all three CLIs.
+    model_args = ["--model", model] if model else []
     if cli == "claude":
-        return ["claude", "--permission-mode", "auto", prompt_text]
+        return ["claude", "--permission-mode", "auto", *model_args, prompt_text]
     if cli == "codex":
         # `-c sandbox_workspace_write.network_access=true` keeps the
         # filesystem sandbox (writes scoped to the workspace) but
@@ -455,10 +471,11 @@ def _build_cli_command(cli: CliChoice, prompt_text: str) -> list[str]:
             "workspace-write",
             "-c",
             "sandbox_workspace_write.network_access=true",
+            *model_args,
             prompt_text,
         ]
     if cli == "gemini":
-        return ["gemini", "--approval-mode", "auto_edit", prompt_text]
+        return ["gemini", "--approval-mode", "auto_edit", *model_args, prompt_text]
     # Defensive: CliChoice is a Literal of exactly those three, so this
     # is reachable only if someone widens the type without updating this
     # switch. Make that failure loud rather than silently emitting a
@@ -763,6 +780,29 @@ _CLI_DISPLAY: dict[CliChoice, str] = {
     "codex": "Codex",
     "gemini": "Gemini",
 }
+
+# Placeholder prose for the model Inputs (Settings + Confirm modals). These
+# are hints only — nothing validates against them — because upstream model
+# names churn far faster than this project releases, and a hardcoded
+# allow-list would start rejecting valid models the week after it shipped.
+_MODEL_PLACEHOLDER: dict[CliChoice, str] = {
+    "claude": "e.g. opus, sonnet, haiku — blank = CLI default",
+    "codex": "e.g. gpt-5-codex — blank = CLI default",
+    "gemini": "e.g. gemini-2.5-pro — blank = CLI default",
+}
+
+
+def _model_setting_key(cli: CliChoice) -> str:
+    """`settings` key holding the persisted model override for `cli`.
+
+    Model names are per-CLI (`opus` means nothing to codex), so a single
+    global `model` setting would silently become wrong the moment the user
+    cycles CLI with `c`. Keying by CLI keeps each preference independent;
+    routing every read/write through this one helper means a fourth CLI
+    stays a single `_CLI_CYCLE` edit rather than three new literal keys.
+    """
+    return f"model_{cli}"
+
 
 # Per-CLI remediation prose printed when `.codegraph/` and the binary are
 # both present but the CLI's MCP config doesn't reference codegraph.
@@ -2057,15 +2097,16 @@ def _format_launch_banner_parts(
     my_login: str | None,
     selected_agents: tuple[str, ...],
     extra_prompt: str,
+    model: str = "",
 ) -> list[str]:
     """Assemble the human-readable launch-banner fragments (pure).
 
     Mirrors the banner the user sees just before the CLI takes over: the
     post-inline mode (with rereview / detection-unavailable annotations),
     the existing-comments summary (or fetch-failed marker), the agent
-    subset when it diverges from the default, and a capped, repr'd preview
-    of any extra prompt. No I/O — the caller joins these into the
-    `Launching …` line and prints it.
+    subset when it diverges from the default, the model override when one
+    is set, and a capped, repr'd preview of any extra prompt. No I/O — the
+    caller joins these into the `Launching …` line and prints it.
     """
     if not fetch_ok:
         existing_desc = "existing comments: fetch failed"
@@ -2094,6 +2135,12 @@ def _format_launch_banner_parts(
             parts.append("agents: " + ", ".join(REVIEW_SKILL_LABELS[n] for n in selected_agents))
         else:
             parts.append(f"agents: {len(selected_agents)}/{len(REVIEW_SKILLS)}")
+    # Only when overridden. A blank model means we emit no `--model` flag at
+    # all, and we genuinely don't know what the CLI will pick — printing
+    # "model: default" would be both noise on every launch and a claim we
+    # can't back up.
+    if model:
+        parts.append(f"model: {model}")
     if extra_prompt:
         # `!r` keeps newlines/control chars visible so a misclick paste
         # (e.g. a secret) is spottable before the CLI consumes it. The
@@ -2538,8 +2585,9 @@ def _open_review_db() -> sqlite3.Connection:
     # thesis can be checked against data instead of guessed at.
     #
     # It captures ONLY what we control on this side of the subprocess
-    # boundary: the prompt we built (size + composition) and the launch
-    # outcome (exit code + wall-clock). It deliberately does NOT — and
+    # boundary: the prompt we built (size + composition), the model we asked
+    # for, and the launch outcome (exit code + wall-clock). It deliberately
+    # does NOT — and
     # cannot from here — record the agent's in-session tool calls (grep vs
     # `codegraph_*`) or its real token usage; those live in the CLI's own
     # transcript, which we never read. Data is local to this workspace DB
@@ -2558,10 +2606,27 @@ def _open_review_db() -> sqlite3.Connection:
             rereview INTEGER NOT NULL,
             approx_prompt_tokens INTEGER NOT NULL,
             duration_seconds REAL NOT NULL,
-            exit_code INTEGER NOT NULL
+            exit_code INTEGER NOT NULL,
+            model TEXT NOT NULL DEFAULT ''
         )
         """
     )
+    # Additive column migrations for `review_telemetry`. `CREATE TABLE IF NOT
+    # EXISTS` above is a no-op against an existing DB, so a column added to
+    # that statement reaches fresh installs only — every workspace DB created
+    # before the column shipped would keep failing the INSERT. Guarding on
+    # `PRAGMA table_info` keeps this idempotent across restarts (SQLite has no
+    # `ADD COLUMN IF NOT EXISTS`). Any future telemetry column follows the
+    # same two-step: add it to the CREATE above AND list it here.
+    #
+    # `ADD COLUMN` under `NOT NULL` is legal because the DEFAULT is a
+    # constant, which SQLite backfills into existing rows. Those rows read
+    # back as '' — honestly "we didn't record a model", indistinguishable
+    # from "no override was set", which is fine: neither told the CLI what
+    # to run.
+    telemetry_cols = {row["name"] for row in conn.execute("PRAGMA table_info(review_telemetry)")}
+    if "model" not in telemetry_cols:
+        conn.execute("ALTER TABLE review_telemetry ADD COLUMN model TEXT NOT NULL DEFAULT ''")
     conn.commit()
     return conn
 
@@ -2653,6 +2718,7 @@ def _record_launch_telemetry(
     approx_prompt_tokens: int,
     duration_seconds: float,
     exit_code: int,
+    model: str = "",
 ) -> None:
     """Append one best-effort row to `review_telemetry` (schema in `_open_review_db`).
 
@@ -2673,8 +2739,8 @@ def _record_launch_telemetry(
             INSERT INTO review_telemetry (
                 recorded_at, pr_key, cli, codegraph_tools, affected_paths,
                 existing_in_prompt, post_inline, rereview, approx_prompt_tokens,
-                duration_seconds, exit_code
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                duration_seconds, exit_code, model
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 now,
@@ -2688,6 +2754,7 @@ def _record_launch_telemetry(
                 approx_prompt_tokens,
                 duration_seconds,
                 exit_code,
+                model,
             ),
         )
         conn.commit()
@@ -3184,11 +3251,20 @@ class ConfirmResult:
     `PRReviewer.cli` at modal-open time and may be cycled inside the modal
     via Ctrl+L. The override is one-shot — the launcher honours it but
     does NOT write back to the global setting.
+
+    `model` follows the same one-shot contract: it's seeded from the
+    persisted per-CLI model but the launcher uses whatever literal text
+    ends up here without writing it back. It's the *answer*, not a delta —
+    there's no further merging downstream, so an empty string means "no
+    `--model` flag, let the CLI pick" even when a persisted value exists
+    (the user cleared the field deliberately). Stripped on construction for
+    the same reason as `extra_prompt`: whitespace must never reach argv.
     """
 
     post_inline: bool
     extra_prompt: str = ""
     cli: CliChoice = DEFAULT_CLI
+    model: str = ""
     # Subset of REVIEW_SKILLS the reviewer wants to run for this launch.
     # Default = all six; the ConfirmScreen lets the user uncheck individual
     # agents (e.g. drop code-reviewer + pr-test-analyzer for a doc-only PR).
@@ -3206,6 +3282,7 @@ class ConfirmResult:
         # to enforce the strip invariant on the type itself rather than at
         # each call site.
         object.__setattr__(self, "extra_prompt", self.extra_prompt.strip())
+        object.__setattr__(self, "model", self.model.strip())
 
 
 class ExtraPromptTextArea(TextArea):
@@ -3275,17 +3352,33 @@ class ConfirmScreen(ModalScreen[ConfirmResult | None]):
         Binding("ctrl+a", "toggle_all_agents", "Toggle all agents"),
     ]
 
-    def __init__(self, prompt: str, default_cli: CliChoice = DEFAULT_CLI):
+    def __init__(
+        self,
+        prompt: str,
+        default_cli: CliChoice = DEFAULT_CLI,
+        *,
+        models: dict[CliChoice, str],
+    ):
         super().__init__()
         self.prompt = prompt
         self.post_inline = True
         self.cli: CliChoice = default_cli
+        # The whole per-CLI map, not just the active CLI's value: `Ctrl+L`
+        # can switch backends while the modal is open, and the model Input
+        # has to reseed from the incoming CLI's persisted value. Required
+        # rather than defaulted to `{}` — a caller that forgot to pass it
+        # would silently stop honouring every persisted model override, with
+        # nothing to notice until someone checked the launch banner. Copied
+        # so caller-side edits between mount and confirm can't retroactively
+        # change what the Input was seeded with.
+        self.models: dict[CliChoice, str] = dict(models)
 
     def compose(self) -> ComposeResult:
         hint = (
             "[b]Enter[/] / [b]Ctrl+Y[/] confirm • [b]Esc[/] / [b]Ctrl+N[/] cancel "
             "• [b]Ctrl+T[/] post-inline • [b]Ctrl+L[/] cycle CLI "
             "• [b]Tab[/]/[b]Space[/] agents • [b]Ctrl+A[/] (on agents) toggle all "
+            "• [b]Tab[/] to the model field to override it "
             "• [b]Shift+Enter[/] newline"
         )
         # Agent checkboxes: one per REVIEW_SKILLS entry, all checked by
@@ -3304,12 +3397,18 @@ class ConfirmScreen(ModalScreen[ConfirmResult | None]):
             )
             for name in REVIEW_SKILLS
         ]
-        yield Vertical(
+        yield VerticalScroll(
             Label(self.prompt, id="confirm-title", markup=False),
             Label(self._checkbox_text(), id="confirm-checkbox", markup=False),
             Label("Review agents:", id="confirm-agents-label"),
             *agent_checkboxes,
             Label(self._cli_text(), id="confirm-cli", markup=False),
+            Label("Model (blank = CLI default):", id="confirm-model-label"),
+            Input(
+                value=self.models.get(self.cli, ""),
+                placeholder=_MODEL_PLACEHOLDER[self.cli],
+                id="confirm-model",
+            ),
             Label("Extra prompt (optional):", id="confirm-extra-label"),
             ExtraPromptTextArea(id="confirm-extra"),
             Label(hint, id="confirm-hint"),
@@ -3364,6 +3463,7 @@ class ConfirmScreen(ModalScreen[ConfirmResult | None]):
                 post_inline=self.post_inline,
                 extra_prompt=text,
                 cli=self.cli,
+                model=self.query_one("#confirm-model", Input).value,
                 selected_agents=selected,
             )
         )
@@ -3378,6 +3478,16 @@ class ConfirmScreen(ModalScreen[ConfirmResult | None]):
     def action_cycle_cli(self) -> None:
         self.cli = _CLI_CYCLE[self.cli]
         self.query_one("#confirm-cli", Label).update(self._cli_text())
+        # Reseed the model field from the incoming CLI, discarding whatever
+        # was there. Model names aren't portable between backends, so
+        # carrying a half-typed `opus` across into a Codex launch would
+        # produce an argv the CLI rejects; showing that CLI's own persisted
+        # value is both the safe default and what the user almost certainly
+        # means by switching. The placeholder moves with it so the example
+        # names stay relevant.
+        model_input = self.query_one("#confirm-model", Input)
+        model_input.value = self.models.get(self.cli, "")
+        model_input.placeholder = _MODEL_PLACEHOLDER[self.cli]
 
     def action_toggle_all_agents(self) -> None:
         # If any checkbox is off, turn everything on (the "I changed my
@@ -3579,6 +3689,13 @@ class SettingsResult:
     preferences that used to be footer cycle-keys (`c`/`x`/`a`) and now live
     here as proper widgets. `theme` is the persisted color theme (one of
     `_THEME_OPTIONS`).
+
+    `models` carries the per-CLI model override as a tuple of
+    `(cli, model)` pairs rather than a dict: `frozen=True` only blocks
+    attribute *rebinding*, so a dict field would still be mutable in place
+    and quietly break the "a result is an immutable snapshot" contract the
+    other fields keep. Consumers do `dict(result.models)`. Each value is
+    stripped; empty means "let that CLI pick its own default".
     """
 
     cli: CliChoice
@@ -3586,6 +3703,7 @@ class SettingsResult:
     refresh_interval: int
     slack_webhook_url: str
     theme: str
+    models: tuple[tuple[CliChoice, str], ...] = ()
 
 
 # Auto-refresh options for the Settings dropdown: every distinct interval the
@@ -3600,10 +3718,11 @@ _REFRESH_OPTIONS: tuple[int, ...] = tuple(
 class SettingsScreen(ModalScreen[SettingsResult | None]):
     """Edit persisted app settings.
 
-    Hosts the persisted preferences — color theme, review CLI, CodeGraph
-    assist, auto-refresh interval, and the Slack incoming-webhook URL used to
-    announce completed reviews to a shared channel. Dismisses with a
-    SettingsResult on save (Enter) or None on cancel (Esc).
+    Hosts the persisted preferences — color theme, review CLI, per-CLI model
+    override, CodeGraph assist, auto-refresh interval, and the Slack
+    incoming-webhook URL used to announce completed reviews to a shared
+    channel. Dismisses with a SettingsResult on save (Enter) or None on
+    cancel (Esc).
     """
 
     AUTO_FOCUS = "#settings-theme"
@@ -3624,9 +3743,13 @@ class SettingsScreen(ModalScreen[SettingsResult | None]):
         refresh_interval: int,
         slack_webhook_url: str,
         theme: str,
+        models: dict[CliChoice, str],
     ):
         super().__init__()
         self.cli = cli
+        # Copied so edits to the caller's dict between mount and save can't
+        # retroactively change what the Inputs were seeded with.
+        self.models = dict(models)
         self.codegraph_assist = codegraph_assist
         # Snap to a legal dropdown option: the rest of the app tolerates
         # hand-edited / legacy intervals (`parse_refresh_interval` only floors
@@ -3640,8 +3763,27 @@ class SettingsScreen(ModalScreen[SettingsResult | None]):
         self.slack_webhook_url = slack_webhook_url
         self.theme_choice = theme
 
+    @staticmethod
+    def _model_input_id(cli: CliChoice) -> str:
+        return f"settings-model-{cli}"
+
     def compose(self) -> ComposeResult:
-        yield Vertical(
+        # One labelled Input per CLI, generated from `_CLI_CYCLE` so the
+        # dict stays the single source of truth (a fourth CLI needs no edit
+        # here). A per-CLI row rather than one field tracking the CLI Select
+        # above: model names aren't portable between backends, so all three
+        # want to be set once and remembered independently.
+        model_rows: list[Widget] = []
+        for c in _CLI_CYCLE:
+            model_rows.append(Label(f"{_CLI_DISPLAY[c]} model:", classes="settings-model-label"))
+            model_rows.append(
+                Input(
+                    value=self.models.get(c, ""),
+                    placeholder=_MODEL_PLACEHOLDER[c],
+                    id=self._model_input_id(c),
+                )
+            )
+        yield VerticalScroll(
             Label("Settings", id="settings-title"),
             Label("Theme:", id="settings-theme-label"),
             Select(
@@ -3657,6 +3799,7 @@ class SettingsScreen(ModalScreen[SettingsResult | None]):
                 allow_blank=False,
                 id="settings-cli",
             ),
+            *model_rows,
             Checkbox(
                 "CodeGraph assist (prompt to index missing workspaces)",
                 value=self.codegraph_assist,
@@ -3690,6 +3833,10 @@ class SettingsScreen(ModalScreen[SettingsResult | None]):
                 refresh_interval=self.query_one("#settings-refresh", Select).value,
                 slack_webhook_url=self.query_one("#settings-slack", Input).value.strip(),
                 theme=self.query_one("#settings-theme", Select).value,
+                models=tuple(
+                    (c, self.query_one(f"#{self._model_input_id(c)}", Input).value.strip())
+                    for c in _CLI_CYCLE
+                ),
             )
         )
 
@@ -3841,6 +3988,21 @@ class PRReviewer(App):
         background: $panel;
         height: auto;
     }
+    /* Both of these outgrew an 80x24 terminal once the model fields landed
+       (Settings: six new widgets; Confirm: a label + Input on top of the
+       six agent checkboxes it already carried). A plain `Vertical` doesn't
+       scroll — it just overflows, pushing the save hint and the Confirm
+       modal's whole title off-screen with no way to reach them. Both are
+       `VerticalScroll` containers now, so capping their height turns that
+       overflow into a scrollbar. The `height: auto` above still wins
+       whenever the content genuinely fits, so roomy terminals see no
+       change. */
+    #settings-container, #confirm-container {
+        max-height: 100%;
+    }
+    .settings-model-label {
+        color: $text-muted;
+    }
     #inprogress-container {
         border: round $warning;
     }
@@ -3869,6 +4031,10 @@ class PRReviewer(App):
         color: $text-muted;
     }
     #confirm-agents-label {
+        margin-top: 1;
+        color: $text-muted;
+    }
+    #confirm-model-label {
         margin-top: 1;
         color: $text-muted;
     }
@@ -4009,6 +4175,14 @@ class PRReviewer(App):
                     self._cli_fallback_from = persisted
         else:
             self.cli = persisted
+        # Persisted per-CLI model override. Empty means "let the CLI pick",
+        # which is the pre-model behaviour and stays the default. Loaded for
+        # every CLI (not just the active one) because the Confirm modal's
+        # `Ctrl+L` can switch backends mid-modal and needs the incoming
+        # CLI's value to reseed its Input.
+        self.models: dict[CliChoice, str] = {
+            c: _get_setting(self.review_db, _model_setting_key(c), "") for c in _CLI_CYCLE
+        }
         # Persisted color theme. Validated against `_THEME_OPTIONS` so a
         # hand-edited or upgrade-removed value falls back to `DEFAULT_THEME`
         # rather than raising when applied. `App.theme` is a reactive that
@@ -4535,11 +4709,14 @@ class PRReviewer(App):
                         result.post_inline,
                         result.extra_prompt,
                         cli=result.cli,
+                        model=result.model,
                         selected_agents=result.selected_agents,
                         expected_holder=expected_holder,
                     )
 
-            self.push_screen(ConfirmScreen(prompt, default_cli=self.cli), _proceed)
+            self.push_screen(
+                ConfirmScreen(prompt, default_cli=self.cli, models=self.models), _proceed
+            )
 
         # Use the cached snapshot from the periodic worker-thread poll
         # rather than a synchronous re-poll. Two reasons:
@@ -4876,6 +5053,9 @@ class PRReviewer(App):
                         "refresh_interval": str(result.refresh_interval),
                         "slack_webhook_url": result.slack_webhook_url,
                         "theme": result.theme,
+                        # Folded into the SAME batch rather than a follow-up
+                        # write, so the modal's save stays all-or-nothing.
+                        **{_model_setting_key(c): m for c, m in result.models},
                     },
                 )
             except sqlite3.Error as e:
@@ -4888,6 +5068,7 @@ class PRReviewer(App):
             self.codegraph_assist = result.codegraph_assist
             self._auto_refresh_secs = result.refresh_interval
             self.slack_webhook_url = result.slack_webhook_url
+            self.models = dict(result.models)
             # Assigning the App.theme reactive re-themes the running app live
             # (no restart). `result.theme` is constrained to `_THEME_OPTIONS`
             # by the Select, so it's always a valid registered theme.
@@ -4908,6 +5089,7 @@ class PRReviewer(App):
                 codegraph_assist=self.codegraph_assist,
                 refresh_interval=self._auto_refresh_secs,
                 slack_webhook_url=self.slack_webhook_url,
+                models=self.models,
                 # Coerce through `_resolve_theme` so a non-curated theme set
                 # live via the command palette (`Ctrl+P`) maps to a value the
                 # `Select` actually contains — otherwise its initial selection
@@ -5038,6 +5220,7 @@ class PRReviewer(App):
         post_inline: bool,
         extra_prompt: str,
         cli: CliChoice = DEFAULT_CLI,
+        model: str = "",
         selected_agents: tuple[str, ...] = REVIEW_SKILLS,
         expected_holder: InProgressHolder | None = None,
     ) -> None:
@@ -5203,9 +5386,9 @@ class PRReviewer(App):
                     selected_agents=selected_agents,
                 )
 
-                cmd = _build_cli_command(cli, built.text)
+                cmd = _build_cli_command(cli, built.text, model)
                 parts = _format_launch_banner_parts(
-                    post_inline, built, fetch_ok, my_login, selected_agents, extra_prompt
+                    post_inline, built, fetch_ok, my_login, selected_agents, extra_prompt, model
                 )
                 print(
                     f"\nLaunching {_CLI_DISPLAY[cli]} ({', '.join(parts)})"
@@ -5233,6 +5416,7 @@ class PRReviewer(App):
                     approx_prompt_tokens=built.approx_tokens,
                     duration_seconds=launch_duration,
                     exit_code=rc,
+                    model=model,
                 )
 
                 # Only count this as a review if the CLI exited cleanly.

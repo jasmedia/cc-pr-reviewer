@@ -33,6 +33,12 @@ for the duration of each review.
   the global default (`claude → codex → gemini → claude`, persisted
   across sessions), or `Ctrl+L` inside the confirm modal to override
   for a single launch. Default is Claude Code.
+- **Pick the model the review runs on.** Each CLI gets its own persisted
+  model override in the Settings modal (`,`) — model names aren't portable
+  between backends, so `opus` for Claude and `gpt-5-codex` for Codex are
+  remembered independently. The confirm modal pre-fills the active CLI's
+  value and lets you change it for a single launch. Leave it blank (the
+  default) and the CLI picks its own model, exactly as before.
 
 ## How you use it
 
@@ -147,10 +153,20 @@ Inside the confirmation modal: `Enter` / `Ctrl+Y` to proceed, `Esc` /
 `Ctrl+N` to cancel, `Ctrl+T` to toggle post-inline (instruct the CLI to
 publish the findings as inline PR review comments via `gh api`, grouped
 under one review), `Ctrl+L` to cycle the CLI for **this launch only**
-(without changing the global default). The post-inline toggle defaults
-to on each time the modal opens; the CLI defaults to whatever the
-global `c` setting currently is. The chosen values are printed before
-the CLI launches.
+(without changing the global default), and `Tab` onto the **Model** field
+to override the model for this launch only. The post-inline toggle
+defaults to on each time the modal opens; the CLI defaults to whatever
+the global `c` setting currently is; the model field is pre-filled with
+that CLI's saved override and blank means "let the CLI pick". Cycling the
+CLI with `Ctrl+L` re-seeds the model field from the incoming CLI, so a
+half-typed name never carries across to a backend that wouldn't
+understand it. The chosen values are printed before the CLI launches.
+
+Inside the settings modal (`,`): the theme, the default review CLI, a
+**per-CLI model override**, CodeGraph assist, the auto-refresh interval,
+and the Slack webhook URL. `Enter` saves all of them in one transaction,
+`Esc` cancels. Everything here persists in
+`$GH_PR_WORKSPACE/.review_state.db`.
 
 Inside the filter modal: arrow keys to move, `Enter` to apply the
 highlighted repo (or pick **(any repo — clear filter)** to remove the
@@ -170,7 +186,7 @@ TUI suspends itself and runs, in order:
 gh repo clone <owner>/<repo>                      # only if not already cloned
 git fetch --all --prune                           # otherwise
 gh pr checkout <N> --force
-<selected-cli> <auto-approve flags> "<review prompt>"
+<selected-cli> <auto-approve flags> [--model <model>] "<review prompt>"
 ```
 
 The exact CLI invocation depends on which backend is active:
@@ -180,6 +196,11 @@ The exact CLI invocation depends on which backend is active:
 | Claude | `claude --permission-mode auto "<prompt>"`                                                                             |
 | Codex  | `codex --ask-for-approval never --sandbox workspace-write -c sandbox_workspace_write.network_access=true "<prompt>"`   |
 | Gemini | `gemini --approval-mode auto_edit "<prompt>"`                                                                          |
+
+When a model override is set, `--model <model>` is inserted just before
+the prompt (all three CLIs spell the flag the same way). With no override
+— the default — no flag is emitted at all and the invocation is exactly
+as shown above.
 
 All three are launched in modes that minimise manual permission prompts
 while keeping edits scoped to the cloned PR workspace. Claude's `auto`

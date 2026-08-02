@@ -23,6 +23,8 @@ import pytest
 import cc_pr_reviewer as _mod
 from cc_pr_reviewer import (
     _APP_HOSTNAME,
+    _CLI_CYCLE,
+    _MODEL_PLACEHOLDER,
     _REFRESH_CYCLE,
     _REFRESH_OPTIONS,
     _SKILL_COVERAGE,
@@ -50,7 +52,10 @@ from cc_pr_reviewer import (
     SKILL_FILE_NAME,
     WORKSPACE,
     BuiltPrompt,
+    ConfirmResult,
+    ConfirmScreen,
     InProgressHolder,
+    PRReviewer,
     ReviewInProgressError,
     SettingsScreen,
     _approx_tokens,
@@ -71,6 +76,7 @@ from cc_pr_reviewer import (
     _load_in_progress,
     _load_review_state,
     _materialise_skills,
+    _model_setting_key,
     _open_review_db,
     _parse_semver,
     _pid_alive,
@@ -1923,6 +1929,40 @@ def test_build_cli_command_gemini_uses_auto_edit_approval_mode() -> None:
     assert cmd == ["gemini", "--approval-mode", "auto_edit", "prompt body"]
 
 
+@pytest.mark.parametrize("cli", list(_CLI_CYCLE))
+def test_build_cli_command_blank_model_emits_no_flag(cli: str) -> None:
+    """The back-compat guarantee: an unset model must produce byte-identical
+    argv to the pre-model behaviour, so users who never touch the setting
+    see no change at all. Asserted as "no `--model` anywhere" rather than
+    against a literal list so the three explicit per-CLI argv tests above
+    stay the single place a flag rename has to be caught."""
+    assert "--model" not in _build_cli_command(cli, "prompt body")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("cli", list(_CLI_CYCLE))
+def test_build_cli_command_model_precedes_positional_prompt(cli: str) -> None:
+    """All three CLIs take the prompt positionally, so `--model <value>` has
+    to land *before* it — appended after, the flag would be parsed as part
+    of the prompt (or rejected outright). Also pins "exactly once": a
+    duplicated flag is a real risk when splicing into three separate
+    branches, and CLIs differ on whether they'd error or silently take the
+    last one."""
+    cmd = _build_cli_command(cli, "prompt body", "some-model")  # type: ignore[arg-type]
+    assert cmd.count("--model") == 1
+    assert cmd[-3:] == ["--model", "some-model", "prompt body"]
+
+
+@pytest.mark.parametrize("cli", list(_CLI_CYCLE))
+def test_build_cli_command_model_keeps_auto_approval_flags(cli: str) -> None:
+    """Splicing the model in must not displace any auto-approval flag —
+    otherwise a model override would silently re-introduce the mid-review
+    permission prompts those flags exist to suppress."""
+    base = _build_cli_command(cli, "prompt body")  # type: ignore[arg-type]
+    with_model = _build_cli_command(cli, "prompt body", "some-model")  # type: ignore[arg-type]
+    # Everything except the injected pair, in order, is unchanged.
+    assert [a for a in with_model if a not in ("--model", "some-model")] == base
+
+
 def test_build_cli_command_rejects_unknown_cli() -> None:
     """Defensive: CliChoice is a Literal, so this branch should never run
     in well-typed code. If someone widens the type without updating the
@@ -1984,6 +2024,21 @@ def test_banner_large_subset_uses_count() -> None:
 def test_banner_empty_selection_is_generic_review() -> None:
     parts = _format_launch_banner_parts(False, _built(), True, "me", (), "")
     assert "agents: none (generic review)" in parts
+
+
+def test_banner_omits_model_when_blank() -> None:
+    """No override → no `model:` fragment. A blank model emits no `--model`
+    flag, so we genuinely don't know what the CLI will run; "model: default"
+    would be an unbackable claim on every single launch."""
+    parts = _format_launch_banner_parts(False, _built(), True, "me", REVIEW_SKILLS, "")
+    assert not any(p.startswith("model:") for p in parts)
+
+
+def test_banner_shows_model_when_set() -> None:
+    """An override is exactly the case worth surfacing — it's the only
+    signal the reviewer gets that this launch isn't on the CLI default."""
+    parts = _format_launch_banner_parts(False, _built(), True, "me", REVIEW_SKILLS, "", "opus")
+    assert "model: opus" in parts
 
 
 def test_banner_post_inline_on_plain() -> None:
@@ -2621,6 +2676,50 @@ def test_set_settings_rolls_back_on_error(review_db) -> None:
     assert _get_setting(review_db, "cli") == "claude"
 
 
+# --- per-CLI model override (settings keys + ConfirmResult) ----------------
+
+
+def test_model_setting_keys_are_distinct_per_cli() -> None:
+    """Model names aren't portable between backends, so each CLI needs its
+    own key — a collision would make cycling CLI silently overwrite the
+    previous CLI's model."""
+    keys = [_model_setting_key(c) for c in _CLI_CYCLE]
+    assert len(set(keys)) == len(_CLI_CYCLE)
+
+
+def test_every_cli_has_a_model_placeholder() -> None:
+    """Both modals index `_MODEL_PLACEHOLDER` by CLI unguarded, so a fourth
+    CLI added to `_CLI_CYCLE` without a placeholder would KeyError on
+    modal-open rather than degrading."""
+    assert set(_MODEL_PLACEHOLDER) == set(_CLI_CYCLE)
+
+
+@pytest.mark.parametrize("cli", list(_CLI_CYCLE))
+def test_model_setting_round_trips_and_defaults_empty(review_db, cli: str) -> None:
+    key = _model_setting_key(cli)  # type: ignore[arg-type]
+    # Unset → empty, i.e. "let the CLI pick" (the pre-model behaviour).
+    assert _get_setting(review_db, key, "") == ""
+    _set_settings(review_db, {key: "some-model"})
+    assert _get_setting(review_db, key, "") == "some-model"
+    # Clearing it returns to the CLI default.
+    _set_settings(review_db, {key: ""})
+    assert _get_setting(review_db, key, "") == ""
+
+
+def test_confirm_result_strips_model() -> None:
+    """Same invariant as `extra_prompt`: whitespace must never reach argv.
+    An unstripped `" "` would be truthy, emitting `--model " "` and failing
+    the launch outright."""
+    assert ConfirmResult(post_inline=True, model="  opus  ").model == "opus"
+    assert ConfirmResult(post_inline=True, model="   ").model == ""
+
+
+def test_confirm_result_model_defaults_blank() -> None:
+    """Default construction must mean "no override" so callers that don't
+    know about models can't accidentally pin one."""
+    assert ConfirmResult(post_inline=True).model == ""
+
+
 def _insert_holder(
     conn: sqlite3.Connection,
     pr_key: str,
@@ -2652,6 +2751,7 @@ def test_record_launch_telemetry_inserts_row(review_db) -> None:
         approx_prompt_tokens=842,
         duration_seconds=4.5,
         exit_code=0,
+        model="some-model",
     )
     rows = review_db.execute("SELECT * FROM review_telemetry").fetchall()
     assert len(rows) == 1
@@ -2666,7 +2766,100 @@ def test_record_launch_telemetry_inserts_row(review_db) -> None:
     assert row["approx_prompt_tokens"] == 842
     assert row["duration_seconds"] == 4.5
     assert row["exit_code"] == 0
+    assert row["model"] == "some-model"
     assert row["recorded_at"].endswith("Z")
+
+
+def test_record_launch_telemetry_defaults_model_to_blank(review_db) -> None:
+    """No override → blank, which is the honest record: we emitted no
+    `--model` flag and can't observe what the CLI chose for itself."""
+    _record_launch_telemetry(
+        review_db,
+        pr_key="o/r#8",
+        cli="claude",
+        codegraph_tools=False,
+        affected_paths=0,
+        existing_in_prompt=0,
+        post_inline=False,
+        rereview=False,
+        approx_prompt_tokens=1,
+        duration_seconds=0.1,
+        exit_code=0,
+    )
+    assert review_db.execute("SELECT model FROM review_telemetry").fetchone()["model"] == ""
+
+
+def test_open_review_db_adds_model_column_to_legacy_telemetry(tmp_path, monkeypatch) -> None:
+    """`CREATE TABLE IF NOT EXISTS` is a no-op against an existing DB, so a
+    workspace created before the `model` column shipped would keep failing
+    every telemetry INSERT. Simulate that pre-upgrade file and assert the
+    additive migration backfills the column — and that a second open is a
+    harmless no-op (SQLite has no `ADD COLUMN IF NOT EXISTS`, so re-running
+    an unguarded ALTER would raise)."""
+    db_path = tmp_path / ".review_state.db"
+    monkeypatch.setattr("cc_pr_reviewer.REVIEW_DB_PATH", db_path)
+
+    # Hand-build the pre-migration schema, including a row, so the test also
+    # covers that existing data survives the ALTER.
+    legacy = sqlite3.connect(db_path)
+    legacy.execute(
+        """
+        CREATE TABLE review_telemetry (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            recorded_at TEXT NOT NULL,
+            pr_key TEXT NOT NULL,
+            cli TEXT NOT NULL,
+            codegraph_tools INTEGER NOT NULL,
+            affected_paths INTEGER NOT NULL,
+            existing_in_prompt INTEGER NOT NULL,
+            post_inline INTEGER NOT NULL,
+            rereview INTEGER NOT NULL,
+            approx_prompt_tokens INTEGER NOT NULL,
+            duration_seconds REAL NOT NULL,
+            exit_code INTEGER NOT NULL
+        )
+        """
+    )
+    legacy.execute(
+        "INSERT INTO review_telemetry (recorded_at, pr_key, cli, codegraph_tools, "
+        "affected_paths, existing_in_prompt, post_inline, rereview, "
+        "approx_prompt_tokens, duration_seconds, exit_code) "
+        "VALUES ('2026-01-01T00:00:00Z', 'o/r#1', 'claude', 0, 0, 0, 0, 0, 1, 0.5, 0)"
+    )
+    legacy.commit()
+    legacy.close()
+
+    conn = _open_review_db()
+    try:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(review_telemetry)")}
+        assert "model" in cols
+        # Pre-existing rows are backfilled with the constant DEFAULT.
+        assert conn.execute("SELECT model FROM review_telemetry").fetchone()["model"] == ""
+        # And the migrated schema accepts new writes.
+        _record_launch_telemetry(
+            conn,
+            pr_key="o/r#2",
+            cli="claude",
+            codegraph_tools=False,
+            affected_paths=0,
+            existing_in_prompt=0,
+            post_inline=False,
+            rereview=False,
+            approx_prompt_tokens=1,
+            duration_seconds=0.1,
+            exit_code=0,
+            model="opus",
+        )
+        assert conn.execute("SELECT COUNT(*) c FROM review_telemetry").fetchone()["c"] == 2
+    finally:
+        conn.close()
+
+    # Idempotent: opening again must not re-run the ALTER.
+    again = _open_review_db()
+    try:
+        assert again.execute("SELECT COUNT(*) c FROM review_telemetry").fetchone()["c"] == 2
+    finally:
+        again.close()
 
 
 def test_record_launch_telemetry_records_nonzero_exit(review_db) -> None:
@@ -3270,6 +3463,7 @@ def test_settings_screen_mounts_with_offcycle_refresh(interval: int) -> None:
                     refresh_interval=interval,
                     slack_webhook_url="",
                     theme=DEFAULT_THEME,
+                    models={},
                 )
             )
             await pilot.pause()
@@ -3277,6 +3471,134 @@ def test_settings_screen_mounts_with_offcycle_refresh(interval: int) -> None:
 
     # No exception == the regression is fixed; the snapped value is legal.
     assert asyncio.run(_run()) in _REFRESH_OPTIONS
+
+
+@pytest.mark.parametrize("size", [(80, 24), (100, 32), (120, 50)])
+@pytest.mark.parametrize("which", ["settings", "confirm"])
+def test_modals_stay_on_screen_on_short_terminals(which: str, size: tuple[int, int]) -> None:
+    """Neither modal may overflow the viewport.
+
+    Both grew past 24 rows once the model fields landed, and a plain
+    `Vertical` doesn't scroll — it overflows, which on an 80x24 pushed the
+    Confirm modal's title off the top of the screen and the Settings modal's
+    save hint off the bottom, with no key that could bring them back. Both
+    are `VerticalScroll` + `max-height: 100%` now. Assert the container is
+    fully within the viewport and that the hint (the last child, so the
+    worst case) is reachable after scrolling to the end.
+    """
+    import asyncio
+
+    from textual.app import App
+    from textual.widgets import Label
+
+    class _Harness(App):
+        # The real stylesheet — a bare `App()` applies no CSS at all, so the
+        # margin/max-height rules under test simply wouldn't exist.
+        CSS = PRReviewer.CSS
+
+    async def _run() -> tuple[int, int, int]:
+        app: App = _Harness()
+        async with app.run_test(size=size) as pilot:
+            if which == "settings":
+                screen: Any = SettingsScreen(
+                    cli="claude",
+                    codegraph_assist=False,
+                    refresh_interval=0,
+                    slack_webhook_url="",
+                    theme=DEFAULT_THEME,
+                    models={c: "" for c in _CLI_CYCLE},
+                )
+            else:
+                screen = ConfirmScreen(
+                    "Review o/r#1?", "claude", models={c: "" for c in _CLI_CYCLE}
+                )
+            await app.push_screen(screen)
+            await pilot.pause()
+            container = app.screen.query_one(f"#{which}-container")
+            # Scroll to the very bottom — the hint is the last child, so if
+            # anything is unreachable it's this.
+            container.scroll_end(animate=False)
+            await pilot.pause()
+            hint = app.screen.query_one(f"#{which}-hint", Label)
+            return container.region.y, container.region.bottom, hint.region.y
+
+    top, bottom, hint_y = asyncio.run(_run())
+    assert top >= 0, "modal overflows the top of the screen"
+    assert bottom <= size[1], "modal overflows the bottom of the screen"
+    assert hint_y >= 0, "hint is unreachable even after scrolling to the end"
+
+
+def test_settings_screen_round_trips_per_cli_models() -> None:
+    """Each CLI gets its own Input, seeded from and saved back to its own
+    slot. The regression this guards is a cross-wired id (every Input
+    reading the same widget), which would silently collapse all three
+    models into one."""
+    import asyncio
+
+    from textual.app import App
+    from textual.widgets import Input
+
+    async def _run() -> tuple[tuple[str, str], ...]:
+        app: App = App()
+        seeded = {c: f"model-for-{c}" for c in _CLI_CYCLE}
+        async with app.run_test() as pilot:
+            await app.push_screen(
+                SettingsScreen(
+                    cli="claude",
+                    codegraph_assist=False,
+                    refresh_interval=0,
+                    slack_webhook_url="",
+                    theme=DEFAULT_THEME,
+                    models=seeded,
+                )
+            )
+            await pilot.pause()
+            screen = app.screen
+            for c in _CLI_CYCLE:
+                assert screen.query_one(f"#settings-model-{c}", Input).value == seeded[c]
+            # Whitespace is stripped on save so it can't reach argv.
+            screen.query_one("#settings-model-claude", Input).value = "  opus  "
+            result: list[Any] = []
+            screen.dismiss = result.append  # type: ignore[method-assign]
+            screen.action_save()
+            return result[0].models
+
+    models = dict(asyncio.run(_run()))
+    assert models["claude"] == "opus"
+    assert models["codex"] == "model-for-codex"
+    assert models["gemini"] == "model-for-gemini"
+
+
+def test_confirm_screen_reseeds_model_on_cli_cycle() -> None:
+    """`Ctrl+L` swaps the backend, so the model field must follow. Carrying
+    a Claude-only name like `opus` into a Codex launch would build an argv
+    the CLI rejects; the placeholder moves too so the examples stay
+    relevant."""
+    import asyncio
+
+    from textual.app import App
+    from textual.widgets import Input
+
+    async def _run() -> tuple[str, str, str]:
+        app: App = App()
+        models = {c: f"model-for-{c}" for c in _CLI_CYCLE}
+        async with app.run_test() as pilot:
+            await app.push_screen(ConfirmScreen("Review o/r#1?", "claude", models=models))
+            await pilot.pause()
+            screen = app.screen
+            field = screen.query_one("#confirm-model", Input)
+            seeded = field.value
+            # Simulate a half-typed override that must NOT survive the cycle.
+            field.value = "opus"
+            screen.action_cycle_cli()  # type: ignore[attr-defined]
+            await pilot.pause()
+            return seeded, field.value, field.placeholder
+
+    seeded, after_cycle, placeholder = asyncio.run(_run())
+    assert seeded == "model-for-claude"
+    nxt = _CLI_CYCLE["claude"]
+    assert after_cycle == f"model-for-{nxt}"
+    assert placeholder == _MODEL_PLACEHOLDER[nxt]
 
 
 class _NotifyFake:

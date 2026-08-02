@@ -19,11 +19,11 @@ flowchart TD
     D -- no holder --> CS["ConfirmScreen modal"]
 
     subgraph CONFIRM["ConfirmScreen — per-launch choices"]
-        CS --> CSi["Ctrl+T post-inline · Ctrl+L cycle CLI<br/>checkboxes pick agents · type extra prompt"]
+        CS --> CSi["Ctrl+T post-inline · Ctrl+L cycle CLI (reseeds model)<br/>checkboxes pick agents · model field · type extra prompt"]
         CSi --> CSk{Enter / Esc}
     end
     CSk -- "Esc / Ctrl+N (cancel → None)" --> Z2([no launch])
-    CSk -- "Enter / Ctrl+Y" --> CR["ConfirmResult<br/>(post_inline, extra_prompt, cli, agents)"]
+    CSk -- "Enter / Ctrl+Y" --> CR["ConfirmResult<br/>(post_inline, extra_prompt, cli, model, agents)"]
     CR --> L["_launch_review_cli(pr, …, expected_holder)"]
 
     L --> PF{"_preflight_cli_checks(cli)"}
