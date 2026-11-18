@@ -53,6 +53,7 @@ from cc_pr_reviewer import (
     SKILL_FILE_NAME,
     WORKSPACE,
     BuiltPrompt,
+    DiffScope,
     InProgressHolder,
     ReviewInProgressError,
     SettingsScreen,
@@ -87,6 +88,7 @@ from cc_pr_reviewer import (
     _release_in_progress,
     _reserve_in_progress,
     _resolve_codegraph_tools,
+    _resolve_diff_scope,
     _resolve_theme,
     _review_cell,
     _rmdir_if_empty,
@@ -99,8 +101,10 @@ from cc_pr_reviewer import (
     build_review_prompt,
     build_slack_payload,
     check_prereqs,
+    describe_diff_scope,
     fetch_my_latest_review,
     format_codegraph_affected_tests,
+    format_diff_scope,
     format_existing_comments,
     humanise,
     new_review_pr_keys,
@@ -3898,3 +3902,221 @@ def test_notify_stays_quiet_on_dismiss_revealing_older_review(
         pre_review={"id": 10, "state": "APPROVED", "submitted_at": "t10"},
     )
     assert posted == []
+
+
+# --- diff scope (_resolve_diff_scope / format_diff_scope) ------------------
+
+_MB = "a" * 40
+_HEAD = "b" * 40
+
+
+def _scope(local: int = 3, github: int = 3, base: str = "main") -> DiffScope:
+    return DiffScope(
+        base_ref=base, merge_base=_MB, head_sha=_HEAD, local_files=local, github_files=github
+    )
+
+
+def test_format_diff_scope_matching_counts() -> None:
+    text = format_diff_scope(_scope(base="release/1.2"), 42)
+    assert "`release/1.2`" in text
+    assert f"git diff --name-only {_MB} HEAD" in text
+    assert f"git diff {_MB} HEAD" in text
+    assert _HEAD in text
+    assert "sub-agent" in text
+    assert "WARNING" not in text
+
+
+def test_format_diff_scope_mismatch_names_github_authoritative() -> None:
+    text = format_diff_scope(_scope(local=9, github=2), 42)
+    assert "WARNING" in text
+    assert "9 files" in text and "reports 2" in text
+    assert "gh pr diff 42 --name-only" in text
+
+
+def test_describe_diff_scope_variants() -> None:
+    assert describe_diff_scope(None) == "scope: unavailable"
+    assert describe_diff_scope(_scope()) == "scope: main@aaaaaaaa, 3 files"
+    assert describe_diff_scope(_scope(local=9, github=2)).endswith("9 files (GitHub: 2)")
+
+
+@pytest.mark.parametrize("cli", ["claude", "codex", "gemini"])
+def test_diff_scope_section_placed_after_extras_before_codegraph(cli: str) -> None:
+    """Scope is "what to review" context: after the per-launch extras,
+    before the CodeGraph evidence-gathering sections."""
+    scope_text = format_diff_scope(_scope(), 7)
+    built = build_review_prompt(
+        post_inline=False,
+        extra_prompt="extra",
+        existing=[],
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+        cli=cli,
+        codegraph_present=True,
+        diff_scope=scope_text,
+    )
+    base = REVIEW_PROMPT_CLAUDE if cli == "claude" else REVIEW_PROMPT_SKILL_BASED
+    assert built.text == PROMPT_SECTION_SEP.join(
+        [
+            base,
+            REVIEW_STANDARDS_SUFFIX,
+            "Additional instructions from reviewer:\nextra",
+            scope_text,
+            f"{CODEGRAPH_HINT_SUFFIX} {CODEGRAPH_IMPACT_NUDGE}",
+        ]
+    )
+
+
+def test_diff_scope_empty_adds_no_section() -> None:
+    kwargs: dict[str, Any] = dict(
+        post_inline=False,
+        extra_prompt="",
+        existing=[],
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+    )
+    assert build_review_prompt(**kwargs).text == build_review_prompt(**kwargs, diff_scope="").text
+
+
+def test_banner_appends_scope_desc() -> None:
+    parts = _format_launch_banner_parts(
+        False, _built(), True, "me", REVIEW_SKILLS, "", scope_desc="scope: unavailable"
+    )
+    assert parts[-1] == "scope: unavailable"
+
+
+def _git(cwd: Path, *args: str) -> str:
+    import subprocess
+
+    return subprocess.run(
+        ["git", *args], cwd=cwd, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def _commit(repo: Path, name: str) -> str:
+    (repo / name).write_text(name)
+    _git(repo, "add", name)
+    _git(repo, "commit", "-q", "-m", name)
+    return _git(repo, "rev-parse", "HEAD")
+
+
+@pytest.fixture
+def stale_base_worktree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Real git repos reproducing the stale-base scenario.
+
+    origin/main gains someone else's merged commit (`other.py`); the PR is
+    rebased onto it and adds `pr.py`. The review checkout fetched only the PR
+    ref, so its `origin/main` is still the old commit — a merge-base computed
+    from it would drag `other.py` into the diff (2 files vs GitHub's 1).
+    """
+    gitcfg = tmp_path / "gitconfig"
+    gitcfg.write_text("")
+    for k, v in {
+        "GIT_CONFIG_GLOBAL": str(gitcfg),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@example.com",
+    }.items():
+        monkeypatch.setenv(k, v)
+
+    origin = tmp_path / "origin.git"
+    _git(tmp_path, "init", "-q", "--bare", "-b", "main", str(origin))
+    author = tmp_path / "author"
+    _git(tmp_path, "clone", "-q", str(origin), str(author))
+    _git(author, "checkout", "-q", "-b", "main")
+    _commit(author, "base.py")
+    _git(author, "push", "-q", "origin", "main")
+
+    review = tmp_path / "review"
+    _git(tmp_path, "clone", "-q", str(origin), str(review))  # origin/main = base
+
+    merged = _commit(author, "other.py")  # someone else's merged work
+    _git(author, "push", "-q", "origin", "main")
+    _git(author, "checkout", "-q", "-b", "pr")
+    _commit(author, "pr.py")
+    _git(author, "push", "-q", "origin", "pr")
+
+    _git(review, "fetch", "-q", "origin", "pr:refs/remotes/origin/pr")
+    _git(review, "checkout", "-q", "--detach", "origin/pr")
+    return {"path": review, "merged": merged}
+
+
+def _patch_gh(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    stdout: str = '{"baseRefName": "main", "changedFiles": 1}',
+    returncode: int = 0,
+    fail_fetch: bool = False,
+) -> None:
+    import subprocess
+
+    real_run = _mod.run
+
+    def fake(cmd: list[str], **kw: Any) -> subprocess.CompletedProcess:
+        if cmd[0] == "gh":
+            return subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr="gh boom")
+        if fail_fetch and cmd[:2] == ["git", "fetch"]:
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="network down")
+        return real_run(cmd, **kw)
+
+    monkeypatch.setattr(_mod, "run", fake)
+
+
+def test_resolve_diff_scope_fetches_base_and_reconciles(
+    stale_base_worktree: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fresh base fetch moves the merge-base forward past the other
+    author's merged commit, so the local count matches GitHub's."""
+    _patch_gh(monkeypatch)
+    scope = _resolve_diff_scope("o/r", 1, stale_base_worktree["path"])
+    assert scope is not None
+    assert scope.base_ref == "main"
+    assert scope.merge_base == stale_base_worktree["merged"]
+    assert scope.local_files == 1
+    assert not scope.mismatch
+
+
+def test_resolve_diff_scope_flags_stale_base_when_fetch_fails(
+    stale_base_worktree: dict[str, Any], monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """If the base can't be refreshed, the stale merge-base pulls in the
+    already-merged file and the reconciliation catches it."""
+    _patch_gh(monkeypatch, fail_fetch=True)
+    scope = _resolve_diff_scope("o/r", 1, stale_base_worktree["path"])
+    assert scope is not None
+    assert (scope.local_files, scope.github_files) == (2, 1)
+    assert scope.mismatch
+    assert "network down" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("stdout", "returncode"),
+    [
+        ("", 1),
+        ("not json", 0),
+        ('{"baseRefName": "main"}', 0),
+        ('{"baseRefName": "", "changedFiles": 1}', 0),
+    ],
+    ids=["gh-fails", "bad-json", "missing-field", "empty-base"],
+)
+def test_resolve_diff_scope_returns_none_on_bad_pr_metadata(
+    stale_base_worktree: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    stdout: str,
+    returncode: int,
+) -> None:
+    _patch_gh(monkeypatch, stdout=stdout, returncode=returncode)
+    assert _resolve_diff_scope("o/r", 1, stale_base_worktree["path"]) is None
+
+
+def test_resolve_diff_scope_returns_none_when_base_ref_missing(
+    stale_base_worktree: dict[str, Any], monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """A base branch that doesn't exist on origin fails the fetch and the
+    merge-base — no scope, with the git error surfaced."""
+    _patch_gh(monkeypatch, stdout='{"baseRefName": "nope", "changedFiles": 1}')
+    assert _resolve_diff_scope("o/r", 1, stale_base_worktree["path"]) is None
+    assert "merge-base" in capsys.readouterr().out
