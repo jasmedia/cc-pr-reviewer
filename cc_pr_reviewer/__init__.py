@@ -466,13 +466,44 @@ def _build_cli_command(cli: CliChoice, prompt_text: str) -> list[str]:
     raise ValueError(f"unknown CLI choice: {cli!r}")
 
 
+# Review-quality standards, appended right after the base prompt for every
+# CLI and regardless of post-inline. Defines the P1/P2/P3 taxonomy the
+# `POST_INLINE_*` verdict suffixes below rely on, so keep the two in sync.
+# Deliberately short: it rides on every launch, so each sentence costs prompt
+# tokens (`approx_prompt_tokens` in `review_telemetry` tracks the total).
+REVIEW_STANDARDS_SUFFIX = (
+    "Review standards:\n"
+    "- Tag every finding P1 (must fix before merge: correctness, security, "
+    "data loss, broken contracts, breaking changes, concurrency bugs, resource "
+    "leaks, significant performance regressions), P2 (should fix), or P3 "
+    "(optional / nit), with a `file:line` reference.\n"
+    "- Verify every P1/P2 before reporting it — trace the code path, run the "
+    "test, or reproduce the behavior. If you could not verify it, label it "
+    "UNVERIFIED rather than presenting it as confirmed.\n"
+    "- Every finding must state a concrete consequence (what breaks, for whom, "
+    "when) and be about a line this PR changed, or pre-existing code the change "
+    "made wrong. Fold duplicates into the strongest instance. Cut anything "
+    "whose honest consequence is 'nothing changes'.\n"
+    "- No praise, no 'strengths' section, no recap of what the PR does. "
+    "Treat the PR description and commit messages as claims to check, not "
+    "facts.\n"
+    "- Finding nothing is a valid result: if nothing survives these rules, "
+    "say so plainly instead of padding the review."
+)
+
 POST_INLINE_PROMPT = (
     "Additionally, publish each finding as an inline PR review comment on "
     "GitHub using the `gh` CLI. Create a single pending review via `gh api "
     "--method POST /repos/{owner}/{repo}/pulls/{number}/reviews` with an array "
     "of `comments` entries (each with `path`, `line`, and `body`), then submit "
     "the review with `event: COMMENT` so all findings appear grouped. Use the "
-    "PR's head commit SHA when the endpoint requires `commit_id`."
+    "PR's head commit SHA when the endpoint requires `commit_id`. Prefix every "
+    "comment body with its severity tag, e.g. `[P2]`. If no findings survive, "
+    "do not submit an empty COMMENT review — just say so in your summary. If "
+    "posting is blocked (auth failure, permission denial, sandbox or network "
+    "block), do not try to work around it: print the full JSON payload and "
+    "the exact `gh api ... --input <file>` command in your final summary so "
+    "the user can post it themselves."
 )
 
 # Appended to POST_INLINE_PROMPT only when we actually have existing comments
@@ -492,10 +523,8 @@ POST_INLINE_DEDUP_SUFFIX = (
 # just because someone else commented.
 POST_INLINE_REREVIEW_SUFFIX = (
     " You (the authenticated `gh` user) have already reviewed this PR in a "
-    "previous pass, so raise the bar: only post findings that are clearly "
-    "important (e.g., correctness, security, data loss, broken contracts, "
-    "breaking changes, concurrency bugs, resource leaks, significant "
-    "performance regressions). Skip anything minor, stylistic, or NIT-level."
+    "previous pass, so raise the bar: only post P1 and P2 findings. Skip "
+    "every P3."
 )
 
 # Appended after POST_INLINE_REREVIEW_SUFFIX only when the PR is NOT
@@ -503,7 +532,7 @@ POST_INLINE_REREVIEW_SUFFIX = (
 # on `event: APPROVE` for the author, so this clause is unsafe to send when
 # the `gh` user is the PR author — but the raised bar above still applies.
 POST_INLINE_REREVIEW_APPROVE_SUFFIX = (
-    " If after filtering the only remaining findings are minor or NIT-level, "
+    " If after filtering no P1 or P2 findings remain (only P3s, or nothing), "
     "submit an APPROVE review with no inline comments (use `event: APPROVE` "
     "and omit the `comments` array) instead of `event: COMMENT`."
 )
@@ -554,26 +583,23 @@ POST_INLINE_REREVIEW_RESOLVE_SUFFIX = (
 
 # Appended to POST_INLINE_PROMPT on a *first* review (not a re-review) of a PR
 # the `gh` user did NOT author. It turns the post-inline pass into a verdict:
-# classify each finding, and if nothing is blocking, APPROVE while STILL
-# attaching the low/NIT findings as inline comments. GitHub accepts a
+# using the P1/P2/P3 tags from REVIEW_STANDARDS_SUFFIX, APPROVE when no P1/P2
+# remains while STILL attaching the P3s as inline comments. GitHub accepts a
 # `comments` array on an `event: APPROVE` submission, so "approve + nits" is a
 # single review. Gated on not-self-authored because GitHub returns 422 on
 # self-approval (same guard as the re-review approve clause) — on our own PR
 # or an unknown login we fall through to the plain `event: COMMENT` behavior.
-# The blocking list mirrors POST_INLINE_REREVIEW_SUFFIX so both passes share
-# one taxonomy.
+# Both this and the re-review suffixes key off the same P1/P2/P3 taxonomy
+# (defined once in REVIEW_STANDARDS_SUFFIX). It explicitly overrides
+# POST_INLINE_PROMPT's "no empty COMMENT review" rule, since a clean first
+# review of someone else's PR should still land as an APPROVE.
 POST_INLINE_APPROVE_SUFFIX = (
-    " Then decide the verdict by the highest-priority finding. Classify each "
-    "finding as blocking (correctness, security, data loss, broken contracts, "
-    "breaking changes, concurrency bugs, resource leaks, significant "
-    "performance regressions) or low/NIT (everything else — style, naming, "
-    "minor clarity, optional refactors). If every finding is low/NIT-level (or "
-    "there are none), submit the review with `event: APPROVE` while STILL "
-    "including those findings as inline `comments` — an approval with "
-    "non-blocking nits attached, not an empty approval. If any finding is "
-    "blocking, submit with `event: COMMENT` instead and do not approve. Prefix "
-    "every comment body with its priority label, e.g. `[nit]`, `[low]`, or "
-    "`[blocking]`."
+    " Then decide the verdict by the highest-severity finding. If there are no "
+    "P1 or P2 findings, submit the review with `event: APPROVE` (this "
+    "overrides the no-empty-review rule above), STILL including any P3 "
+    "findings as inline `comments` — an approval with nits attached. If any "
+    "P1 or P2 finding remains, submit with `event: COMMENT` instead and do "
+    "not approve."
 )
 
 # Appended to POST_INLINE_PROMPT when the existing-comments fetch failed. The
@@ -686,7 +712,7 @@ DEFAULT_CLI: CliChoice = "claude"
 
 # Whether a post-inline review may submit `event: APPROVE` (and resolve our own
 # addressed threads on re-review). "auto" is the historical behavior: approve
-# another user's PR when only low/NIT findings remain. "comment-only" is a hard
+# another user's PR when only P3 (nit) findings remain. "comment-only" is a hard
 # stop — every review is submitted as `event: COMMENT` and no threads are
 # resolved, leaving approval as a separate, explicit human action. Modal-only
 # Settings value (no footer cycle); `_APPROVE_POLICY_LABELS` is the single
@@ -2340,7 +2366,10 @@ def build_review_prompt(
         base = _build_claude_prompt(normalised_agents)
     else:
         base = _build_skill_based_prompt(normalised_agents)
-    sections = [base]
+    # Standards sit directly after the base prompt for every CLI and both
+    # post-inline modes — they define the P1/P2/P3 taxonomy the post-inline
+    # verdict suffixes rely on, so they must always be present.
+    sections = [base, REVIEW_STANDARDS_SUFFIX]
     # Strip defensively — the current ConfirmResult dataclass already strips,
     # but `build_review_prompt` is now an API boundary and a future caller
     # (or test) passing whitespace-only `extra_prompt` would otherwise render
@@ -2349,7 +2378,7 @@ def build_review_prompt(
     stripped_extra = extra_prompt.strip()
     if stripped_extra:
         sections.append(f"Additional instructions from reviewer:\n{stripped_extra}")
-    # Placed AFTER the reviewer extras so a per-launch override stays adjacent
+    # Placed AFTER the reviewer extras so a per-launch override stays close
     # to the base prompt (highest visibility), but BEFORE existing-comments
     # and the post-inline output instructions — CodeGraph is workflow guidance
     # for how to gather evidence, so it belongs next to the "what to review"
