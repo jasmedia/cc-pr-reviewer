@@ -215,7 +215,10 @@ comment via a single `POST /repos/{owner}/{repo}/pulls/{n}/reviews` call
 through `gh api`, so they land grouped under one review. On a re-review
 of someone else's PR where only NIT-level findings remain, the CLI is
 also asked to resolve any of its own previously-posted threads that the
-new code has addressed before submitting the APPROVE.
+new code has addressed before submitting the APPROVE. Set **Approval on
+others' PRs** in Settings (`,`) to *Never approve (comment only)* to turn
+off every approve/resolve step: reviews are then always submitted as
+`event: COMMENT`, and approving stays a separate manual action.
 
 When you exit the CLI, press Enter and the TUI returns.
 

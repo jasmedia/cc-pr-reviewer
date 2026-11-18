@@ -684,6 +684,20 @@ _CLI_CYCLE: dict[CliChoice, CliChoice] = {
 }
 DEFAULT_CLI: CliChoice = "claude"
 
+# Whether a post-inline review may submit `event: APPROVE` (and resolve our own
+# addressed threads on re-review). "auto" is the historical behavior: approve
+# another user's PR when only low/NIT findings remain. "comment-only" is a hard
+# stop — every review is submitted as `event: COMMENT` and no threads are
+# resolved, leaving approval as a separate, explicit human action. Modal-only
+# Settings value (no footer cycle); `_APPROVE_POLICY_LABELS` is the single
+# source of truth for the legal values and their dropdown labels.
+ApprovePolicy = Literal["auto", "comment-only"]
+_APPROVE_POLICY_LABELS: dict[ApprovePolicy, str] = {
+    "auto": "Auto-approve when only nits remain",
+    "comment-only": "Never approve (comment only)",
+}
+DEFAULT_APPROVE_POLICY: ApprovePolicy = "auto"
+
 # Custom branded theme — a warm dark palette built around Claude's coral
 # (`#d97757`). Registered on the running App (`on_mount`) before the
 # persisted theme is applied; offered in the Settings picker like any
@@ -2057,6 +2071,7 @@ def _format_launch_banner_parts(
     my_login: str | None,
     selected_agents: tuple[str, ...],
     extra_prompt: str,
+    allow_approve: bool = True,
 ) -> list[str]:
     """Assemble the human-readable launch-banner fragments (pure).
 
@@ -2078,6 +2093,10 @@ def _format_launch_banner_parts(
         post_inline_desc += ", rereview"
     elif post_inline and my_login is None:
         post_inline_desc += ", rereview-detection-unavailable"
+    # Only the non-default policy is called out, and only when it can matter
+    # (approval is a post-inline concern) — keeps the default banner unchanged.
+    if post_inline and not allow_approve:
+        post_inline_desc += ", never-approve"
     parts = [f"post-inline: {post_inline_desc}", existing_desc]
     # Only call out the agent subset when it diverges from the default — the
     # banner is already crowded, and "agents: all" would be noise on every
@@ -2209,6 +2228,7 @@ def build_review_prompt(
     codegraph_present: bool = False,
     codegraph_affected_tests: str = "",
     selected_agents: tuple[str, ...] | None = None,
+    allow_approve: bool = True,
 ) -> BuiltPrompt:
     """Assemble the user message for the selected coding-agent CLI. Pure — no I/O.
 
@@ -2259,6 +2279,15 @@ def build_review_prompt(
     skips the section entirely — that covers both "no index" and "empty
     diff / no affected files" without callers needing to disambiguate.
 
+    `allow_approve` is the `approve_policy` setting resolved to a bool
+    (`"auto"` → True). When False, every APPROVE-bearing clause
+    (`POST_INLINE_APPROVE_SUFFIX`, `POST_INLINE_REREVIEW_APPROVE_SUFFIX`, and
+    the `POST_INLINE_REREVIEW_RESOLVE_SUFFIX` that rides on the latter) is
+    dropped, so the review falls through to plain `event: COMMENT`. The
+    re-review raised bar (`POST_INLINE_REREVIEW_SUFFIX`) is unaffected — it's
+    about which findings to post, not the verdict. Defaults to True so callers
+    that predate the setting keep the historical prompt verbatim.
+
     Contract: `fetch_existing_review_comments` guarantees that
     `fetch_ok=False` always returns `existing=[]`. Passing a non-empty
     `existing` with `fetch_ok=False` is a contradictory state — caught
@@ -2297,7 +2326,10 @@ def build_review_prompt(
     # login can't *prove* the PR isn't ours, so we stay conservative (plain
     # COMMENT) rather than risk a 422.
     not_self_authored = bool(my_login) and author_login != my_login
-    rereview_can_approve = rereview and not_self_authored
+    # `allow_approve=False` (approve_policy "comment-only") vetoes both approve
+    # paths below; it composes with, never replaces, the 422/authorship gate.
+    may_approve = not_self_authored and allow_approve
+    rereview_can_approve = rereview and may_approve
 
     # Default subset → use the precomputed all-six constants (also what the
     # public `REVIEW_PROMPT_*` symbols document); any non-default subset
@@ -2349,7 +2381,7 @@ def build_review_prompt(
             if rereview_can_approve:
                 post += POST_INLINE_REREVIEW_APPROVE_SUFFIX
                 post += POST_INLINE_REREVIEW_RESOLVE_SUFFIX
-        elif not_self_authored and fetch_ok:
+        elif may_approve and fetch_ok:
             # `and fetch_ok`: a failed existing-comments fetch forces
             # `existing=[]`, which forces `rereview=False` — so without this
             # guard the approve clause would fire on a fetch failure and could
@@ -3586,6 +3618,7 @@ class SettingsResult:
     refresh_interval: int
     slack_webhook_url: str
     theme: str
+    approve_policy: ApprovePolicy = DEFAULT_APPROVE_POLICY
 
 
 # Auto-refresh options for the Settings dropdown: every distinct interval the
@@ -3624,9 +3657,16 @@ class SettingsScreen(ModalScreen[SettingsResult | None]):
         refresh_interval: int,
         slack_webhook_url: str,
         theme: str,
+        approve_policy: ApprovePolicy = DEFAULT_APPROVE_POLICY,
     ):
         super().__init__()
         self.cli = cli
+        # Snap unknown values for the same reason as `refresh_interval` below:
+        # `Select(allow_blank=False)` raises on mount for a value not in its
+        # options.
+        self.approve_policy: ApprovePolicy = (
+            approve_policy if approve_policy in _APPROVE_POLICY_LABELS else DEFAULT_APPROVE_POLICY
+        )
         self.codegraph_assist = codegraph_assist
         # Snap to a legal dropdown option: the rest of the app tolerates
         # hand-edited / legacy intervals (`parse_refresh_interval` only floors
@@ -3669,6 +3709,13 @@ class SettingsScreen(ModalScreen[SettingsResult | None]):
                 allow_blank=False,
                 id="settings-refresh",
             ),
+            Label("Approval on others' PRs:", id="settings-approve-label"),
+            Select(
+                [(label, p) for p, label in _APPROVE_POLICY_LABELS.items()],
+                value=self.approve_policy,
+                allow_blank=False,
+                id="settings-approve",
+            ),
             Label(
                 "Slack webhook URL for review notifications (blank = off):",
                 id="settings-slack-label",
@@ -3690,6 +3737,7 @@ class SettingsScreen(ModalScreen[SettingsResult | None]):
                 refresh_interval=self.query_one("#settings-refresh", Select).value,
                 slack_webhook_url=self.query_one("#settings-slack", Input).value.strip(),
                 theme=self.query_one("#settings-theme", Select).value,
+                approve_policy=self.query_one("#settings-approve", Select).value,
             )
         )
 
@@ -3980,6 +4028,13 @@ class PRReviewer(App):
         # (no extra `gh api` calls, no POST) when this is blank. Editable via
         # the Settings modal (`,`).
         self.slack_webhook_url: str = _get_setting(self.review_db, "slack_webhook_url", "")
+        # Gates every APPROVE/resolve clause in the post-inline prompt (see
+        # `build_review_prompt(allow_approve=...)`). Unknown stored values fall
+        # back to the default rather than guessing.
+        stored_approve = _get_setting(self.review_db, "approve_policy", DEFAULT_APPROVE_POLICY)
+        self.approve_policy: ApprovePolicy = (
+            stored_approve if stored_approve in _APPROVE_POLICY_LABELS else DEFAULT_APPROVE_POLICY
+        )
         stored_cli = _get_setting(self.review_db, "cli", DEFAULT_CLI)
         persisted: CliChoice = stored_cli if stored_cli in _CLI_CYCLE else DEFAULT_CLI
         # If the persisted CLI isn't on PATH, fall back to whatever IS
@@ -4876,6 +4931,7 @@ class PRReviewer(App):
                         "refresh_interval": str(result.refresh_interval),
                         "slack_webhook_url": result.slack_webhook_url,
                         "theme": result.theme,
+                        "approve_policy": result.approve_policy,
                     },
                 )
             except sqlite3.Error as e:
@@ -4888,6 +4944,7 @@ class PRReviewer(App):
             self.codegraph_assist = result.codegraph_assist
             self._auto_refresh_secs = result.refresh_interval
             self.slack_webhook_url = result.slack_webhook_url
+            self.approve_policy = result.approve_policy
             # Assigning the App.theme reactive re-themes the running app live
             # (no restart). `result.theme` is constrained to `_THEME_OPTIONS`
             # by the Select, so it's always a valid registered theme.
@@ -4908,6 +4965,7 @@ class PRReviewer(App):
                 codegraph_assist=self.codegraph_assist,
                 refresh_interval=self._auto_refresh_secs,
                 slack_webhook_url=self.slack_webhook_url,
+                approve_policy=self.approve_policy,
                 # Coerce through `_resolve_theme` so a non-curated theme set
                 # live via the command palette (`Ctrl+P`) maps to a value the
                 # `Select` actually contains — otherwise its initial selection
@@ -5190,6 +5248,7 @@ class PRReviewer(App):
                 codegraph_tools_available = _resolve_codegraph_tools(
                     cli, worktree_path, codegraph_present, codegraph_on_path
                 )
+                allow_approve = self.approve_policy == "auto"
                 built = build_review_prompt(
                     post_inline=post_inline,
                     extra_prompt=extra_prompt,
@@ -5201,11 +5260,18 @@ class PRReviewer(App):
                     codegraph_present=codegraph_tools_available,
                     codegraph_affected_tests=codegraph_affected_block,
                     selected_agents=selected_agents,
+                    allow_approve=allow_approve,
                 )
 
                 cmd = _build_cli_command(cli, built.text)
                 parts = _format_launch_banner_parts(
-                    post_inline, built, fetch_ok, my_login, selected_agents, extra_prompt
+                    post_inline,
+                    built,
+                    fetch_ok,
+                    my_login,
+                    selected_agents,
+                    extra_prompt,
+                    allow_approve=allow_approve,
                 )
                 print(
                     f"\nLaunching {_CLI_DISPLAY[cli]} ({', '.join(parts)})"
