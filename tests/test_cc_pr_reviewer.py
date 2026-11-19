@@ -49,6 +49,7 @@ from cc_pr_reviewer import (
     REVIEW_PROMPT_SKILL_BASED,
     REVIEW_SKILL_LABELS,
     REVIEW_SKILLS,
+    REVIEW_STANDARDS_SUFFIX,
     SKILL_FILE_NAME,
     WORKSPACE,
     BuiltPrompt,
@@ -146,7 +147,7 @@ def test_plain_review_equals_base_prompt(cli: str, expected_base: str) -> None:
         author_login="bob",
         cli=cli,
     )
-    assert built.text == expected_base
+    assert built.text == PROMPT_SECTION_SEP.join([expected_base, REVIEW_STANDARDS_SUFFIX])
     assert not built.rereview
     assert built.existing_shown == 0
     assert built.existing_total == 0
@@ -262,6 +263,7 @@ def test_full_chain_assembles_in_canonical_order(cli: str, expected_base: str) -
     expected = PROMPT_SECTION_SEP.join(
         [
             expected_base,
+            REVIEW_STANDARDS_SUFFIX,
             "Additional instructions from reviewer:\nx",
             format_existing_comments(existing)[0],
             POST_INLINE_PROMPT
@@ -430,12 +432,73 @@ def test_first_review_approve_assembles_in_canonical_order(cli: str, expected_ba
     expected = PROMPT_SECTION_SEP.join(
         [
             expected_base,
+            REVIEW_STANDARDS_SUFFIX,
             "Additional instructions from reviewer:\nx",
             format_existing_comments(existing)[0],
             POST_INLINE_PROMPT + POST_INLINE_DEDUP_SUFFIX + POST_INLINE_APPROVE_SUFFIX,
         ]
     )
     assert built.text == expected
+
+
+# --- review standards (REVIEW_STANDARDS_SUFFIX + P1/P2/P3 verdicts) ---------
+
+
+@pytest.mark.parametrize("cli", ["claude", "codex", "gemini"])
+@pytest.mark.parametrize("post_inline", [False, True])
+@pytest.mark.parametrize("selected_agents", [None, ()], ids=["all-agents", "no-agents"])
+def test_review_standards_always_follow_base_prompt(
+    cli: str, post_inline: bool, selected_agents: tuple[str, ...] | None
+) -> None:
+    """The standards define the P1/P2/P3 taxonomy the post-inline verdict
+    suffixes depend on, so they must be present — directly after the base —
+    for every CLI, with or without inline posting, and even for the generic
+    no-agents review."""
+    built = build_review_prompt(
+        post_inline=post_inline,
+        extra_prompt="",
+        existing=[],
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+        cli=cli,
+        selected_agents=selected_agents,
+    )
+    sections = built.text.split(PROMPT_SECTION_SEP)
+    assert sections[1] == REVIEW_STANDARDS_SUFFIX
+    assert built.text.count(REVIEW_STANDARDS_SUFFIX) == 1
+
+
+def test_review_standards_define_taxonomy_and_rules() -> None:
+    """Pin the load-bearing rules so a wording pass can't quietly drop one."""
+    for token in ("P1", "P2", "P3", "file:line", "UNVERIFIED", "No praise", "nothing"):
+        assert token in REVIEW_STANDARDS_SUFFIX
+
+
+def test_post_inline_prompt_tags_skips_empty_and_has_blocked_fallback() -> None:
+    assert "`[P2]`" in POST_INLINE_PROMPT
+    assert "do not submit an empty COMMENT review" in POST_INLINE_PROMPT
+    assert "--input" in POST_INLINE_PROMPT
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [POST_INLINE_APPROVE_SUFFIX, POST_INLINE_REREVIEW_SUFFIX, POST_INLINE_REREVIEW_APPROVE_SUFFIX],
+)
+def test_verdict_suffixes_use_severity_tags_not_legacy_labels(suffix: str) -> None:
+    """All verdict clauses share the P1/P2/P3 taxonomy from the standards
+    block — a leftover blocking/low/NIT label would give the agent two
+    competing scales to classify against."""
+    assert "P1" in suffix and "P2" in suffix
+    for legacy in ("blocking", "NIT", "[nit]", "[low]"):
+        assert legacy not in suffix
+
+
+def test_first_review_approve_overrides_no_empty_review_rule() -> None:
+    """POST_INLINE_PROMPT forbids an empty COMMENT review; the approve clause
+    that follows must explicitly override it so a clean first review of
+    someone else's PR still lands as an APPROVE."""
+    assert "overrides the no-empty-review rule" in POST_INLINE_APPROVE_SUFFIX
 
 
 # --- approve_policy (Settings → build_review_prompt(allow_approve=...)) -----
@@ -512,6 +575,7 @@ def test_comment_only_rereview_assembles_in_canonical_order(cli: str) -> None:
     assert built.text == PROMPT_SECTION_SEP.join(
         [
             base,
+            REVIEW_STANDARDS_SUFFIX,
             format_existing_comments(existing)[0],
             POST_INLINE_PROMPT + POST_INLINE_DEDUP_SUFFIX + POST_INLINE_REREVIEW_SUFFIX,
         ]
@@ -558,7 +622,7 @@ def test_selected_agents_default_none_matches_default_constant() -> None:
         cli="claude",
         selected_agents=None,
     )
-    assert built.text == REVIEW_PROMPT_CLAUDE
+    assert built.text == PROMPT_SECTION_SEP.join([REVIEW_PROMPT_CLAUDE, REVIEW_STANDARDS_SUFFIX])
 
 
 def test_selected_agents_full_set_equals_default_constant() -> None:
@@ -844,8 +908,8 @@ def test_codegraph_suffix_present_when_flag_set(cli: str) -> None:
 
 def test_codegraph_suffix_placed_after_extra_prompt_before_existing() -> None:
     """Lock the canonical section order when CodeGraph is present:
-    base → reviewer extras → CodeGraph hint → existing comments →
-    post-inline. Reviewer extras stay adjacent to the base (highest
+    base → review standards → reviewer extras → CodeGraph hint → existing
+    comments → post-inline. Reviewer extras stay close to the base (high
     visibility for per-launch overrides); the hint sits with the
     "what to review" blocks rather than the "how to publish" block."""
     existing = [_comment("charlie")]
@@ -862,6 +926,7 @@ def test_codegraph_suffix_placed_after_extra_prompt_before_existing() -> None:
     expected = PROMPT_SECTION_SEP.join(
         [
             REVIEW_PROMPT_CLAUDE,
+            REVIEW_STANDARDS_SUFFIX,
             "Additional instructions from reviewer:\nfocus on the auth changes",
             # No precomputed affected block here, so the per-symbol impact
             # nudge rides along with the hint as one section.
@@ -1059,6 +1124,7 @@ def test_affected_tests_block_lands_after_hint_before_existing(cli: str) -> None
     expected = PROMPT_SECTION_SEP.join(
         [
             base,
+            REVIEW_STANDARDS_SUFFIX,
             "Additional instructions from reviewer:\nextra",
             CODEGRAPH_HINT_SUFFIX,
             affected_block,
@@ -1086,7 +1152,11 @@ def test_affected_tests_block_absent_when_kwarg_empty() -> None:
         codegraph_affected_tests="",
     )
     assert built.text == PROMPT_SECTION_SEP.join(
-        [REVIEW_PROMPT_CLAUDE, f"{CODEGRAPH_HINT_SUFFIX} {CODEGRAPH_IMPACT_NUDGE}"]
+        [
+            REVIEW_PROMPT_CLAUDE,
+            REVIEW_STANDARDS_SUFFIX,
+            f"{CODEGRAPH_HINT_SUFFIX} {CODEGRAPH_IMPACT_NUDGE}",
+        ]
     )
 
 
