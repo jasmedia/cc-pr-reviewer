@@ -52,6 +52,7 @@ from cc_pr_reviewer import (
     REVIEW_SKILLS,
     REVIEW_STANDARDS_SUFFIX,
     SKILL_FILE_NAME,
+    SUBAGENT_DISPATCH_SUFFIX,
     TEST_CHANGE_SCRUTINY_CAP,
     TEST_CHANGE_SCRUTINY_SUFFIX,
     WORKSPACE,
@@ -126,6 +127,17 @@ from cc_pr_reviewer import (
 # --- build_review_prompt ---------------------------------------------------
 
 
+def _dispatch(cli: str) -> list[str]:
+    """The Claude-only sub-agent briefing section, as a splat-able list."""
+    return [SUBAGENT_DISPATCH_SUFFIX] if cli == "claude" else []
+
+
+def _standards(cli: str) -> list[str]:
+    """The fixed sections that follow the base prompt when no repo standards
+    are loaded: the review standards, then (Claude only) the dispatch rules."""
+    return [REVIEW_STANDARDS_SUFFIX, *_dispatch(cli)]
+
+
 def _comment(login: str, **overrides: Any) -> dict[str, Any]:
     """Build a minimal review-comment dict (overridable per test)."""
     base: dict[str, Any] = {
@@ -163,7 +175,7 @@ def test_plain_review_equals_base_prompt(cli: str, expected_base: str) -> None:
         author_login="bob",
         cli=cli,
     )
-    assert built.text == PROMPT_SECTION_SEP.join([expected_base, REVIEW_STANDARDS_SUFFIX])
+    assert built.text == PROMPT_SECTION_SEP.join([expected_base, *_standards(cli)])
     assert not built.rereview
     assert built.existing_shown == 0
     assert built.existing_total == 0
@@ -279,7 +291,7 @@ def test_full_chain_assembles_in_canonical_order(cli: str, expected_base: str) -
     expected = PROMPT_SECTION_SEP.join(
         [
             expected_base,
-            REVIEW_STANDARDS_SUFFIX,
+            *_standards(cli),
             "Additional instructions from reviewer:\nx",
             format_existing_comments(existing)[0],
             POST_INLINE_PROMPT
@@ -448,7 +460,7 @@ def test_first_review_approve_assembles_in_canonical_order(cli: str, expected_ba
     expected = PROMPT_SECTION_SEP.join(
         [
             expected_base,
-            REVIEW_STANDARDS_SUFFIX,
+            *_standards(cli),
             "Additional instructions from reviewer:\nx",
             format_existing_comments(existing)[0],
             POST_INLINE_PROMPT + POST_INLINE_DEDUP_SUFFIX + POST_INLINE_APPROVE_SUFFIX,
@@ -515,6 +527,76 @@ def test_first_review_approve_overrides_no_empty_review_rule() -> None:
     that follows must explicitly override it so a clean first review of
     someone else's PR still lands as an APPROVE."""
     assert "overrides the no-empty-review rule" in POST_INLINE_APPROVE_SUFFIX
+
+
+# --- sub-agent dispatch (Claude-only SUBAGENT_DISPATCH_SUFFIX) -------------
+
+
+@pytest.mark.parametrize("cli", ["claude", "codex", "gemini"])
+@pytest.mark.parametrize("post_inline", [False, True])
+@pytest.mark.parametrize("selected_agents", [None, ()], ids=["all-agents", "no-agents"])
+def test_dispatch_rules_only_for_claude_right_after_standards(
+    cli: str, post_inline: bool, selected_agents: tuple[str, ...] | None
+) -> None:
+    """Claude briefs the toolkit's sub-agents itself, including for the generic
+    no-agents toolkit review, so it always gets the rules, placed right after
+    the standards it is told to forward. Codex/Gemini run skills in-process
+    and never get them."""
+    built = build_review_prompt(
+        post_inline=post_inline,
+        extra_prompt="",
+        existing=[],
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+        cli=cli,
+        selected_agents=selected_agents,
+    )
+    sections = built.text.split(PROMPT_SECTION_SEP)
+    if cli == "claude":
+        assert sections[2] == SUBAGENT_DISPATCH_SUFFIX
+        assert built.text.count(SUBAGENT_DISPATCH_SUFFIX) == 1
+    else:
+        assert SUBAGENT_DISPATCH_SUFFIX not in built.text
+
+
+def test_dispatch_rules_cover_scope_scepticism_and_triage() -> None:
+    """Pin the load-bearing instructions so a wording pass can't drop one."""
+    for token in (
+        "don't see this conversation",
+        "merge-base",
+        "review standards above",
+        "claims, not evidence",
+        "adversary",
+        "clean result",
+        "raw material",
+        "verify each P1/P2 yourself",
+    ):
+        assert token in SUBAGENT_DISPATCH_SUFFIX
+
+
+def test_dispatch_rules_sit_between_repo_standards_and_extras() -> None:
+    """Repo standards are among the 'standards above' Claude forwards, so the
+    dispatch rules must come after them; the reviewer extras still follow."""
+    built = build_review_prompt(
+        post_inline=False,
+        extra_prompt="extra",
+        existing=[],
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+        cli="claude",
+        repo_standards="Team conventions:\n- rule",
+    )
+    assert built.text == PROMPT_SECTION_SEP.join(
+        [
+            REVIEW_PROMPT_CLAUDE,
+            REVIEW_STANDARDS_SUFFIX,
+            "Team conventions:\n- rule",
+            SUBAGENT_DISPATCH_SUFFIX,
+            "Additional instructions from reviewer:\nextra",
+        ]
+    )
 
 
 # --- approve_policy (Settings → build_review_prompt(allow_approve=...)) -----
@@ -591,7 +673,7 @@ def test_comment_only_rereview_assembles_in_canonical_order(cli: str) -> None:
     assert built.text == PROMPT_SECTION_SEP.join(
         [
             base,
-            REVIEW_STANDARDS_SUFFIX,
+            *_standards(cli),
             format_existing_comments(existing)[0],
             POST_INLINE_PROMPT + POST_INLINE_DEDUP_SUFFIX + POST_INLINE_REREVIEW_SUFFIX,
         ]
@@ -638,7 +720,7 @@ def test_selected_agents_default_none_matches_default_constant() -> None:
         cli="claude",
         selected_agents=None,
     )
-    assert built.text == PROMPT_SECTION_SEP.join([REVIEW_PROMPT_CLAUDE, REVIEW_STANDARDS_SUFFIX])
+    assert built.text == PROMPT_SECTION_SEP.join([REVIEW_PROMPT_CLAUDE, *_standards("claude")])
 
 
 def test_selected_agents_full_set_equals_default_constant() -> None:
@@ -942,7 +1024,7 @@ def test_codegraph_suffix_placed_after_extra_prompt_before_existing() -> None:
     expected = PROMPT_SECTION_SEP.join(
         [
             REVIEW_PROMPT_CLAUDE,
-            REVIEW_STANDARDS_SUFFIX,
+            *_standards("claude"),
             "Additional instructions from reviewer:\nfocus on the auth changes",
             # No precomputed affected block here, so the per-symbol impact
             # nudge rides along with the hint as one section.
@@ -1140,7 +1222,7 @@ def test_affected_tests_block_lands_after_hint_before_existing(cli: str) -> None
     expected = PROMPT_SECTION_SEP.join(
         [
             base,
-            REVIEW_STANDARDS_SUFFIX,
+            *_standards(cli),
             "Additional instructions from reviewer:\nextra",
             CODEGRAPH_HINT_SUFFIX,
             affected_block,
@@ -1170,7 +1252,7 @@ def test_affected_tests_block_absent_when_kwarg_empty() -> None:
     assert built.text == PROMPT_SECTION_SEP.join(
         [
             REVIEW_PROMPT_CLAUDE,
-            REVIEW_STANDARDS_SUFFIX,
+            *_standards("claude"),
             f"{CODEGRAPH_HINT_SUFFIX} {CODEGRAPH_IMPACT_NUDGE}",
         ]
     )
@@ -3971,7 +4053,7 @@ def test_diff_scope_section_placed_after_extras_before_codegraph(cli: str) -> No
     assert built.text == PROMPT_SECTION_SEP.join(
         [
             base,
-            REVIEW_STANDARDS_SUFFIX,
+            *_standards(cli),
             "Additional instructions from reviewer:\nextra",
             scope_text,
             f"{CODEGRAPH_HINT_SUFFIX} {CODEGRAPH_IMPACT_NUDGE}",
@@ -4308,7 +4390,7 @@ def test_test_change_section_follows_scope_before_codegraph(cli: str) -> None:
     assert built.text == PROMPT_SECTION_SEP.join(
         [
             base,
-            REVIEW_STANDARDS_SUFFIX,
+            *_standards(cli),
             scope_text,
             tests_text,
             f"{CODEGRAPH_HINT_SUFFIX} {CODEGRAPH_IMPACT_NUDGE}",
@@ -4578,5 +4660,11 @@ def test_repo_standards_follow_review_standards_before_extras(cli: str) -> None:
     )
     base = REVIEW_PROMPT_CLAUDE if cli == "claude" else REVIEW_PROMPT_SKILL_BASED
     assert built.text == PROMPT_SECTION_SEP.join(
-        [base, REVIEW_STANDARDS_SUFFIX, section, "Additional instructions from reviewer:\nextra"]
+        [
+            base,
+            REVIEW_STANDARDS_SUFFIX,
+            section,
+            *_dispatch(cli),
+            "Additional instructions from reviewer:\nextra",
+        ]
     )
