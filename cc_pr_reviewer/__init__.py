@@ -491,6 +491,33 @@ REVIEW_STANDARDS_SUFFIX = (
     "say so plainly instead of padding the review."
 )
 
+# Claude-only: how the orchestrating session briefs the PR Review Toolkit's
+# sub-agents. They start without this conversation, so anything not written
+# into their dispatch prompt (the scope, the standards above) never reaches
+# them, and an agent briefed with the author's framing tends to confirm it.
+# Codex/Gemini run the review skills in-process, so they get no such section.
+# Sits after the standards (and any repo standards) it tells Claude to forward.
+SUBAGENT_DISPATCH_SUFFIX = (
+    "Briefing the review agents (they don't see this conversation, so each "
+    "dispatch prompt must stand on its own):\n"
+    "- Give each agent the worktree path, the PR head SHA, and the merge-base "
+    "with the exact diff command from the review scope section (when present), "
+    "plus the review standards above. Tell it to read the changed files from "
+    "the repo itself.\n"
+    "- Tell it the PR description, commit messages and code comments are the "
+    "author's claims, not evidence, and to test a claim where it can (run the "
+    "test, execute the path).\n"
+    "- Ask it to attack the change as an adversary would: the case that makes "
+    "it look correct when it isn't, the input the author didn't try, the doc "
+    "or comment the code doesn't support.\n"
+    "- Tell it that a clean result for its aspect is valid and should be "
+    "reported as such, never padded with weak observations.\n"
+    "- Treat the agents' output as raw material, not the review: apply the "
+    "review standards to every finding, verify each P1/P2 yourself, and drop "
+    "or downgrade what doesn't hold. Don't substitute your own reading for "
+    "theirs."
+)
+
 POST_INLINE_PROMPT = (
     "Additionally, publish each finding as an inline PR review comment on "
     "GitHub using the `gh` CLI. Create a single pending review via `gh api "
@@ -2815,6 +2842,11 @@ def build_review_prompt(
     sits right after `REVIEW_STANDARDS_SUFFIX` — it's more rules — and before
     the reviewer extras, so a per-launch instruction can still override it.
 
+    For `cli="claude"` only, `SUBAGENT_DISPATCH_SUFFIX` follows the standards
+    sections: how to brief the toolkit's sub-agents (self-contained scope,
+    standards forwarded, sceptical framing, clean-is-valid) and to treat their
+    output as raw material. Codex/Gemini run skills in-process and skip it.
+
     Contract: `fetch_existing_review_comments` guarantees that
     `fetch_ok=False` always returns `existing=[]`. Passing a non-empty
     `existing` with `fetch_ok=False` is a contradictory state — caught
@@ -2873,6 +2905,11 @@ def build_review_prompt(
     sections = [base, REVIEW_STANDARDS_SUFFIX]
     if repo_standards:
         sections.append(repo_standards)
+    # Claude dispatches the toolkit's sub-agents itself (even for the generic
+    # no-agents review), so it alone needs the briefing rules. After both
+    # standards sections, which it tells Claude to forward.
+    if cli == "claude":
+        sections.append(SUBAGENT_DISPATCH_SUFFIX)
     # Strip defensively — the current ConfirmResult dataclass already strips,
     # but `build_review_prompt` is now an API boundary and a future caller
     # (or test) passing whitespace-only `extra_prompt` would otherwise render
