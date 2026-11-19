@@ -1917,10 +1917,10 @@ def _prepare_pr_worktree(
 class DiffScope:
     """The PR's review scope, resolved locally and reconciled with GitHub.
 
-    `merge_base` is computed against the PR's *actual* base branch (from
-    `baseRefName`, never assumed to be the default branch) after a fresh
-    fetch of that branch, so a stale remote-tracking ref can't drag already-
-    merged commits from other people into the diff. `local_files` is the
+    `merge_base` is computed against the PR's *actual* base commit (GitHub's
+    `baseRefOid` for `baseRefName`, never assumed to be the default branch),
+    so a stale remote-tracking ref can't drag already-merged commits from
+    other people into the diff. `local_files` is the
     `git diff --name-only <merge_base> HEAD` count; `github_files` is GitHub's
     own `changedFiles`. They disagree when the local base is wrong — local
     showing *more* files is the classic stale-base signature.
@@ -1943,9 +1943,16 @@ def _resolve_diff_scope(repo: str, number: int, worktree_path: Path) -> DiffScop
     Returns None (after printing why) when the scope can't be determined —
     `gh pr view` failing, an unparseable response, or `git merge-base`
     failing. That is non-fatal: the launch proceeds without a Scope section,
-    exactly as before this check existed. A failed `git fetch` of the base is
-    only a warning — the already-fetched ref is still usable, and the file-
-    count reconciliation will flag it if it's actually stale.
+    exactly as before this check existed.
+
+    The merge-base is computed against GitHub's own base commit
+    (`baseRefOid`), not the local `origin/<base>` ref, so a stale ref can't
+    silently widen the diff — file-count reconciliation alone misses a stale
+    base whose extra commits only touch files the PR also touches. A failed
+    `git fetch` of the base is only a warning when that commit is already
+    present locally (e.g. via the PR's own history after a rebase); when it
+    isn't, the scope is unverifiable and we return None rather than certify
+    a diff against the wrong base.
 
     Runs `git` in the worktree: worktrees share refs with the primary clone,
     so fetching here updates the same `origin/<base>` ref the primary uses.
@@ -1962,7 +1969,7 @@ def _resolve_diff_scope(repo: str, number: int, worktree_path: Path) -> DiffScop
                 "--repo",
                 repo,
                 "--json",
-                "baseRefName,changedFiles",
+                "baseRefName,baseRefOid,changedFiles",
             ],
             cwd=worktree_path,
             timeout=15,
@@ -1977,12 +1984,13 @@ def _resolve_diff_scope(repo: str, number: int, worktree_path: Path) -> DiffScop
     try:
         meta = json.loads(view.stdout)
         base = str(meta["baseRefName"]).strip()
+        base_oid = str(meta["baseRefOid"]).strip()
         github_files = int(meta["changedFiles"])
     except (ValueError, KeyError, TypeError) as e:
         print(f"warning: unexpected `gh pr view` output ({e}); skipping diff-scope check.")
         return None
-    if not base:
-        print("warning: PR has an empty baseRefName; skipping diff-scope check.")
+    if not base or not base_oid:
+        print("warning: PR has an empty baseRefName/baseRefOid; skipping diff-scope check.")
         return None
 
     print(f"Fetching base branch origin/{base}…")
@@ -2007,7 +2015,27 @@ def _resolve_diff_scope(repo: str, number: int, worktree_path: Path) -> DiffScop
         print(f"warning: `git {' '.join(args)}` failed ({err}); skipping diff-scope check.")
         return None
 
-    mb_out = _git("merge-base", f"origin/{base}", "HEAD")
+    # GitHub's base commit must be present locally; if the fetch failed and
+    # it isn't, our `origin/<base>` is behind GitHub's and any merge-base
+    # computed from it could include other people's already-merged work.
+    try:
+        has_base = run(
+            ["git", "cat-file", "-e", f"{base_oid}^{{commit}}"], cwd=worktree_path, timeout=30
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as e:
+        print(
+            f"warning: couldn't look up base commit {base_oid[:8]} ({e}); "
+            "skipping diff-scope check."
+        )
+        return None
+    if has_base.returncode != 0:
+        print(
+            f"warning: GitHub's base commit {base_oid[:8]} for origin/{base} isn't "
+            "available locally (base fetch failed?); skipping diff-scope check."
+        )
+        return None
+
+    mb_out = _git("merge-base", base_oid, "HEAD")
     if mb_out is None:
         return None
     merge_base = mb_out.strip()

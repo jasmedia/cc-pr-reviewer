@@ -3994,21 +3994,26 @@ def _git(cwd: Path, *args: str) -> str:
     ).stdout.strip()
 
 
-def _commit(repo: Path, name: str) -> str:
-    (repo / name).write_text(name)
+def _commit(repo: Path, name: str, content: str | None = None) -> str:
+    (repo / name).write_text(name if content is None else content)
     _git(repo, "add", name)
     _git(repo, "commit", "-q", "-m", name)
     return _git(repo, "rev-parse", "HEAD")
 
 
-@pytest.fixture
-def stale_base_worktree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+def _build_stale_base(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, same_file: bool = False
+) -> dict[str, Any]:
     """Real git repos reproducing the stale-base scenario.
 
-    origin/main gains someone else's merged commit (`other.py`); the PR is
-    rebased onto it and adds `pr.py`. The review checkout fetched only the PR
-    ref, so its `origin/main` is still the old commit — a merge-base computed
-    from it would drag `other.py` into the diff (2 files vs GitHub's 1).
+    origin/main gains someone else's merged commit; the PR is rebased onto it
+    and adds its own change. The review checkout fetched only the PR ref, so
+    its `origin/main` is still the old commit — a merge-base computed from it
+    would drag the merged change into the diff. With `same_file`, the merged
+    commit and the PR edit the SAME file, so the stale diff has the same file
+    count as GitHub's (1) and count reconciliation alone can't catch it.
+    After the PR is pushed, main advances once more (`later`), a commit the
+    review checkout only gets if its base fetch succeeds.
     """
     gitcfg = tmp_path / "gitconfig"
     gitcfg.write_text("")
@@ -4028,20 +4033,38 @@ def stale_base_worktree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict
     _git(tmp_path, "clone", "-q", str(origin), str(author))
     _git(author, "checkout", "-q", "-b", "main")
     _commit(author, "base.py")
+    if same_file:
+        _commit(author, "shared.py", "v1")
     _git(author, "push", "-q", "origin", "main")
 
     review = tmp_path / "review"
     _git(tmp_path, "clone", "-q", str(origin), str(review))  # origin/main = base
 
-    merged = _commit(author, "other.py")  # someone else's merged work
+    # someone else's merged work
+    merged = _commit(author, "shared.py", "v2") if same_file else _commit(author, "other.py")
     _git(author, "push", "-q", "origin", "main")
     _git(author, "checkout", "-q", "-b", "pr")
-    _commit(author, "pr.py")
+    if same_file:
+        _commit(author, "shared.py", "v3")
+    else:
+        _commit(author, "pr.py")
     _git(author, "push", "-q", "origin", "pr")
+    _git(author, "checkout", "-q", "main")
+    later = _commit(author, "later.py")
+    _git(author, "push", "-q", "origin", "main")
 
     _git(review, "fetch", "-q", "origin", "pr:refs/remotes/origin/pr")
     _git(review, "checkout", "-q", "--detach", "origin/pr")
-    return {"path": review, "merged": merged}
+    return {"path": review, "merged": merged, "later": later}
+
+
+@pytest.fixture
+def stale_base_worktree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    return _build_stale_base(tmp_path, monkeypatch)
+
+
+def _gh_meta(base_oid: str, base: str = "main", files: int = 1) -> str:
+    return json.dumps({"baseRefName": base, "baseRefOid": base_oid, "changedFiles": files})
 
 
 def _patch_gh(
@@ -4068,9 +4091,9 @@ def _patch_gh(
 def test_resolve_diff_scope_fetches_base_and_reconciles(
     stale_base_worktree: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The fresh base fetch moves the merge-base forward past the other
-    author's merged commit, so the local count matches GitHub's."""
-    _patch_gh(monkeypatch)
+    """The fresh base fetch brings in GitHub's base commit; the merge-base
+    lands past the other author's merged commit, so counts match GitHub's."""
+    _patch_gh(monkeypatch, stdout=_gh_meta(stale_base_worktree["later"]))
     scope = _resolve_diff_scope("o/r", 1, stale_base_worktree["path"])
     assert scope is not None
     assert scope.base_ref == "main"
@@ -4079,17 +4102,33 @@ def test_resolve_diff_scope_fetches_base_and_reconciles(
     assert not scope.mismatch
 
 
-def test_resolve_diff_scope_flags_stale_base_when_fetch_fails(
+def test_resolve_diff_scope_skips_when_base_commit_unavailable(
     stale_base_worktree: dict[str, Any], monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:
-    """If the base can't be refreshed, the stale merge-base pulls in the
-    already-merged file and the reconciliation catches it."""
-    _patch_gh(monkeypatch, fail_fetch=True)
-    scope = _resolve_diff_scope("o/r", 1, stale_base_worktree["path"])
+    """Fetch failed and GitHub's base commit isn't local: the stale
+    `origin/main` must NOT be used to certify a scope."""
+    _patch_gh(monkeypatch, stdout=_gh_meta(stale_base_worktree["later"]), fail_fetch=True)
+    assert _resolve_diff_scope("o/r", 1, stale_base_worktree["path"]) is None
+    out = capsys.readouterr().out
+    assert "network down" in out
+    assert "isn't available locally" in out
+
+
+@pytest.mark.parametrize("same_file", [False, True], ids=["other-file", "same-file"])
+def test_resolve_diff_scope_uses_github_base_commit_despite_stale_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, same_file: bool
+) -> None:
+    """Fetch failed, but GitHub's base commit is reachable via the PR's own
+    history: the merge-base comes from it, not the stale `origin/main`. The
+    same-file case is the one count reconciliation alone would miss — the
+    stale diff would also be 1 file, but include the other author's edit."""
+    wt = _build_stale_base(tmp_path, monkeypatch, same_file=same_file)
+    _patch_gh(monkeypatch, stdout=_gh_meta(wt["merged"]), fail_fetch=True)
+    scope = _resolve_diff_scope("o/r", 1, wt["path"])
     assert scope is not None
-    assert (scope.local_files, scope.github_files) == (2, 1)
-    assert scope.mismatch
-    assert "network down" in capsys.readouterr().out
+    assert scope.merge_base == wt["merged"]
+    assert (scope.local_files, scope.github_files) == (1, 1)
+    assert not scope.mismatch
 
 
 @pytest.mark.parametrize(
@@ -4098,9 +4137,10 @@ def test_resolve_diff_scope_flags_stale_base_when_fetch_fails(
         ("", 1),
         ("not json", 0),
         ('{"baseRefName": "main"}', 0),
-        ('{"baseRefName": "", "changedFiles": 1}', 0),
+        ('{"baseRefName": "", "baseRefOid": "abc", "changedFiles": 1}', 0),
+        ('{"baseRefName": "main", "baseRefOid": "", "changedFiles": 1}', 0),
     ],
-    ids=["gh-fails", "bad-json", "missing-field", "empty-base"],
+    ids=["gh-fails", "bad-json", "missing-field", "empty-base", "empty-base-oid"],
 )
 def test_resolve_diff_scope_returns_none_on_bad_pr_metadata(
     stale_base_worktree: dict[str, Any],
@@ -4115,8 +4155,10 @@ def test_resolve_diff_scope_returns_none_on_bad_pr_metadata(
 def test_resolve_diff_scope_returns_none_when_base_ref_missing(
     stale_base_worktree: dict[str, Any], monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:
-    """A base branch that doesn't exist on origin fails the fetch and the
-    merge-base — no scope, with the git error surfaced."""
-    _patch_gh(monkeypatch, stdout='{"baseRefName": "nope", "changedFiles": 1}')
+    """A base branch that doesn't exist on origin fails the fetch, and its
+    base commit isn't local — no scope, with the reason surfaced."""
+    _patch_gh(monkeypatch, stdout=_gh_meta("0" * 40, base="nope"))
     assert _resolve_diff_scope("o/r", 1, stale_base_worktree["path"]) is None
-    assert "merge-base" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "git fetch origin nope" in out
+    assert "isn't available locally" in out
