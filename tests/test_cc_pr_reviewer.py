@@ -23,6 +23,7 @@ import pytest
 import cc_pr_reviewer as _mod
 from cc_pr_reviewer import (
     _APP_HOSTNAME,
+    _APPROVE_POLICY_LABELS,
     _REFRESH_CYCLE,
     _REFRESH_OPTIONS,
     _SKILL_COVERAGE,
@@ -32,6 +33,7 @@ from cc_pr_reviewer import (
     CODEGRAPH_AFFECTED_TESTS_CAP,
     CODEGRAPH_HINT_SUFFIX,
     CODEGRAPH_IMPACT_NUDGE,
+    DEFAULT_APPROVE_POLICY,
     DEFAULT_THEME,
     EXISTING_COMMENT_BODY_CAP,
     EXISTING_COMMENT_LIST_CAP,
@@ -434,6 +436,108 @@ def test_first_review_approve_assembles_in_canonical_order(cli: str, expected_ba
         ]
     )
     assert built.text == expected
+
+
+# --- approve_policy (Settings → build_review_prompt(allow_approve=...)) -----
+
+
+_APPROVE_CLAUSES = (
+    POST_INLINE_APPROVE_SUFFIX,
+    POST_INLINE_REREVIEW_APPROVE_SUFFIX,
+    POST_INLINE_REREVIEW_RESOLVE_SUFFIX,
+)
+
+
+@pytest.mark.parametrize("cli", ["claude", "codex", "gemini"])
+@pytest.mark.parametrize(
+    "existing",
+    [[], [_comment("charlie")], [_comment("alice")]],
+    ids=["first-review", "third-party-comments", "rereview"],
+)
+def test_comment_only_policy_strips_every_approve_clause(
+    cli: str, existing: list[dict[str, Any]]
+) -> None:
+    """With approve_policy "comment-only", no APPROVE or resolve instruction
+    may reach the agent on any path that would otherwise carry one (first
+    review, first review with third-party comments, re-review) — for every
+    CLI. This is the hard stop: approval must stay a separate human action."""
+    built = build_review_prompt(
+        post_inline=True,
+        extra_prompt="",
+        existing=existing,
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+        cli=cli,
+        allow_approve=False,
+    )
+    for clause in _APPROVE_CLAUSES:
+        assert clause not in built.text
+    assert "APPROVE" not in built.text
+    assert POST_INLINE_PROMPT in built.text
+
+
+def test_comment_only_policy_keeps_rereview_raised_bar() -> None:
+    """The policy vetoes the verdict only — a re-review still raises the bar
+    on which findings get posted."""
+    built = build_review_prompt(
+        post_inline=True,
+        extra_prompt="",
+        existing=[_comment("alice")],
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+        allow_approve=False,
+    )
+    assert built.rereview
+    assert POST_INLINE_REREVIEW_SUFFIX in built.text
+
+
+@pytest.mark.parametrize("cli", ["claude", "codex", "gemini"])
+def test_comment_only_rereview_assembles_in_canonical_order(cli: str) -> None:
+    """Lock the exact comment-only re-review assembly so the policy can't
+    leave a dangling separator or reorder sections."""
+    existing = [_comment("alice")]
+    built = build_review_prompt(
+        post_inline=True,
+        extra_prompt="",
+        existing=existing,
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+        cli=cli,
+        allow_approve=False,
+    )
+    base = REVIEW_PROMPT_CLAUDE if cli == "claude" else REVIEW_PROMPT_SKILL_BASED
+    assert built.text == PROMPT_SECTION_SEP.join(
+        [
+            base,
+            format_existing_comments(existing)[0],
+            POST_INLINE_PROMPT + POST_INLINE_DEDUP_SUFFIX + POST_INLINE_REREVIEW_SUFFIX,
+        ]
+    )
+
+
+@pytest.mark.parametrize("existing", [[], [_comment("alice")]], ids=["first-review", "rereview"])
+def test_allow_approve_default_matches_explicit_auto(existing: list[dict[str, Any]]) -> None:
+    """Omitting `allow_approve` must equal the "auto" policy, so callers that
+    predate the setting keep the historical prompt byte-for-byte."""
+    kwargs: dict[str, Any] = dict(
+        post_inline=True,
+        extra_prompt="",
+        existing=existing,
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+    )
+    assert (
+        build_review_prompt(**kwargs).text == build_review_prompt(**kwargs, allow_approve=True).text
+    )
+    assert DEFAULT_APPROVE_POLICY == "auto"
+
+
+def test_approve_policy_labels_cover_both_policies() -> None:
+    assert set(_APPROVE_POLICY_LABELS) == {"auto", "comment-only"}
 
 
 # --- selected_agents subset (ConfirmScreen → build_review_prompt) ----------
@@ -1959,6 +2063,27 @@ def test_banner_default_agents_omits_agents_part() -> None:
     ]
 
 
+def test_banner_flags_comment_only_policy_when_posting_inline() -> None:
+    """A non-default approve policy is called out next to post-inline — the
+    last chance to notice it before the agent submits a verdict."""
+    parts = _format_launch_banner_parts(
+        True, _built(), True, "me", REVIEW_SKILLS, "", allow_approve=False
+    )
+    assert parts[0] == "post-inline: on, never-approve"
+
+
+@pytest.mark.parametrize(
+    ("post_inline", "allow_approve"), [(False, False), (True, True), (False, True)]
+)
+def test_banner_omits_never_approve_when_irrelevant(post_inline: bool, allow_approve: bool) -> None:
+    """Default policy, or no inline posting (no verdict is submitted), leaves
+    the banner unchanged."""
+    parts = _format_launch_banner_parts(
+        post_inline, _built(), True, "me", REVIEW_SKILLS, "", allow_approve=allow_approve
+    )
+    assert "never-approve" not in parts[0]
+
+
 def test_banner_reordered_full_set_still_omits_agents_part() -> None:
     """Comparison is by SET — a reordered-but-full subset is still the
     default shape and shouldn't trip the agents gate."""
@@ -3277,6 +3402,36 @@ def test_settings_screen_mounts_with_offcycle_refresh(interval: int) -> None:
 
     # No exception == the regression is fixed; the snapped value is legal.
     assert asyncio.run(_run()) in _REFRESH_OPTIONS
+
+
+@pytest.mark.parametrize("stored", ["comment-only", "auto", "bogus", ""])
+def test_settings_screen_approve_policy_select(stored: str) -> None:
+    """The approve-policy Select mounts with a stored legal value, and snaps a
+    hand-edited/unknown one to the default instead of raising
+    `InvalidSelectValueError` (which would take the app down on `,`)."""
+    import asyncio
+
+    from textual.app import App
+    from textual.widgets import Select
+
+    async def _run() -> str:
+        app: App = App()
+        async with app.run_test() as pilot:
+            await app.push_screen(
+                SettingsScreen(
+                    cli="claude",
+                    codegraph_assist=False,
+                    refresh_interval=3600,
+                    slack_webhook_url="",
+                    theme=DEFAULT_THEME,
+                    approve_policy=stored,  # type: ignore[arg-type]
+                )
+            )
+            await pilot.pause()
+            return app.screen.query_one("#settings-approve", Select).value
+
+    expected = stored if stored in _APPROVE_POLICY_LABELS else DEFAULT_APPROVE_POLICY
+    assert asyncio.run(_run()) == expected
 
 
 class _NotifyFake:
