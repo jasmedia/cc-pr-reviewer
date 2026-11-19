@@ -466,13 +466,71 @@ def _build_cli_command(cli: CliChoice, prompt_text: str) -> list[str]:
     raise ValueError(f"unknown CLI choice: {cli!r}")
 
 
+# Review-quality standards, appended right after the base prompt for every
+# CLI and regardless of post-inline. Defines the P1/P2/P3 taxonomy the
+# `POST_INLINE_*` verdict suffixes below rely on, so keep the two in sync.
+# Deliberately short: it rides on every launch, so each sentence costs prompt
+# tokens (`approx_prompt_tokens` in `review_telemetry` tracks the total).
+REVIEW_STANDARDS_SUFFIX = (
+    "Review standards:\n"
+    "- Tag every finding P1 (must fix before merge: correctness, security, "
+    "data loss, broken contracts, breaking changes, concurrency bugs, resource "
+    "leaks, significant performance regressions), P2 (should fix), or P3 "
+    "(optional / nit), with a `file:line` reference.\n"
+    "- Verify every P1/P2 before reporting it — trace the code path, run the "
+    "test, or reproduce the behavior. If you could not verify it, label it "
+    "UNVERIFIED rather than presenting it as confirmed.\n"
+    "- Every finding must state a concrete consequence (what breaks, for whom, "
+    "when) and be about a line this PR changed, or pre-existing code the change "
+    "made wrong. Fold duplicates into the strongest instance. Cut anything "
+    "whose honest consequence is 'nothing changes'.\n"
+    "- No praise, no 'strengths' section, no recap of what the PR does. "
+    "Treat the PR description and commit messages as claims to check, not "
+    "facts.\n"
+    "- Finding nothing is a valid result: if nothing survives these rules, "
+    "say so plainly instead of padding the review."
+)
+
+# Claude-only: how the orchestrating session briefs the PR Review Toolkit's
+# sub-agents. They start without this conversation, so anything not written
+# into their dispatch prompt (the scope, the standards above) never reaches
+# them, and an agent briefed with the author's framing tends to confirm it.
+# Codex/Gemini run the review skills in-process, so they get no such section.
+# Sits after the standards (and any repo standards) it tells Claude to forward.
+SUBAGENT_DISPATCH_SUFFIX = (
+    "Briefing the review agents (they don't see this conversation, so each "
+    "dispatch prompt must stand on its own):\n"
+    "- Give each agent the worktree path, the PR head SHA, and the merge-base "
+    "with the exact diff command from the review scope section (when present), "
+    "plus the review standards above. Tell it to read the changed files from "
+    "the repo itself.\n"
+    "- Tell it the PR description, commit messages and code comments are the "
+    "author's claims, not evidence, and to test a claim where it can (run the "
+    "test, execute the path).\n"
+    "- Ask it to attack the change as an adversary would: the case that makes "
+    "it look correct when it isn't, the input the author didn't try, the doc "
+    "or comment the code doesn't support.\n"
+    "- Tell it that a clean result for its aspect is valid and should be "
+    "reported as such, never padded with weak observations.\n"
+    "- Treat the agents' output as raw material, not the review: apply the "
+    "review standards to every finding, verify each P1/P2 yourself, and drop "
+    "or downgrade what doesn't hold. Don't substitute your own reading for "
+    "theirs."
+)
+
 POST_INLINE_PROMPT = (
     "Additionally, publish each finding as an inline PR review comment on "
     "GitHub using the `gh` CLI. Create a single pending review via `gh api "
     "--method POST /repos/{owner}/{repo}/pulls/{number}/reviews` with an array "
     "of `comments` entries (each with `path`, `line`, and `body`), then submit "
     "the review with `event: COMMENT` so all findings appear grouped. Use the "
-    "PR's head commit SHA when the endpoint requires `commit_id`."
+    "PR's head commit SHA when the endpoint requires `commit_id`. Prefix every "
+    "comment body with its severity tag, e.g. `[P2]`. If no findings survive, "
+    "do not submit an empty COMMENT review — just say so in your summary. If "
+    "posting is blocked (auth failure, permission denial, sandbox or network "
+    "block), do not try to work around it: print the full JSON payload and "
+    "the exact `gh api ... --input <file>` command in your final summary so "
+    "the user can post it themselves."
 )
 
 # Appended to POST_INLINE_PROMPT only when we actually have existing comments
@@ -492,10 +550,8 @@ POST_INLINE_DEDUP_SUFFIX = (
 # just because someone else commented.
 POST_INLINE_REREVIEW_SUFFIX = (
     " You (the authenticated `gh` user) have already reviewed this PR in a "
-    "previous pass, so raise the bar: only post findings that are clearly "
-    "important (e.g., correctness, security, data loss, broken contracts, "
-    "breaking changes, concurrency bugs, resource leaks, significant "
-    "performance regressions). Skip anything minor, stylistic, or NIT-level."
+    "previous pass, so raise the bar: only post P1 and P2 findings. Skip "
+    "every P3."
 )
 
 # Appended after POST_INLINE_REREVIEW_SUFFIX only when the PR is NOT
@@ -503,7 +559,7 @@ POST_INLINE_REREVIEW_SUFFIX = (
 # on `event: APPROVE` for the author, so this clause is unsafe to send when
 # the `gh` user is the PR author — but the raised bar above still applies.
 POST_INLINE_REREVIEW_APPROVE_SUFFIX = (
-    " If after filtering the only remaining findings are minor or NIT-level, "
+    " If after filtering no P1 or P2 findings remain (only P3s, or nothing), "
     "submit an APPROVE review with no inline comments (use `event: APPROVE` "
     "and omit the `comments` array) instead of `event: COMMENT`."
 )
@@ -554,26 +610,23 @@ POST_INLINE_REREVIEW_RESOLVE_SUFFIX = (
 
 # Appended to POST_INLINE_PROMPT on a *first* review (not a re-review) of a PR
 # the `gh` user did NOT author. It turns the post-inline pass into a verdict:
-# classify each finding, and if nothing is blocking, APPROVE while STILL
-# attaching the low/NIT findings as inline comments. GitHub accepts a
+# using the P1/P2/P3 tags from REVIEW_STANDARDS_SUFFIX, APPROVE when no P1/P2
+# remains while STILL attaching the P3s as inline comments. GitHub accepts a
 # `comments` array on an `event: APPROVE` submission, so "approve + nits" is a
 # single review. Gated on not-self-authored because GitHub returns 422 on
 # self-approval (same guard as the re-review approve clause) — on our own PR
 # or an unknown login we fall through to the plain `event: COMMENT` behavior.
-# The blocking list mirrors POST_INLINE_REREVIEW_SUFFIX so both passes share
-# one taxonomy.
+# Both this and the re-review suffixes key off the same P1/P2/P3 taxonomy
+# (defined once in REVIEW_STANDARDS_SUFFIX). It explicitly overrides
+# POST_INLINE_PROMPT's "no empty COMMENT review" rule, since a clean first
+# review of someone else's PR should still land as an APPROVE.
 POST_INLINE_APPROVE_SUFFIX = (
-    " Then decide the verdict by the highest-priority finding. Classify each "
-    "finding as blocking (correctness, security, data loss, broken contracts, "
-    "breaking changes, concurrency bugs, resource leaks, significant "
-    "performance regressions) or low/NIT (everything else — style, naming, "
-    "minor clarity, optional refactors). If every finding is low/NIT-level (or "
-    "there are none), submit the review with `event: APPROVE` while STILL "
-    "including those findings as inline `comments` — an approval with "
-    "non-blocking nits attached, not an empty approval. If any finding is "
-    "blocking, submit with `event: COMMENT` instead and do not approve. Prefix "
-    "every comment body with its priority label, e.g. `[nit]`, `[low]`, or "
-    "`[blocking]`."
+    " Then decide the verdict by the highest-severity finding. If there are no "
+    "P1 or P2 findings, submit the review with `event: APPROVE` (this "
+    "overrides the no-empty-review rule above), STILL including any P3 "
+    "findings as inline `comments` — an approval with nits attached. If any "
+    "P1 or P2 finding remains, submit with `event: COMMENT` instead and do "
+    "not approve."
 )
 
 # Appended to POST_INLINE_PROMPT when the existing-comments fetch failed. The
@@ -683,6 +736,20 @@ _CLI_CYCLE: dict[CliChoice, CliChoice] = {
     "gemini": "claude",
 }
 DEFAULT_CLI: CliChoice = "claude"
+
+# Whether a post-inline review may submit `event: APPROVE` (and resolve our own
+# addressed threads on re-review). "auto" is the historical behavior: approve
+# another user's PR when only P3 (nit) findings remain. "comment-only" is a hard
+# stop — every review is submitted as `event: COMMENT` and no threads are
+# resolved, leaving approval as a separate, explicit human action. Modal-only
+# Settings value (no footer cycle); `_APPROVE_POLICY_LABELS` is the single
+# source of truth for the legal values and their dropdown labels.
+ApprovePolicy = Literal["auto", "comment-only"]
+_APPROVE_POLICY_LABELS: dict[ApprovePolicy, str] = {
+    "auto": "Auto-approve when only nits remain",
+    "comment-only": "Never approve (comment only)",
+}
+DEFAULT_APPROVE_POLICY: ApprovePolicy = "auto"
 
 # Custom branded theme — a warm dark palette built around Claude's coral
 # (`#d97757`). Registered on the running App (`on_mount`) before the
@@ -1873,6 +1940,482 @@ def _prepare_pr_worktree(
     return True, worktree_created, head_sha
 
 
+@dataclass(frozen=True)
+class DiffScope:
+    """The PR's review scope, resolved locally and reconciled with GitHub.
+
+    `merge_base` is computed against the PR's *actual* base commit (GitHub's
+    `baseRefOid` for `baseRefName`, never assumed to be the default branch),
+    so a stale remote-tracking ref can't drag already-merged commits from
+    other people into the diff. `local_files` is the
+    `git diff --name-only <merge_base> HEAD` count; `github_files` is GitHub's
+    own `changedFiles`. They disagree when the local base is wrong — local
+    showing *more* files is the classic stale-base signature.
+    """
+
+    base_ref: str
+    merge_base: str
+    head_sha: str
+    local_files: int
+    github_files: int
+    # Existing test files this PR modified, renamed or deleted, as
+    # `(status, path)` with status one of "modified"/"renamed"/"deleted".
+    # Added tests are excluded on purpose — new tests for new behavior are
+    # welcome; it's edits to existing expectations that need scrutiny.
+    changed_tests: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def mismatch(self) -> bool:
+        return self.local_files != self.github_files
+
+
+def _resolve_diff_scope(repo: str, number: int, worktree_path: Path) -> DiffScope | None:
+    """Resolve and reconcile the PR's diff scope inside its worktree.
+
+    Returns None (after printing why) when the scope can't be determined —
+    `gh pr view` failing, an unparseable response, or `git merge-base`
+    failing. That is non-fatal: the launch proceeds without a Scope section,
+    exactly as before this check existed.
+
+    The merge-base is computed against GitHub's own base commit
+    (`baseRefOid`), not the local `origin/<base>` ref, so a stale ref can't
+    silently widen the diff — file-count reconciliation alone misses a stale
+    base whose extra commits only touch files the PR also touches. A failed
+    `git fetch` of the base is only a warning when that commit is already
+    present locally (e.g. via the PR's own history after a rebase); when it
+    isn't, the scope is unverifiable and we return None rather than certify
+    a diff against the wrong base.
+
+    Runs `git` in the worktree: worktrees share refs with the primary clone,
+    so fetching here updates the same `origin/<base>` ref the primary uses.
+    `gh pr view --repo` is explicit for the same cross-fork reason as
+    `_codegraph_affected_paths`.
+    """
+    try:
+        view = run(
+            [
+                "gh",
+                "pr",
+                "view",
+                str(number),
+                "--repo",
+                repo,
+                "--json",
+                "baseRefName,baseRefOid,changedFiles",
+            ],
+            cwd=worktree_path,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as e:
+        print(f"warning: `gh pr view` failed ({e}); skipping diff-scope check.")
+        return None
+    if view.returncode != 0:
+        err = (view.stderr or view.stdout).strip() or f"exit {view.returncode}"
+        print(f"warning: `gh pr view` failed ({err}); skipping diff-scope check.")
+        return None
+    try:
+        meta = json.loads(view.stdout)
+        base = str(meta["baseRefName"]).strip()
+        base_oid = str(meta["baseRefOid"]).strip()
+        github_files = int(meta["changedFiles"])
+    except (ValueError, KeyError, TypeError) as e:
+        print(f"warning: unexpected `gh pr view` output ({e}); skipping diff-scope check.")
+        return None
+    if not base or not base_oid:
+        print("warning: PR has an empty baseRefName/baseRefOid; skipping diff-scope check.")
+        return None
+
+    print(f"Fetching base branch origin/{base}…")
+    try:
+        fetch = run(["git", "fetch", "origin", base], cwd=worktree_path, timeout=120)
+        if fetch.returncode != 0:
+            err = (fetch.stderr or fetch.stdout).strip() or f"exit {fetch.returncode}"
+            print(f"warning: `git fetch origin {base}` failed ({err}); using last-fetched ref.")
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as e:
+        print(f"warning: `git fetch origin {base}` failed ({e}); using last-fetched ref.")
+
+    def _git(*args: str) -> str | None:
+        """Run one git step; on failure print why and return None."""
+        try:
+            r = run(["git", *args], cwd=worktree_path, timeout=30)
+        except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as e:
+            err = str(e)
+        else:
+            if r.returncode == 0:
+                return r.stdout
+            err = (r.stderr or r.stdout).strip() or f"exit {r.returncode}"
+        print(f"warning: `git {' '.join(args)}` failed ({err}); skipping diff-scope check.")
+        return None
+
+    # GitHub's base commit must be present locally; if the fetch failed and
+    # it isn't, our `origin/<base>` is behind GitHub's and any merge-base
+    # computed from it could include other people's already-merged work.
+    try:
+        has_base = run(
+            ["git", "cat-file", "-e", f"{base_oid}^{{commit}}"], cwd=worktree_path, timeout=30
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as e:
+        print(
+            f"warning: couldn't look up base commit {base_oid[:8]} ({e}); "
+            "skipping diff-scope check."
+        )
+        return None
+    if has_base.returncode != 0:
+        print(
+            f"warning: GitHub's base commit {base_oid[:8]} for origin/{base} isn't "
+            "available locally (base fetch failed?); skipping diff-scope check."
+        )
+        return None
+
+    mb_out = _git("merge-base", base_oid, "HEAD")
+    if mb_out is None:
+        return None
+    merge_base = mb_out.strip()
+    head_out = _git("rev-parse", "HEAD")
+    if head_out is None:
+        return None
+    # `--name-status` (not `--name-only`) so one call yields both the file
+    # count (one line per file, renames included, same as `--name-only`) and
+    # which existing tests were modified/renamed/deleted. `-z` so paths come
+    # through raw — without it git C-quotes non-ASCII/tab/quote paths
+    # (`"tests/caf\303\251.py"`), which the test-path heuristic can't match.
+    diff_out = _git("diff", "--name-status", "-z", merge_base, "HEAD")
+    if diff_out is None:
+        return None
+    local_files, changed_tests = _parse_name_status(diff_out)
+    return DiffScope(
+        base_ref=base,
+        merge_base=merge_base,
+        head_sha=head_out.strip(),
+        local_files=local_files,
+        github_files=github_files,
+        changed_tests=changed_tests,
+    )
+
+
+# Directory names that mark everything under them as test code. Includes
+# `__snapshots__` because editing a snapshot IS editing expected values — the
+# "update the expectation to match new output" red flag in its purest form.
+_TEST_DIR_NAMES = frozenset({"test", "tests", "__tests__", "spec", "specs", "__snapshots__"})
+# Filename conventions across the common ecosystems: pytest (`test_*.py`,
+# `*_test.py`, `conftest.py` fixtures), Go (`*_test.go`), JS/TS
+# (`*.test.*`, `*.spec.*`), JVM/.NET (`*Test(s).java|kt|cs`), RSpec (`*_spec.rb`).
+_TEST_FILE_RE = re.compile(
+    r"(^test_.*\.py$)|(_test\.(py|go)$)|(^conftest\.py$)"
+    r"|(\.(test|spec)\.[cm]?[jt]sx?$)"
+    r"|(Tests?\.(java|kt|cs)$)|(_spec\.rb$)"
+)
+
+
+def _is_test_path(path: str) -> bool:
+    """Heuristic: does this repo-relative path look like test code? (pure)"""
+    parts = path.split("/")
+    if any(part in _TEST_DIR_NAMES for part in parts[:-1]):
+        return True
+    return bool(_TEST_FILE_RE.search(parts[-1]))
+
+
+_NAME_STATUS_LABELS = {"M": "modified", "D": "deleted", "R": "renamed"}
+
+
+def _parse_name_status(out: str) -> tuple[int, tuple[tuple[str, str], ...]]:
+    """Parse `git diff --name-status -z` into (file count, changed existing tests). Pure.
+
+    Records are NUL-separated: `<status>\0<path>\0`, or for renames/copies
+    `R<score>\0<old>\0<new>\0`. A renamed test is listed under its new path
+    (where the reviewer will find it) but matched on either path, so moving a
+    test out of `tests/` doesn't hide it. Added (`A`) and copied (`C`) files
+    are never "existing tests".
+    """
+    count = 0
+    tests: list[tuple[str, str]] = []
+    fields = out.split("\0")
+    i = 0
+    while i < len(fields):
+        status = fields[i].strip()
+        if not status:
+            i += 1
+            continue
+        n_paths = 2 if status[:1] in ("R", "C") else 1
+        paths = [p for p in fields[i + 1 : i + 1 + n_paths] if p]
+        i += 1 + n_paths
+        count += 1
+        label = _NAME_STATUS_LABELS.get(status[:1])
+        if label is None or not paths:
+            continue
+        if any(_is_test_path(p) for p in paths):
+            tests.append((label, paths[-1]))
+    return count, tuple(sorted(tests, key=lambda t: t[1]))
+
+
+TEST_CHANGE_SCRUTINY_CAP = 30
+
+TEST_CHANGE_SCRUTINY_SUFFIX = (
+    "Changing an existing test is the exception, not the norm: a refactor or "
+    "bug fix that doesn't change intended behavior shouldn't need to touch "
+    "existing expectations. For each file above, decide whether the change is "
+    "legitimate (a real requirement changed, and the PR says so) or weakens "
+    "the test to get the suite green. Red flags: an assertion removed, "
+    "loosened, or made less specific; expected values edited to match new "
+    "output with no stated reason; a test deleted, skipped, xfail'd, or "
+    "commented out; a test-only change with no product-code change to justify "
+    "it; reduced coverage (cases dropped, fixtures stubbed out). For each, find "
+    "the product-code change that necessitates it, confirm the new expectation "
+    "is the intended behavior rather than a regression the edited test now "
+    "accepts, and check the PR explains why. Flag unjustified changes as P1 if "
+    "they could hide a regression, P2 if merely unexplained, naming the "
+    "specific assertion. Newly added tests are fine and not in scope here."
+)
+
+
+def format_test_change_scrutiny(changed_tests: tuple[tuple[str, str], ...]) -> str:
+    """Render the edited-existing-tests prompt section (pure).
+
+    Returns "" (skip the section) when the PR touches no existing test, so
+    the ~200-token instruction only rides on launches where it applies.
+    Capped at `TEST_CHANGE_SCRUTINY_CAP` with an explicit overflow note.
+    """
+    if not changed_tests:
+        return ""
+    shown = changed_tests[:TEST_CHANGE_SCRUTINY_CAP]
+    lines = ["This PR modifies, renames, or deletes existing test files:"]
+    lines += [f"- `{path}` ({label})" for label, path in shown]
+    hidden = len(changed_tests) - len(shown)
+    if hidden:
+        lines.append(f"- … and {hidden} more (run the scope diff to see all).")
+    lines.append(TEST_CHANGE_SCRUTINY_SUFFIX)
+    return "\n".join(lines)
+
+
+# Per-org / per-repo review conventions, by file convention (no Settings UI):
+#   $GH_PR_WORKSPACE/.review-standards/<owner>.md          — every repo of <owner>
+#   $GH_PR_WORKSPACE/.review-standards/<owner>/<repo>.md   — one repo; REPLACES
+#                                                            the org file
+# The markdown body is added to the prompt; an optional frontmatter
+# `title_pattern:` regex enables a Python-side PR-title check. Lives outside any
+# clone/worktree so it never leaks into a reviewed repo, and is scoped per org
+# because the TUI lists review requests from every org the user belongs to.
+STANDARDS_DIR = WORKSPACE / ".review-standards"
+# Keep a runaway file from swamping the prompt; truncation is announced both
+# in the terminal and inside the section itself.
+REPO_STANDARDS_CHAR_CAP = 6000
+_KNOWN_STANDARDS_KEYS = frozenset({"title_pattern"})
+
+
+@dataclass(frozen=True)
+class RepoStandards:
+    """A loaded `.review-standards` file. `title_pattern` is pre-validated:
+    it's None when absent or when the regex didn't compile (warned)."""
+
+    source: Path
+    body: str
+    title_pattern: str | None = None
+
+
+def _find_case_insensitive(directory: Path, name: str) -> Path | None:
+    """`directory/name`, matched case-insensitively (GitHub owner/repo names
+    are case-insensitive, but Linux filesystems aren't).
+
+    A missing directory is silent (the feature is simply off); any other
+    listing error (permissions, I/O) warns, so configured standards are never
+    skipped — or swapped for the org fallback — without a signal.
+    """
+    try:
+        entries = list(directory.iterdir())
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as e:
+        print(f"warning: couldn't list review standards dir {directory} ({e}); skipping it.")
+        return None
+    exact = directory / name
+    if exact in entries:
+        return exact
+    lowered = name.lower()
+    return next((e for e in entries if e.name.lower() == lowered), None)
+
+
+def _parse_standards_file(text: str, source: Path) -> RepoStandards:
+    """Split optional `---` frontmatter from the body (pure apart from warnings).
+
+    Frontmatter is deliberately minimal — `key: value` lines, not YAML — so no
+    new dependency. Values are taken verbatim after the first `: ` and
+    stripped; wrap a value in matching single or double quotes to keep
+    leading/trailing whitespace (e.g. a regex ending in a space).
+    """
+    body = text
+    meta: dict[str, str] = {}
+    lines = text.splitlines()
+    if lines and lines[0].strip() == "---":
+        end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), None)
+        if end is None:
+            print(f"warning: {source}: unterminated `---` frontmatter; treating it as body.")
+        else:
+            for raw in lines[1:end]:
+                if not raw.strip() or raw.lstrip().startswith("#"):
+                    continue
+                key, sep, value = raw.partition(":")
+                key = key.strip()
+                if not sep or key not in _KNOWN_STANDARDS_KEYS:
+                    print(f"warning: {source}: ignoring unknown frontmatter line {raw.strip()!r}.")
+                    continue
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+                    value = value[1:-1]
+                meta[key] = value
+            body = "\n".join(lines[end + 1 :])
+
+    pattern = meta.get("title_pattern") or None
+    if pattern is not None:
+        try:
+            re.compile(pattern)
+        except re.error as e:
+            print(f"warning: {source}: invalid title_pattern {pattern!r} ({e}); title check off.")
+            pattern = None
+
+    body = body.strip()
+    if len(body) > REPO_STANDARDS_CHAR_CAP:
+        print(
+            f"warning: {source} is {len(body)} chars; only the first "
+            f"{REPO_STANDARDS_CHAR_CAP} go into the prompt."
+        )
+        body = body[:REPO_STANDARDS_CHAR_CAP] + "\n[… truncated — the rest of the file was omitted]"
+    return RepoStandards(source=source, body=body, title_pattern=pattern)
+
+
+def load_repo_standards(owner: str, repo: str, root: Path = STANDARDS_DIR) -> RepoStandards | None:
+    """Load the conventions file for `owner/repo`, repo file first, else org file.
+
+    Returns None when neither exists (the feature is simply off for this repo
+    — silent by design) and, after a warning, when the file exists but can't
+    be read (a configured-but-broken file must not be silently ignored).
+    """
+    candidates: list[Path] = []
+    owner_dir = _find_case_insensitive(root, owner)
+    if owner_dir is not None and owner_dir.is_dir():
+        repo_file = _find_case_insensitive(owner_dir, f"{repo}.md")
+        if repo_file is not None:
+            candidates.append(repo_file)
+    org_file = _find_case_insensitive(root, f"{owner}.md")
+    if org_file is not None:
+        candidates.append(org_file)
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as e:
+            print(f"warning: couldn't read review standards {path} ({e}); skipping them.")
+            return None
+        return _parse_standards_file(text, path)
+    return None
+
+
+def fetch_pr_title(repo: str, number: int) -> str | None:
+    """The PR's current title from GitHub, or None (after a warning) on failure.
+
+    The queue's cached title can be stale by launch time; the title check
+    must judge what the PR is titled now, not at the last refresh.
+    """
+    try:
+        r = run(
+            ["gh", "pr", "view", str(number), "--repo", repo, "--json", "title"],
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as e:
+        err = str(e)
+    else:
+        if r.returncode == 0:
+            try:
+                return str(json.loads(r.stdout)["title"])
+            except (ValueError, KeyError, TypeError) as e:
+                err = f"unexpected output: {e}"
+        else:
+            err = (r.stderr or r.stdout).strip() or f"exit {r.returncode}"
+    print(f"warning: couldn't fetch the current PR title ({err}); using the cached one.")
+    return None
+
+
+def title_check_failed(standards: RepoStandards | None, title: str) -> bool:
+    """True when a title pattern is configured and the PR title doesn't match. Pure."""
+    return bool(
+        standards and standards.title_pattern and not re.search(standards.title_pattern, title)
+    )
+
+
+def describe_repo_standards(standards: RepoStandards | None, title: str) -> str:
+    """Launch-banner fragment for the conventions file (pure; "" when none)."""
+    if standards is None:
+        return ""
+    desc = f"standards: {standards.source.name}"
+    if title_check_failed(standards, title):
+        desc += ", title check failed"
+    return desc
+
+
+def format_repo_standards(standards: RepoStandards | None, title: str) -> str:
+    """Render the repository-conventions prompt section (pure).
+
+    A passing title check adds nothing (no acknowledgement to post); a failing
+    one is stated as a fact for the review *body* — a process issue, not a
+    `file:line` finding. Returns "" when there's nothing to say.
+    """
+    if standards is None:
+        return ""
+    parts: list[str] = []
+    if standards.body:
+        parts.append(
+            f"Repository review conventions (from `{standards.source.name}`) — apply "
+            f"these on top of the review standards above:\n{standards.body}"
+        )
+    if title_check_failed(standards, title):
+        parts.append(
+            f"PR title check: the title {title!r} does not match this repository's "
+            f"required format (regex `{standards.title_pattern}`). Raise this in the "
+            "review body or summary, not as an inline `file:line` finding."
+        )
+    return "\n\n".join(parts)
+
+
+def format_diff_scope(scope: DiffScope, number: int) -> str:
+    """Render the prompt's Scope section (pure).
+
+    Hands the agent one fixed scope so it — and every sub-agent it
+    dispatches — reads the same diff instead of re-deriving the base from
+    whatever ref happens to be local. On a mismatch the user chose to
+    continue anyway, so the section names GitHub's file list as
+    authoritative rather than silently trusting the local diff.
+    """
+    mb = scope.merge_base
+    lines = [
+        "Review scope (resolved before launch — use it instead of re-deriving the base):",
+        f"- Base branch: `{scope.base_ref}`; merge-base: `{mb}`; PR head: `{scope.head_sha}`.",
+        f"- Changed files: `git diff --name-only {mb} HEAD`. Full diff: `git diff {mb} HEAD`.",
+        "- Only changes in that diff are in scope. Give the merge-base SHA and these "
+        "commands to any sub-agent you dispatch.",
+    ]
+    if scope.mismatch:
+        lines.append(
+            f"- WARNING: the local diff has {scope.local_files} files but GitHub reports "
+            f"{scope.github_files}. Treat `gh pr diff {number} --name-only` as the "
+            "authoritative file list and ignore files outside it."
+        )
+    return "\n".join(lines)
+
+
+def describe_diff_scope(scope: DiffScope | None) -> str:
+    """Launch-banner fragment for the scope check (pure)."""
+    if scope is None:
+        return "scope: unavailable"
+    desc = f"scope: {scope.base_ref}@{scope.merge_base[:8]}, {scope.local_files} files"
+    if scope.mismatch:
+        desc += f" (GitHub: {scope.github_files})"
+    elif scope.changed_tests:
+        # Mirrors the launch gate: the test-change section is only sent when
+        # the counts reconcile, so only advertise it then.
+        desc += f", {len(scope.changed_tests)} existing tests edited"
+    return desc
+
+
 def _setup_codegraph_index(
     primary_path: Path,
     worktree_path: Path,
@@ -2057,6 +2600,9 @@ def _format_launch_banner_parts(
     my_login: str | None,
     selected_agents: tuple[str, ...],
     extra_prompt: str,
+    allow_approve: bool = True,
+    scope_desc: str = "",
+    standards_desc: str = "",
 ) -> list[str]:
     """Assemble the human-readable launch-banner fragments (pure).
 
@@ -2078,7 +2624,15 @@ def _format_launch_banner_parts(
         post_inline_desc += ", rereview"
     elif post_inline and my_login is None:
         post_inline_desc += ", rereview-detection-unavailable"
+    # Only the non-default policy is called out, and only when it can matter
+    # (approval is a post-inline concern) — keeps the default banner unchanged.
+    if post_inline and not allow_approve:
+        post_inline_desc += ", never-approve"
     parts = [f"post-inline: {post_inline_desc}", existing_desc]
+    if scope_desc:
+        parts.append(scope_desc)
+    if standards_desc:
+        parts.append(standards_desc)
     # Only call out the agent subset when it diverges from the default — the
     # banner is already crowded, and "agents: all" would be noise on every
     # default-shape launch. Compare as SETS rather than tuples:
@@ -2209,6 +2763,10 @@ def build_review_prompt(
     codegraph_present: bool = False,
     codegraph_affected_tests: str = "",
     selected_agents: tuple[str, ...] | None = None,
+    allow_approve: bool = True,
+    diff_scope: str = "",
+    test_changes: str = "",
+    repo_standards: str = "",
 ) -> BuiltPrompt:
     """Assemble the user message for the selected coding-agent CLI. Pure — no I/O.
 
@@ -2259,6 +2817,36 @@ def build_review_prompt(
     skips the section entirely — that covers both "no index" and "empty
     diff / no affected files" without callers needing to disambiguate.
 
+    `allow_approve` is the `approve_policy` setting resolved to a bool
+    (`"auto"` → True). When False, every APPROVE-bearing clause
+    (`POST_INLINE_APPROVE_SUFFIX`, `POST_INLINE_REREVIEW_APPROVE_SUFFIX`, and
+    the `POST_INLINE_REREVIEW_RESOLVE_SUFFIX` that rides on the latter) is
+    dropped, so the review falls through to plain `event: COMMENT`. The
+    re-review raised bar (`POST_INLINE_REREVIEW_SUFFIX`) is unaffected — it's
+    about which findings to post, not the verdict. Defaults to True so callers
+    that predate the setting keep the historical prompt verbatim.
+
+    `diff_scope` is the pre-rendered Scope section from `format_diff_scope`
+    (base branch, merge-base SHA, head SHA, the exact diff commands, and a
+    GitHub-is-authoritative warning on a file-count mismatch). It lands after
+    the reviewer extras and before the CodeGraph sections — it's "what to
+    review" context. Empty string (the default, and the runtime value when
+    the scope couldn't be resolved) skips the section.
+
+    `test_changes` is the pre-rendered `format_test_change_scrutiny` section
+    (existing tests this PR modified/renamed/deleted, plus the weakened-test
+    red flags). It follows the Scope section; empty skips it.
+
+    `repo_standards` is the pre-rendered `format_repo_standards` section (the
+    org/repo `.review-standards` file body and any failed PR-title check). It
+    sits right after `REVIEW_STANDARDS_SUFFIX` — it's more rules — and before
+    the reviewer extras, so a per-launch instruction can still override it.
+
+    For `cli="claude"` only, `SUBAGENT_DISPATCH_SUFFIX` follows the standards
+    sections: how to brief the toolkit's sub-agents (self-contained scope,
+    standards forwarded, sceptical framing, clean-is-valid) and to treat their
+    output as raw material. Codex/Gemini run skills in-process and skip it.
+
     Contract: `fetch_existing_review_comments` guarantees that
     `fetch_ok=False` always returns `existing=[]`. Passing a non-empty
     `existing` with `fetch_ok=False` is a contradictory state — caught
@@ -2297,7 +2885,10 @@ def build_review_prompt(
     # login can't *prove* the PR isn't ours, so we stay conservative (plain
     # COMMENT) rather than risk a 422.
     not_self_authored = bool(my_login) and author_login != my_login
-    rereview_can_approve = rereview and not_self_authored
+    # `allow_approve=False` (approve_policy "comment-only") vetoes both approve
+    # paths below; it composes with, never replaces, the 422/authorship gate.
+    may_approve = not_self_authored and allow_approve
+    rereview_can_approve = rereview and may_approve
 
     # Default subset → use the precomputed all-six constants (also what the
     # public `REVIEW_PROMPT_*` symbols document); any non-default subset
@@ -2308,7 +2899,17 @@ def build_review_prompt(
         base = _build_claude_prompt(normalised_agents)
     else:
         base = _build_skill_based_prompt(normalised_agents)
-    sections = [base]
+    # Standards sit directly after the base prompt for every CLI and both
+    # post-inline modes — they define the P1/P2/P3 taxonomy the post-inline
+    # verdict suffixes rely on, so they must always be present.
+    sections = [base, REVIEW_STANDARDS_SUFFIX]
+    if repo_standards:
+        sections.append(repo_standards)
+    # Claude dispatches the toolkit's sub-agents itself (even for the generic
+    # no-agents review), so it alone needs the briefing rules. After both
+    # standards sections, which it tells Claude to forward.
+    if cli == "claude":
+        sections.append(SUBAGENT_DISPATCH_SUFFIX)
     # Strip defensively — the current ConfirmResult dataclass already strips,
     # but `build_review_prompt` is now an API boundary and a future caller
     # (or test) passing whitespace-only `extra_prompt` would otherwise render
@@ -2317,7 +2918,11 @@ def build_review_prompt(
     stripped_extra = extra_prompt.strip()
     if stripped_extra:
         sections.append(f"Additional instructions from reviewer:\n{stripped_extra}")
-    # Placed AFTER the reviewer extras so a per-launch override stays adjacent
+    if diff_scope:
+        sections.append(diff_scope)
+    if test_changes:
+        sections.append(test_changes)
+    # Placed AFTER the reviewer extras so a per-launch override stays close
     # to the base prompt (highest visibility), but BEFORE existing-comments
     # and the post-inline output instructions — CodeGraph is workflow guidance
     # for how to gather evidence, so it belongs next to the "what to review"
@@ -2349,7 +2954,7 @@ def build_review_prompt(
             if rereview_can_approve:
                 post += POST_INLINE_REREVIEW_APPROVE_SUFFIX
                 post += POST_INLINE_REREVIEW_RESOLVE_SUFFIX
-        elif not_self_authored and fetch_ok:
+        elif may_approve and fetch_ok:
             # `and fetch_ok`: a failed existing-comments fetch forces
             # `existing=[]`, which forces `rereview=False` — so without this
             # guard the approve clause would fire on a fetch failure and could
@@ -3586,6 +4191,7 @@ class SettingsResult:
     refresh_interval: int
     slack_webhook_url: str
     theme: str
+    approve_policy: ApprovePolicy = DEFAULT_APPROVE_POLICY
 
 
 # Auto-refresh options for the Settings dropdown: every distinct interval the
@@ -3624,9 +4230,16 @@ class SettingsScreen(ModalScreen[SettingsResult | None]):
         refresh_interval: int,
         slack_webhook_url: str,
         theme: str,
+        approve_policy: ApprovePolicy = DEFAULT_APPROVE_POLICY,
     ):
         super().__init__()
         self.cli = cli
+        # Snap unknown values for the same reason as `refresh_interval` below:
+        # `Select(allow_blank=False)` raises on mount for a value not in its
+        # options.
+        self.approve_policy: ApprovePolicy = (
+            approve_policy if approve_policy in _APPROVE_POLICY_LABELS else DEFAULT_APPROVE_POLICY
+        )
         self.codegraph_assist = codegraph_assist
         # Snap to a legal dropdown option: the rest of the app tolerates
         # hand-edited / legacy intervals (`parse_refresh_interval` only floors
@@ -3669,6 +4282,13 @@ class SettingsScreen(ModalScreen[SettingsResult | None]):
                 allow_blank=False,
                 id="settings-refresh",
             ),
+            Label("Approval on others' PRs:", id="settings-approve-label"),
+            Select(
+                [(label, p) for p, label in _APPROVE_POLICY_LABELS.items()],
+                value=self.approve_policy,
+                allow_blank=False,
+                id="settings-approve",
+            ),
             Label(
                 "Slack webhook URL for review notifications (blank = off):",
                 id="settings-slack-label",
@@ -3690,6 +4310,7 @@ class SettingsScreen(ModalScreen[SettingsResult | None]):
                 refresh_interval=self.query_one("#settings-refresh", Select).value,
                 slack_webhook_url=self.query_one("#settings-slack", Input).value.strip(),
                 theme=self.query_one("#settings-theme", Select).value,
+                approve_policy=self.query_one("#settings-approve", Select).value,
             )
         )
 
@@ -3980,6 +4601,13 @@ class PRReviewer(App):
         # (no extra `gh api` calls, no POST) when this is blank. Editable via
         # the Settings modal (`,`).
         self.slack_webhook_url: str = _get_setting(self.review_db, "slack_webhook_url", "")
+        # Gates every APPROVE/resolve clause in the post-inline prompt (see
+        # `build_review_prompt(allow_approve=...)`). Unknown stored values fall
+        # back to the default rather than guessing.
+        stored_approve = _get_setting(self.review_db, "approve_policy", DEFAULT_APPROVE_POLICY)
+        self.approve_policy: ApprovePolicy = (
+            stored_approve if stored_approve in _APPROVE_POLICY_LABELS else DEFAULT_APPROVE_POLICY
+        )
         stored_cli = _get_setting(self.review_db, "cli", DEFAULT_CLI)
         persisted: CliChoice = stored_cli if stored_cli in _CLI_CYCLE else DEFAULT_CLI
         # If the persisted CLI isn't on PATH, fall back to whatever IS
@@ -4876,6 +5504,7 @@ class PRReviewer(App):
                         "refresh_interval": str(result.refresh_interval),
                         "slack_webhook_url": result.slack_webhook_url,
                         "theme": result.theme,
+                        "approve_policy": result.approve_policy,
                     },
                 )
             except sqlite3.Error as e:
@@ -4888,6 +5517,7 @@ class PRReviewer(App):
             self.codegraph_assist = result.codegraph_assist
             self._auto_refresh_secs = result.refresh_interval
             self.slack_webhook_url = result.slack_webhook_url
+            self.approve_policy = result.approve_policy
             # Assigning the App.theme reactive re-themes the running app live
             # (no restart). `result.theme` is constrained to `_THEME_OPTIONS`
             # by the Select, so it's always a valid registered theme.
@@ -4908,6 +5538,7 @@ class PRReviewer(App):
                 codegraph_assist=self.codegraph_assist,
                 refresh_interval=self._auto_refresh_secs,
                 slack_webhook_url=self.slack_webhook_url,
+                approve_policy=self.approve_policy,
                 # Coerce through `_resolve_theme` so a non-curated theme set
                 # live via the command palette (`Ctrl+P`) maps to a value the
                 # `Select` actually contains — otherwise its initial selection
@@ -5115,6 +5746,39 @@ class PRReviewer(App):
                 if not ok:
                     return
 
+                # Resolve the PR's diff scope against its actual base branch
+                # and reconcile the file count with GitHub. A mismatch means
+                # the local base is wrong (classically: stale), so the agent
+                # would review other people's already-merged commits — ask
+                # before launching, defaulting to abort. An unresolvable scope
+                # is non-fatal: the launch proceeds without a Scope section.
+                print("Resolving diff scope…")
+                diff_scope = _resolve_diff_scope(repo_full, number, worktree_path)
+                if diff_scope is not None and diff_scope.mismatch:
+                    print(
+                        f"\nwarning: local diff vs origin/{diff_scope.base_ref} has "
+                        f"{diff_scope.local_files} files, but GitHub reports "
+                        f"{diff_scope.github_files}. The local base is likely wrong, "
+                        "so the review may include changes that aren't in this PR."
+                    )
+                    answer = input("Launch the review anyway? [y/N] ").strip().lower()
+                    if answer not in ("y", "yes"):
+                        print("Review cancelled.")
+                        return
+
+                # Per-org/per-repo conventions from `.review-standards/`
+                # (absent file = feature off for this repo, silently).
+                repo_standards = load_repo_standards(owner, name)
+                pr_title = pr.get("title") or ""
+                if repo_standards is not None and repo_standards.title_pattern:
+                    # Check the title as it is now, not as of the last
+                    # queue refresh (the author may have renamed it since).
+                    current_title = fetch_pr_title(repo_full, number)
+                    if current_title is not None:
+                        pr_title = current_title
+                if repo_standards is not None:
+                    print(f"Using review standards from {repo_standards.source}")
+
                 # Hoist the `codegraph` PATH probe once: the Tier 2/3/4
                 # blocks below all share this gate, and three separate
                 # `shutil.which` calls would also create a TOCTOU surface
@@ -5190,6 +5854,7 @@ class PRReviewer(App):
                 codegraph_tools_available = _resolve_codegraph_tools(
                     cli, worktree_path, codegraph_present, codegraph_on_path
                 )
+                allow_approve = self.approve_policy == "auto"
                 built = build_review_prompt(
                     post_inline=post_inline,
                     extra_prompt=extra_prompt,
@@ -5201,11 +5866,32 @@ class PRReviewer(App):
                     codegraph_present=codegraph_tools_available,
                     codegraph_affected_tests=codegraph_affected_block,
                     selected_agents=selected_agents,
+                    allow_approve=allow_approve,
+                    diff_scope=(
+                        format_diff_scope(diff_scope, number) if diff_scope is not None else ""
+                    ),
+                    # Skipped on a (user-overridden) mismatch: the local diff
+                    # then includes files outside the PR, so its test list
+                    # could point the agent at other people's test edits.
+                    repo_standards=format_repo_standards(repo_standards, pr_title),
+                    test_changes=(
+                        format_test_change_scrutiny(diff_scope.changed_tests)
+                        if diff_scope is not None and not diff_scope.mismatch
+                        else ""
+                    ),
                 )
 
                 cmd = _build_cli_command(cli, built.text)
                 parts = _format_launch_banner_parts(
-                    post_inline, built, fetch_ok, my_login, selected_agents, extra_prompt
+                    post_inline,
+                    built,
+                    fetch_ok,
+                    my_login,
+                    selected_agents,
+                    extra_prompt,
+                    allow_approve=allow_approve,
+                    scope_desc=describe_diff_scope(diff_scope),
+                    standards_desc=describe_repo_standards(repo_standards, pr_title),
                 )
                 print(
                     f"\nLaunching {_CLI_DISPLAY[cli]} ({', '.join(parts)})"

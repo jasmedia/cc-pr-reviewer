@@ -23,6 +23,7 @@ import pytest
 import cc_pr_reviewer as _mod
 from cc_pr_reviewer import (
     _APP_HOSTNAME,
+    _APPROVE_POLICY_LABELS,
     _REFRESH_CYCLE,
     _REFRESH_OPTIONS,
     _SKILL_COVERAGE,
@@ -32,6 +33,7 @@ from cc_pr_reviewer import (
     CODEGRAPH_AFFECTED_TESTS_CAP,
     CODEGRAPH_HINT_SUFFIX,
     CODEGRAPH_IMPACT_NUDGE,
+    DEFAULT_APPROVE_POLICY,
     DEFAULT_THEME,
     EXISTING_COMMENT_BODY_CAP,
     EXISTING_COMMENT_LIST_CAP,
@@ -43,14 +45,21 @@ from cc_pr_reviewer import (
     POST_INLINE_REREVIEW_RESOLVE_SUFFIX,
     POST_INLINE_REREVIEW_SUFFIX,
     PROMPT_SECTION_SEP,
+    REPO_STANDARDS_CHAR_CAP,
     REVIEW_PROMPT_CLAUDE,
     REVIEW_PROMPT_SKILL_BASED,
     REVIEW_SKILL_LABELS,
     REVIEW_SKILLS,
+    REVIEW_STANDARDS_SUFFIX,
     SKILL_FILE_NAME,
+    SUBAGENT_DISPATCH_SUFFIX,
+    TEST_CHANGE_SCRUTINY_CAP,
+    TEST_CHANGE_SCRUTINY_SUFFIX,
     WORKSPACE,
     BuiltPrompt,
+    DiffScope,
     InProgressHolder,
+    RepoStandards,
     ReviewInProgressError,
     SettingsScreen,
     _approx_tokens,
@@ -67,11 +76,13 @@ from cc_pr_reviewer import (
     _get_setting,
     _in_progress_age_str,
     _is_newer,
+    _is_test_path,
     _join_agents,
     _load_in_progress,
     _load_review_state,
     _materialise_skills,
     _open_review_db,
+    _parse_name_status,
     _parse_semver,
     _pid_alive,
     _pr_key,
@@ -84,6 +95,7 @@ from cc_pr_reviewer import (
     _release_in_progress,
     _reserve_in_progress,
     _resolve_codegraph_tools,
+    _resolve_diff_scope,
     _resolve_theme,
     _review_cell,
     _rmdir_if_empty,
@@ -96,15 +108,34 @@ from cc_pr_reviewer import (
     build_review_prompt,
     build_slack_payload,
     check_prereqs,
+    describe_diff_scope,
+    describe_repo_standards,
     fetch_my_latest_review,
+    fetch_pr_title,
     format_codegraph_affected_tests,
+    format_diff_scope,
     format_existing_comments,
+    format_repo_standards,
+    format_test_change_scrutiny,
     humanise,
+    load_repo_standards,
     new_review_pr_keys,
     parse_refresh_interval,
+    title_check_failed,
 )
 
 # --- build_review_prompt ---------------------------------------------------
+
+
+def _dispatch(cli: str) -> list[str]:
+    """The Claude-only sub-agent briefing section, as a splat-able list."""
+    return [SUBAGENT_DISPATCH_SUFFIX] if cli == "claude" else []
+
+
+def _standards(cli: str) -> list[str]:
+    """The fixed sections that follow the base prompt when no repo standards
+    are loaded: the review standards, then (Claude only) the dispatch rules."""
+    return [REVIEW_STANDARDS_SUFFIX, *_dispatch(cli)]
 
 
 def _comment(login: str, **overrides: Any) -> dict[str, Any]:
@@ -144,7 +175,7 @@ def test_plain_review_equals_base_prompt(cli: str, expected_base: str) -> None:
         author_login="bob",
         cli=cli,
     )
-    assert built.text == expected_base
+    assert built.text == PROMPT_SECTION_SEP.join([expected_base, *_standards(cli)])
     assert not built.rereview
     assert built.existing_shown == 0
     assert built.existing_total == 0
@@ -260,6 +291,7 @@ def test_full_chain_assembles_in_canonical_order(cli: str, expected_base: str) -
     expected = PROMPT_SECTION_SEP.join(
         [
             expected_base,
+            *_standards(cli),
             "Additional instructions from reviewer:\nx",
             format_existing_comments(existing)[0],
             POST_INLINE_PROMPT
@@ -428,12 +460,246 @@ def test_first_review_approve_assembles_in_canonical_order(cli: str, expected_ba
     expected = PROMPT_SECTION_SEP.join(
         [
             expected_base,
+            *_standards(cli),
             "Additional instructions from reviewer:\nx",
             format_existing_comments(existing)[0],
             POST_INLINE_PROMPT + POST_INLINE_DEDUP_SUFFIX + POST_INLINE_APPROVE_SUFFIX,
         ]
     )
     assert built.text == expected
+
+
+# --- review standards (REVIEW_STANDARDS_SUFFIX + P1/P2/P3 verdicts) ---------
+
+
+@pytest.mark.parametrize("cli", ["claude", "codex", "gemini"])
+@pytest.mark.parametrize("post_inline", [False, True])
+@pytest.mark.parametrize("selected_agents", [None, ()], ids=["all-agents", "no-agents"])
+def test_review_standards_always_follow_base_prompt(
+    cli: str, post_inline: bool, selected_agents: tuple[str, ...] | None
+) -> None:
+    """The standards define the P1/P2/P3 taxonomy the post-inline verdict
+    suffixes depend on, so they must be present — directly after the base —
+    for every CLI, with or without inline posting, and even for the generic
+    no-agents review."""
+    built = build_review_prompt(
+        post_inline=post_inline,
+        extra_prompt="",
+        existing=[],
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+        cli=cli,
+        selected_agents=selected_agents,
+    )
+    sections = built.text.split(PROMPT_SECTION_SEP)
+    assert sections[1] == REVIEW_STANDARDS_SUFFIX
+    assert built.text.count(REVIEW_STANDARDS_SUFFIX) == 1
+
+
+def test_review_standards_define_taxonomy_and_rules() -> None:
+    """Pin the load-bearing rules so a wording pass can't quietly drop one."""
+    for token in ("P1", "P2", "P3", "file:line", "UNVERIFIED", "No praise", "nothing"):
+        assert token in REVIEW_STANDARDS_SUFFIX
+
+
+def test_post_inline_prompt_tags_skips_empty_and_has_blocked_fallback() -> None:
+    assert "`[P2]`" in POST_INLINE_PROMPT
+    assert "do not submit an empty COMMENT review" in POST_INLINE_PROMPT
+    assert "--input" in POST_INLINE_PROMPT
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [POST_INLINE_APPROVE_SUFFIX, POST_INLINE_REREVIEW_SUFFIX, POST_INLINE_REREVIEW_APPROVE_SUFFIX],
+)
+def test_verdict_suffixes_use_severity_tags_not_legacy_labels(suffix: str) -> None:
+    """All verdict clauses share the P1/P2/P3 taxonomy from the standards
+    block — a leftover blocking/low/NIT label would give the agent two
+    competing scales to classify against."""
+    assert "P1" in suffix and "P2" in suffix
+    for legacy in ("blocking", "NIT", "[nit]", "[low]"):
+        assert legacy not in suffix
+
+
+def test_first_review_approve_overrides_no_empty_review_rule() -> None:
+    """POST_INLINE_PROMPT forbids an empty COMMENT review; the approve clause
+    that follows must explicitly override it so a clean first review of
+    someone else's PR still lands as an APPROVE."""
+    assert "overrides the no-empty-review rule" in POST_INLINE_APPROVE_SUFFIX
+
+
+# --- sub-agent dispatch (Claude-only SUBAGENT_DISPATCH_SUFFIX) -------------
+
+
+@pytest.mark.parametrize("cli", ["claude", "codex", "gemini"])
+@pytest.mark.parametrize("post_inline", [False, True])
+@pytest.mark.parametrize("selected_agents", [None, ()], ids=["all-agents", "no-agents"])
+def test_dispatch_rules_only_for_claude_right_after_standards(
+    cli: str, post_inline: bool, selected_agents: tuple[str, ...] | None
+) -> None:
+    """Claude briefs the toolkit's sub-agents itself, including for the generic
+    no-agents toolkit review, so it always gets the rules, placed right after
+    the standards it is told to forward. Codex/Gemini run skills in-process
+    and never get them."""
+    built = build_review_prompt(
+        post_inline=post_inline,
+        extra_prompt="",
+        existing=[],
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+        cli=cli,
+        selected_agents=selected_agents,
+    )
+    sections = built.text.split(PROMPT_SECTION_SEP)
+    if cli == "claude":
+        assert sections[2] == SUBAGENT_DISPATCH_SUFFIX
+        assert built.text.count(SUBAGENT_DISPATCH_SUFFIX) == 1
+    else:
+        assert SUBAGENT_DISPATCH_SUFFIX not in built.text
+
+
+def test_dispatch_rules_cover_scope_scepticism_and_triage() -> None:
+    """Pin the load-bearing instructions so a wording pass can't drop one."""
+    for token in (
+        "don't see this conversation",
+        "merge-base",
+        "review standards above",
+        "claims, not evidence",
+        "adversary",
+        "clean result",
+        "raw material",
+        "verify each P1/P2 yourself",
+    ):
+        assert token in SUBAGENT_DISPATCH_SUFFIX
+
+
+def test_dispatch_rules_sit_between_repo_standards_and_extras() -> None:
+    """Repo standards are among the 'standards above' Claude forwards, so the
+    dispatch rules must come after them; the reviewer extras still follow."""
+    built = build_review_prompt(
+        post_inline=False,
+        extra_prompt="extra",
+        existing=[],
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+        cli="claude",
+        repo_standards="Team conventions:\n- rule",
+    )
+    assert built.text == PROMPT_SECTION_SEP.join(
+        [
+            REVIEW_PROMPT_CLAUDE,
+            REVIEW_STANDARDS_SUFFIX,
+            "Team conventions:\n- rule",
+            SUBAGENT_DISPATCH_SUFFIX,
+            "Additional instructions from reviewer:\nextra",
+        ]
+    )
+
+
+# --- approve_policy (Settings → build_review_prompt(allow_approve=...)) -----
+
+
+_APPROVE_CLAUSES = (
+    POST_INLINE_APPROVE_SUFFIX,
+    POST_INLINE_REREVIEW_APPROVE_SUFFIX,
+    POST_INLINE_REREVIEW_RESOLVE_SUFFIX,
+)
+
+
+@pytest.mark.parametrize("cli", ["claude", "codex", "gemini"])
+@pytest.mark.parametrize(
+    "existing",
+    [[], [_comment("charlie")], [_comment("alice")]],
+    ids=["first-review", "third-party-comments", "rereview"],
+)
+def test_comment_only_policy_strips_every_approve_clause(
+    cli: str, existing: list[dict[str, Any]]
+) -> None:
+    """With approve_policy "comment-only", no APPROVE or resolve instruction
+    may reach the agent on any path that would otherwise carry one (first
+    review, first review with third-party comments, re-review) — for every
+    CLI. This is the hard stop: approval must stay a separate human action."""
+    built = build_review_prompt(
+        post_inline=True,
+        extra_prompt="",
+        existing=existing,
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+        cli=cli,
+        allow_approve=False,
+    )
+    for clause in _APPROVE_CLAUSES:
+        assert clause not in built.text
+    assert "APPROVE" not in built.text
+    assert POST_INLINE_PROMPT in built.text
+
+
+def test_comment_only_policy_keeps_rereview_raised_bar() -> None:
+    """The policy vetoes the verdict only — a re-review still raises the bar
+    on which findings get posted."""
+    built = build_review_prompt(
+        post_inline=True,
+        extra_prompt="",
+        existing=[_comment("alice")],
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+        allow_approve=False,
+    )
+    assert built.rereview
+    assert POST_INLINE_REREVIEW_SUFFIX in built.text
+
+
+@pytest.mark.parametrize("cli", ["claude", "codex", "gemini"])
+def test_comment_only_rereview_assembles_in_canonical_order(cli: str) -> None:
+    """Lock the exact comment-only re-review assembly so the policy can't
+    leave a dangling separator or reorder sections."""
+    existing = [_comment("alice")]
+    built = build_review_prompt(
+        post_inline=True,
+        extra_prompt="",
+        existing=existing,
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+        cli=cli,
+        allow_approve=False,
+    )
+    base = REVIEW_PROMPT_CLAUDE if cli == "claude" else REVIEW_PROMPT_SKILL_BASED
+    assert built.text == PROMPT_SECTION_SEP.join(
+        [
+            base,
+            *_standards(cli),
+            format_existing_comments(existing)[0],
+            POST_INLINE_PROMPT + POST_INLINE_DEDUP_SUFFIX + POST_INLINE_REREVIEW_SUFFIX,
+        ]
+    )
+
+
+@pytest.mark.parametrize("existing", [[], [_comment("alice")]], ids=["first-review", "rereview"])
+def test_allow_approve_default_matches_explicit_auto(existing: list[dict[str, Any]]) -> None:
+    """Omitting `allow_approve` must equal the "auto" policy, so callers that
+    predate the setting keep the historical prompt byte-for-byte."""
+    kwargs: dict[str, Any] = dict(
+        post_inline=True,
+        extra_prompt="",
+        existing=existing,
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+    )
+    assert (
+        build_review_prompt(**kwargs).text == build_review_prompt(**kwargs, allow_approve=True).text
+    )
+    assert DEFAULT_APPROVE_POLICY == "auto"
+
+
+def test_approve_policy_labels_cover_both_policies() -> None:
+    assert set(_APPROVE_POLICY_LABELS) == {"auto", "comment-only"}
 
 
 # --- selected_agents subset (ConfirmScreen → build_review_prompt) ----------
@@ -454,7 +720,7 @@ def test_selected_agents_default_none_matches_default_constant() -> None:
         cli="claude",
         selected_agents=None,
     )
-    assert built.text == REVIEW_PROMPT_CLAUDE
+    assert built.text == PROMPT_SECTION_SEP.join([REVIEW_PROMPT_CLAUDE, *_standards("claude")])
 
 
 def test_selected_agents_full_set_equals_default_constant() -> None:
@@ -740,8 +1006,8 @@ def test_codegraph_suffix_present_when_flag_set(cli: str) -> None:
 
 def test_codegraph_suffix_placed_after_extra_prompt_before_existing() -> None:
     """Lock the canonical section order when CodeGraph is present:
-    base → reviewer extras → CodeGraph hint → existing comments →
-    post-inline. Reviewer extras stay adjacent to the base (highest
+    base → review standards → reviewer extras → CodeGraph hint → existing
+    comments → post-inline. Reviewer extras stay close to the base (high
     visibility for per-launch overrides); the hint sits with the
     "what to review" blocks rather than the "how to publish" block."""
     existing = [_comment("charlie")]
@@ -758,6 +1024,7 @@ def test_codegraph_suffix_placed_after_extra_prompt_before_existing() -> None:
     expected = PROMPT_SECTION_SEP.join(
         [
             REVIEW_PROMPT_CLAUDE,
+            *_standards("claude"),
             "Additional instructions from reviewer:\nfocus on the auth changes",
             # No precomputed affected block here, so the per-symbol impact
             # nudge rides along with the hint as one section.
@@ -955,6 +1222,7 @@ def test_affected_tests_block_lands_after_hint_before_existing(cli: str) -> None
     expected = PROMPT_SECTION_SEP.join(
         [
             base,
+            *_standards(cli),
             "Additional instructions from reviewer:\nextra",
             CODEGRAPH_HINT_SUFFIX,
             affected_block,
@@ -982,7 +1250,11 @@ def test_affected_tests_block_absent_when_kwarg_empty() -> None:
         codegraph_affected_tests="",
     )
     assert built.text == PROMPT_SECTION_SEP.join(
-        [REVIEW_PROMPT_CLAUDE, f"{CODEGRAPH_HINT_SUFFIX} {CODEGRAPH_IMPACT_NUDGE}"]
+        [
+            REVIEW_PROMPT_CLAUDE,
+            *_standards("claude"),
+            f"{CODEGRAPH_HINT_SUFFIX} {CODEGRAPH_IMPACT_NUDGE}",
+        ]
     )
 
 
@@ -1957,6 +2229,27 @@ def test_banner_default_agents_omits_agents_part() -> None:
         "post-inline: off",
         "existing comments: 2 in prompt of 5 fetched",
     ]
+
+
+def test_banner_flags_comment_only_policy_when_posting_inline() -> None:
+    """A non-default approve policy is called out next to post-inline — the
+    last chance to notice it before the agent submits a verdict."""
+    parts = _format_launch_banner_parts(
+        True, _built(), True, "me", REVIEW_SKILLS, "", allow_approve=False
+    )
+    assert parts[0] == "post-inline: on, never-approve"
+
+
+@pytest.mark.parametrize(
+    ("post_inline", "allow_approve"), [(False, False), (True, True), (False, True)]
+)
+def test_banner_omits_never_approve_when_irrelevant(post_inline: bool, allow_approve: bool) -> None:
+    """Default policy, or no inline posting (no verdict is submitted), leaves
+    the banner unchanged."""
+    parts = _format_launch_banner_parts(
+        post_inline, _built(), True, "me", REVIEW_SKILLS, "", allow_approve=allow_approve
+    )
+    assert "never-approve" not in parts[0]
 
 
 def test_banner_reordered_full_set_still_omits_agents_part() -> None:
@@ -3279,6 +3572,36 @@ def test_settings_screen_mounts_with_offcycle_refresh(interval: int) -> None:
     assert asyncio.run(_run()) in _REFRESH_OPTIONS
 
 
+@pytest.mark.parametrize("stored", ["comment-only", "auto", "bogus", ""])
+def test_settings_screen_approve_policy_select(stored: str) -> None:
+    """The approve-policy Select mounts with a stored legal value, and snaps a
+    hand-edited/unknown one to the default instead of raising
+    `InvalidSelectValueError` (which would take the app down on `,`)."""
+    import asyncio
+
+    from textual.app import App
+    from textual.widgets import Select
+
+    async def _run() -> str:
+        app: App = App()
+        async with app.run_test() as pilot:
+            await app.push_screen(
+                SettingsScreen(
+                    cli="claude",
+                    codegraph_assist=False,
+                    refresh_interval=3600,
+                    slack_webhook_url="",
+                    theme=DEFAULT_THEME,
+                    approve_policy=stored,  # type: ignore[arg-type]
+                )
+            )
+            await pilot.pause()
+            return app.screen.query_one("#settings-approve", Select).value
+
+    expected = stored if stored in _APPROVE_POLICY_LABELS else DEFAULT_APPROVE_POLICY
+    assert asyncio.run(_run()) == expected
+
+
 class _NotifyFake:
     """Minimal stand-in for `PRReviewer` exercising `_maybe_notify_new_prs`
     without any widget access — mirrors the dummy-harness pattern used by
@@ -3673,3 +3996,675 @@ def test_notify_stays_quiet_on_dismiss_revealing_older_review(
         pre_review={"id": 10, "state": "APPROVED", "submitted_at": "t10"},
     )
     assert posted == []
+
+
+# --- diff scope (_resolve_diff_scope / format_diff_scope) ------------------
+
+_MB = "a" * 40
+_HEAD = "b" * 40
+
+
+def _scope(local: int = 3, github: int = 3, base: str = "main") -> DiffScope:
+    return DiffScope(
+        base_ref=base, merge_base=_MB, head_sha=_HEAD, local_files=local, github_files=github
+    )
+
+
+def test_format_diff_scope_matching_counts() -> None:
+    text = format_diff_scope(_scope(base="release/1.2"), 42)
+    assert "`release/1.2`" in text
+    assert f"git diff --name-only {_MB} HEAD" in text
+    assert f"git diff {_MB} HEAD" in text
+    assert _HEAD in text
+    assert "sub-agent" in text
+    assert "WARNING" not in text
+
+
+def test_format_diff_scope_mismatch_names_github_authoritative() -> None:
+    text = format_diff_scope(_scope(local=9, github=2), 42)
+    assert "WARNING" in text
+    assert "9 files" in text and "reports 2" in text
+    assert "gh pr diff 42 --name-only" in text
+
+
+def test_describe_diff_scope_variants() -> None:
+    assert describe_diff_scope(None) == "scope: unavailable"
+    assert describe_diff_scope(_scope()) == "scope: main@aaaaaaaa, 3 files"
+    assert describe_diff_scope(_scope(local=9, github=2)).endswith("9 files (GitHub: 2)")
+
+
+@pytest.mark.parametrize("cli", ["claude", "codex", "gemini"])
+def test_diff_scope_section_placed_after_extras_before_codegraph(cli: str) -> None:
+    """Scope is "what to review" context: after the per-launch extras,
+    before the CodeGraph evidence-gathering sections."""
+    scope_text = format_diff_scope(_scope(), 7)
+    built = build_review_prompt(
+        post_inline=False,
+        extra_prompt="extra",
+        existing=[],
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+        cli=cli,
+        codegraph_present=True,
+        diff_scope=scope_text,
+    )
+    base = REVIEW_PROMPT_CLAUDE if cli == "claude" else REVIEW_PROMPT_SKILL_BASED
+    assert built.text == PROMPT_SECTION_SEP.join(
+        [
+            base,
+            *_standards(cli),
+            "Additional instructions from reviewer:\nextra",
+            scope_text,
+            f"{CODEGRAPH_HINT_SUFFIX} {CODEGRAPH_IMPACT_NUDGE}",
+        ]
+    )
+
+
+def test_diff_scope_empty_adds_no_section() -> None:
+    kwargs: dict[str, Any] = dict(
+        post_inline=False,
+        extra_prompt="",
+        existing=[],
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+    )
+    assert build_review_prompt(**kwargs).text == build_review_prompt(**kwargs, diff_scope="").text
+
+
+def test_banner_appends_scope_desc() -> None:
+    parts = _format_launch_banner_parts(
+        False, _built(), True, "me", REVIEW_SKILLS, "", scope_desc="scope: unavailable"
+    )
+    assert parts[-1] == "scope: unavailable"
+
+
+def _git(cwd: Path, *args: str) -> str:
+    import subprocess
+
+    return subprocess.run(
+        ["git", *args], cwd=cwd, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def _commit(repo: Path, name: str, content: str | None = None) -> str:
+    (repo / name).write_text(name if content is None else content)
+    _git(repo, "add", name)
+    _git(repo, "commit", "-q", "-m", name)
+    return _git(repo, "rev-parse", "HEAD")
+
+
+def _isolate_git(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run git with an empty global config and a fixed identity, so the
+    user's hooks, signing, or default-branch settings can't affect tests."""
+    gitcfg = tmp_path / "gitconfig"
+    gitcfg.write_text("")
+    for k, v in {
+        "GIT_CONFIG_GLOBAL": str(gitcfg),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@example.com",
+    }.items():
+        monkeypatch.setenv(k, v)
+
+
+def _build_stale_base(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, same_file: bool = False
+) -> dict[str, Any]:
+    """Real git repos reproducing the stale-base scenario.
+
+    origin/main gains someone else's merged commit; the PR is rebased onto it
+    and adds its own change. The review checkout fetched only the PR ref, so
+    its `origin/main` is still the old commit — a merge-base computed from it
+    would drag the merged change into the diff. With `same_file`, the merged
+    commit and the PR edit the SAME file, so the stale diff has the same file
+    count as GitHub's (1) and count reconciliation alone can't catch it.
+    After the PR is pushed, main advances once more (`later`), a commit the
+    review checkout only gets if its base fetch succeeds.
+    """
+    _isolate_git(tmp_path, monkeypatch)
+    origin = tmp_path / "origin.git"
+    _git(tmp_path, "init", "-q", "--bare", "-b", "main", str(origin))
+    author = tmp_path / "author"
+    _git(tmp_path, "clone", "-q", str(origin), str(author))
+    _git(author, "checkout", "-q", "-b", "main")
+    _commit(author, "base.py")
+    if same_file:
+        _commit(author, "shared.py", "v1")
+    _git(author, "push", "-q", "origin", "main")
+
+    review = tmp_path / "review"
+    _git(tmp_path, "clone", "-q", str(origin), str(review))  # origin/main = base
+
+    # someone else's merged work
+    merged = _commit(author, "shared.py", "v2") if same_file else _commit(author, "other.py")
+    _git(author, "push", "-q", "origin", "main")
+    _git(author, "checkout", "-q", "-b", "pr")
+    if same_file:
+        _commit(author, "shared.py", "v3")
+    else:
+        _commit(author, "pr.py")
+    _git(author, "push", "-q", "origin", "pr")
+    _git(author, "checkout", "-q", "main")
+    later = _commit(author, "later.py")
+    _git(author, "push", "-q", "origin", "main")
+
+    _git(review, "fetch", "-q", "origin", "pr:refs/remotes/origin/pr")
+    _git(review, "checkout", "-q", "--detach", "origin/pr")
+    return {"path": review, "merged": merged, "later": later}
+
+
+@pytest.fixture
+def stale_base_worktree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    return _build_stale_base(tmp_path, monkeypatch)
+
+
+def _gh_meta(base_oid: str, base: str = "main", files: int = 1) -> str:
+    return json.dumps({"baseRefName": base, "baseRefOid": base_oid, "changedFiles": files})
+
+
+def _patch_gh(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    stdout: str = '{"baseRefName": "main", "changedFiles": 1}',
+    returncode: int = 0,
+    fail_fetch: bool = False,
+) -> None:
+    import subprocess
+
+    real_run = _mod.run
+
+    def fake(cmd: list[str], **kw: Any) -> subprocess.CompletedProcess:
+        if cmd[0] == "gh":
+            return subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr="gh boom")
+        if fail_fetch and cmd[:2] == ["git", "fetch"]:
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="network down")
+        return real_run(cmd, **kw)
+
+    monkeypatch.setattr(_mod, "run", fake)
+
+
+def test_resolve_diff_scope_fetches_base_and_reconciles(
+    stale_base_worktree: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fresh base fetch brings in GitHub's base commit; the merge-base
+    lands past the other author's merged commit, so counts match GitHub's."""
+    _patch_gh(monkeypatch, stdout=_gh_meta(stale_base_worktree["later"]))
+    scope = _resolve_diff_scope("o/r", 1, stale_base_worktree["path"])
+    assert scope is not None
+    assert scope.base_ref == "main"
+    assert scope.merge_base == stale_base_worktree["merged"]
+    assert scope.local_files == 1
+    assert not scope.mismatch
+
+
+def test_resolve_diff_scope_skips_when_base_commit_unavailable(
+    stale_base_worktree: dict[str, Any], monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """Fetch failed and GitHub's base commit isn't local: the stale
+    `origin/main` must NOT be used to certify a scope."""
+    _patch_gh(monkeypatch, stdout=_gh_meta(stale_base_worktree["later"]), fail_fetch=True)
+    assert _resolve_diff_scope("o/r", 1, stale_base_worktree["path"]) is None
+    out = capsys.readouterr().out
+    assert "network down" in out
+    assert "isn't available locally" in out
+
+
+@pytest.mark.parametrize("same_file", [False, True], ids=["other-file", "same-file"])
+def test_resolve_diff_scope_uses_github_base_commit_despite_stale_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, same_file: bool
+) -> None:
+    """Fetch failed, but GitHub's base commit is reachable via the PR's own
+    history: the merge-base comes from it, not the stale `origin/main`. The
+    same-file case is the one count reconciliation alone would miss — the
+    stale diff would also be 1 file, but include the other author's edit."""
+    wt = _build_stale_base(tmp_path, monkeypatch, same_file=same_file)
+    _patch_gh(monkeypatch, stdout=_gh_meta(wt["merged"]), fail_fetch=True)
+    scope = _resolve_diff_scope("o/r", 1, wt["path"])
+    assert scope is not None
+    assert scope.merge_base == wt["merged"]
+    assert (scope.local_files, scope.github_files) == (1, 1)
+    assert not scope.mismatch
+
+
+@pytest.mark.parametrize(
+    ("stdout", "returncode"),
+    [
+        ("", 1),
+        ("not json", 0),
+        ('{"baseRefName": "main"}', 0),
+        ('{"baseRefName": "", "baseRefOid": "abc", "changedFiles": 1}', 0),
+        ('{"baseRefName": "main", "baseRefOid": "", "changedFiles": 1}', 0),
+    ],
+    ids=["gh-fails", "bad-json", "missing-field", "empty-base", "empty-base-oid"],
+)
+def test_resolve_diff_scope_returns_none_on_bad_pr_metadata(
+    stale_base_worktree: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    stdout: str,
+    returncode: int,
+) -> None:
+    _patch_gh(monkeypatch, stdout=stdout, returncode=returncode)
+    assert _resolve_diff_scope("o/r", 1, stale_base_worktree["path"]) is None
+
+
+def test_resolve_diff_scope_returns_none_when_base_ref_missing(
+    stale_base_worktree: dict[str, Any], monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """A base branch that doesn't exist on origin fails the fetch, and its
+    base commit isn't local — no scope, with the reason surfaced."""
+    _patch_gh(monkeypatch, stdout=_gh_meta("0" * 40, base="nope"))
+    assert _resolve_diff_scope("o/r", 1, stale_base_worktree["path"]) is None
+    out = capsys.readouterr().out
+    assert "git fetch origin nope" in out
+    assert "isn't available locally" in out
+
+
+# --- test-change scrutiny (_is_test_path / _parse_name_status) -------------
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "tests/test_api.py",
+        "pkg/tests/helpers.py",
+        "src/__tests__/Button.jsx",
+        "src/__snapshots__/Button.test.tsx.snap",
+        "spec/models/user_spec.rb",
+        "test_utils.py",
+        "pkg/utils_test.py",
+        "conftest.py",
+        "internal/store/store_test.go",
+        "web/src/Button.test.tsx",
+        "web/src/api.spec.ts",
+        "web/src/util.test.mjs",
+        "src/main/java/FooTest.java",
+        "src/FooTests.cs",
+        "app/src/BarTest.kt",
+    ],
+)
+def test_is_test_path_positive(path: str) -> None:
+    assert _is_test_path(path)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "src/api.py",
+        "contest.py",
+        "src/testing_utils.py",
+        "latest/main.go",
+        "src/attest.ts",
+        "README.md",
+    ],
+)
+def test_is_test_path_negative(path: str) -> None:
+    """Substrings like `test` inside other words, or a file merely *named*
+    `tests…` at the leaf, must not match."""
+    assert not _is_test_path(path)
+
+
+def test_is_test_path_leaf_named_tests_is_not_a_dir_match() -> None:
+    assert not _is_test_path("docs/tests")
+    assert _is_test_path("docs/tests/x.md")
+
+
+def test_parse_name_status_counts_all_and_lists_existing_tests() -> None:
+    out = "\0".join(
+        [
+            "M", "src/api.py",
+            "M", "tests/test_api.py",
+            "A", "tests/test_new.py",
+            "D", "tests/test_old.py",
+            "R095", "tests/test_a.py", "tests/test_b.py",
+            "R100", "tests/test_moved.py", "src/moved.py",
+            "C080", "tests/test_x.py", "tests/test_y.py",
+            "",
+        ]
+    )  # fmt: skip
+    count, tests = _parse_name_status(out)
+    assert count == 7
+    assert tests == (
+        ("renamed", "src/moved.py"),
+        ("modified", "tests/test_api.py"),
+        ("renamed", "tests/test_b.py"),
+        ("deleted", "tests/test_old.py"),
+    )
+
+
+def test_parse_name_status_keeps_non_ascii_and_tab_paths_raw() -> None:
+    """With `-z`, git doesn't C-quote paths; names with non-ASCII bytes or a
+    tab must still be matched as tests and counted once each."""
+    out = "M\0tests/test_café.py\0M\0src/a\tb.py\0R100\0tests/old é.py\0lib/new é.py\0"
+    count, tests = _parse_name_status(out)
+    assert count == 3
+    assert tests == (("renamed", "lib/new é.py"), ("modified", "tests/test_café.py"))
+
+
+def test_format_test_change_scrutiny_empty_skips_section() -> None:
+    assert format_test_change_scrutiny(()) == ""
+
+
+def test_format_test_change_scrutiny_lists_files_then_rules() -> None:
+    text = format_test_change_scrutiny(
+        (("modified", "tests/test_a.py"), ("deleted", "tests/test_b.py"))
+    )
+    assert text.splitlines()[1:3] == [
+        "- `tests/test_a.py` (modified)",
+        "- `tests/test_b.py` (deleted)",
+    ]
+    assert text.endswith(TEST_CHANGE_SCRUTINY_SUFFIX)
+    for token in ("P1", "P2", "skipped", "loosened", "product-code change"):
+        assert token in TEST_CHANGE_SCRUTINY_SUFFIX
+
+
+def test_format_test_change_scrutiny_caps_with_overflow_note() -> None:
+    many = tuple(("modified", f"tests/test_{i:03}.py") for i in range(TEST_CHANGE_SCRUTINY_CAP + 5))
+    text = format_test_change_scrutiny(many)
+    assert sum(1 for line in text.splitlines() if line.startswith("- `")) == (
+        TEST_CHANGE_SCRUTINY_CAP
+    )
+    assert "and 5 more" in text
+
+
+@pytest.mark.parametrize("cli", ["claude", "codex", "gemini"])
+def test_test_change_section_follows_scope_before_codegraph(cli: str) -> None:
+    scope_text = format_diff_scope(_scope(), 7)
+    tests_text = format_test_change_scrutiny((("modified", "tests/test_a.py"),))
+    built = build_review_prompt(
+        post_inline=False,
+        extra_prompt="",
+        existing=[],
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+        cli=cli,
+        codegraph_present=True,
+        diff_scope=scope_text,
+        test_changes=tests_text,
+    )
+    base = REVIEW_PROMPT_CLAUDE if cli == "claude" else REVIEW_PROMPT_SKILL_BASED
+    assert built.text == PROMPT_SECTION_SEP.join(
+        [
+            base,
+            *_standards(cli),
+            scope_text,
+            tests_text,
+            f"{CODEGRAPH_HINT_SUFFIX} {CODEGRAPH_IMPACT_NUDGE}",
+        ]
+    )
+
+
+def test_describe_diff_scope_counts_edited_tests_only_when_reconciled() -> None:
+    edited = (("modified", "tests/test_a.py"),)
+    ok = DiffScope("main", _MB, _HEAD, 3, 3, edited)
+    bad = DiffScope("main", _MB, _HEAD, 4, 3, edited)
+    assert describe_diff_scope(ok).endswith("3 files, 1 existing tests edited")
+    assert "edited" not in describe_diff_scope(bad)
+
+
+def test_resolve_diff_scope_reports_changed_existing_tests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end on a real repo: modified, deleted and renamed existing
+    tests are reported; an added test and product code are not; the file
+    count still matches GitHub's."""
+    _isolate_git(tmp_path, monkeypatch)
+    origin = tmp_path / "origin.git"
+    _git(tmp_path, "init", "-q", "--bare", "-b", "main", str(origin))
+    repo = tmp_path / "repo"
+    _git(tmp_path, "clone", "-q", str(origin), str(repo))
+    _git(repo, "checkout", "-q", "-b", "main")
+    (repo / "tests").mkdir()
+    for name in (
+        "src.py",
+        "tests/test_a.py",
+        "tests/test_b.py",
+        "tests/test_c.py",
+        "tests/test_café.py",
+    ):
+        (repo / name).write_text(f"{name}\n" * 20)
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "base")
+    base_sha = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "push", "-q", "origin", "main")
+
+    _git(repo, "checkout", "-q", "-b", "pr")
+    (repo / "src.py").write_text("changed\n")
+    (repo / "tests/test_a.py").write_text("weakened\n")
+    _git(repo, "rm", "-q", "tests/test_b.py")
+    _git(repo, "mv", "tests/test_c.py", "tests/test_c2.py")
+    (repo / "tests/test_new.py").write_text("new\n")
+    (repo / "tests/test_café.py").write_text("weakened\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "pr")
+
+    _patch_gh(monkeypatch, stdout=_gh_meta(base_sha, files=6))
+    scope = _resolve_diff_scope("o/r", 1, repo)
+    assert scope is not None
+    assert (scope.local_files, scope.github_files) == (6, 6)
+    assert scope.changed_tests == (
+        ("modified", "tests/test_a.py"),
+        ("deleted", "tests/test_b.py"),
+        ("renamed", "tests/test_c2.py"),
+        ("modified", "tests/test_café.py"),
+    )
+
+
+# --- per-org/per-repo review standards (.review-standards/) ----------------
+
+_UNSTRACT_TITLE = r"^[A-Z]+-\d+ \[[A-Z]+\] "
+
+
+def _write(path: Path, text: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_load_repo_standards_absent_is_none(tmp_path: Path) -> None:
+    assert load_repo_standards("Zipstack", "unstract", tmp_path / "missing") is None
+    assert load_repo_standards("Zipstack", "unstract", tmp_path) is None
+
+
+def test_load_repo_standards_org_file(tmp_path: Path) -> None:
+    src = _write(tmp_path / "Zipstack.md", "- org rule\n")
+    loaded = load_repo_standards("Zipstack", "unstract", tmp_path)
+    assert loaded == RepoStandards(source=src, body="- org rule", title_pattern=None)
+
+
+def test_load_repo_standards_repo_file_replaces_org_file(tmp_path: Path) -> None:
+    _write(tmp_path / "Zipstack.md", "- org rule\n")
+    _write(tmp_path / "Zipstack" / "unstract.md", "- repo rule\n")
+    assert load_repo_standards("Zipstack", "unstract", tmp_path).body == "- repo rule"
+    # Another repo of the same org still gets the org file.
+    assert load_repo_standards("Zipstack", "other", tmp_path).body == "- org rule"
+
+
+def test_load_repo_standards_matches_case_insensitively(tmp_path: Path) -> None:
+    """GitHub owner/repo names are case-insensitive; Linux filesystems aren't."""
+    _write(tmp_path / "zipstack" / "Unstract.md", "- repo rule\n")
+    _write(tmp_path / "ZIPSTACK.md", "- org rule\n")
+    assert load_repo_standards("Zipstack", "unstract", tmp_path).body == "- repo rule"
+    assert load_repo_standards("Zipstack", "x", tmp_path).body == "- org rule"
+
+
+def test_load_repo_standards_unreadable_warns_and_skips(tmp_path: Path, capsys) -> None:
+    (tmp_path / "Zipstack.md").write_bytes(b"\xff\xfe not utf-8 \x80")
+    assert load_repo_standards("Zipstack", "unstract", tmp_path) is None
+    assert "couldn't read review standards" in capsys.readouterr().out
+
+
+def test_load_repo_standards_missing_dir_is_silent(tmp_path: Path, capsys) -> None:
+    assert load_repo_standards("Zipstack", "unstract", tmp_path / "missing") is None
+    (tmp_path / "file").write_text("x")
+    assert load_repo_standards("Zipstack", "unstract", tmp_path / "file") is None
+    assert capsys.readouterr().out == ""
+
+
+def test_load_repo_standards_unlistable_owner_dir_warns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """An unlistable owner dir must not silently fall back to the org file."""
+    _write(tmp_path / "Zipstack.md", "- org rule\n")
+    _write(tmp_path / "Zipstack" / "unstract.md", "- repo rule\n")
+    real_iterdir = Path.iterdir
+
+    def fake_iterdir(self: Path):
+        if self.name == "Zipstack":
+            raise PermissionError(13, "Permission denied")
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+    assert load_repo_standards("Zipstack", "unstract", tmp_path).body == "- org rule"
+    out = capsys.readouterr().out
+    assert "couldn't list review standards dir" in out
+    assert "Permission denied" in out
+
+
+@pytest.mark.parametrize(
+    ("result", "expected", "warns"),
+    [
+        (("0", '{"title": "ABC-1 [FIX] new"}'), "ABC-1 [FIX] new", False),
+        (("1", ""), None, True),
+        (("0", "not json"), None, True),
+        (OSError("no gh"), None, True),
+    ],
+    ids=["ok", "gh-fails", "bad-json", "oserror"],
+)
+def test_fetch_pr_title(
+    monkeypatch: pytest.MonkeyPatch, capsys, result: Any, expected: str | None, warns: bool
+) -> None:
+    import subprocess
+
+    def fake(cmd: list[str], **kw: Any) -> subprocess.CompletedProcess:
+        assert cmd[:3] == ["gh", "pr", "view"] and "--repo" in cmd
+        if isinstance(result, Exception):
+            raise result
+        rc, out = result
+        return subprocess.CompletedProcess(cmd, int(rc), stdout=out, stderr="boom")
+
+    monkeypatch.setattr(_mod, "run", fake)
+    assert fetch_pr_title("o/r", 1) == expected
+    assert ("using the cached one" in capsys.readouterr().out) is warns
+
+
+def test_frontmatter_title_pattern_and_body(tmp_path: Path) -> None:
+    _write(tmp_path / "Zipstack.md", f"---\ntitle_pattern: {_UNSTRACT_TITLE}\n---\n\n- rule\n")
+    loaded = load_repo_standards("Zipstack", "unstract", tmp_path)
+    # Unquoted values are stripped, so the regex's trailing space is lost.
+    assert loaded.title_pattern == _UNSTRACT_TITLE.rstrip()
+    assert loaded.body == "- rule"
+
+
+@pytest.mark.parametrize("quote", ['"', "'"])
+def test_frontmatter_quoted_value_keeps_whitespace(tmp_path: Path, quote: str) -> None:
+    _write(
+        tmp_path / "Zipstack.md",
+        f"---\ntitle_pattern: {quote}{_UNSTRACT_TITLE}{quote}\n---\nbody\n",
+    )
+    assert load_repo_standards("Zipstack", "u", tmp_path).title_pattern == _UNSTRACT_TITLE
+
+
+def test_frontmatter_unknown_key_warns(tmp_path: Path, capsys) -> None:
+    _write(tmp_path / "Zipstack.md", "---\ntitel_pattern: x\n# comment\n---\nbody\n")
+    loaded = load_repo_standards("Zipstack", "u", tmp_path)
+    assert loaded.title_pattern is None
+    assert loaded.body == "body"
+    out = capsys.readouterr().out
+    assert "titel_pattern" in out and "comment" not in out
+
+
+def test_frontmatter_unterminated_is_body(tmp_path: Path, capsys) -> None:
+    _write(tmp_path / "Zipstack.md", "---\ntitle_pattern: x\nbody\n")
+    loaded = load_repo_standards("Zipstack", "u", tmp_path)
+    assert loaded.title_pattern is None
+    assert loaded.body.startswith("---")
+    assert "unterminated" in capsys.readouterr().out
+
+
+def test_frontmatter_invalid_regex_disables_title_check(tmp_path: Path, capsys) -> None:
+    _write(tmp_path / "Zipstack.md", "---\ntitle_pattern: ([unclosed\n---\nbody\n")
+    loaded = load_repo_standards("Zipstack", "u", tmp_path)
+    assert loaded.title_pattern is None
+    assert loaded.body == "body"
+    assert "invalid title_pattern" in capsys.readouterr().out
+
+
+def test_standards_body_truncated_at_cap(tmp_path: Path, capsys) -> None:
+    _write(tmp_path / "Zipstack.md", "x" * (REPO_STANDARDS_CHAR_CAP + 50))
+    loaded = load_repo_standards("Zipstack", "u", tmp_path)
+    assert loaded.body.startswith("x" * REPO_STANDARDS_CHAR_CAP)
+    assert loaded.body.endswith("truncated — the rest of the file was omitted]")
+    assert f"only the first {REPO_STANDARDS_CHAR_CAP}" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("title", "failed"),
+    [
+        ("UN-3653 [FIX] Never weaken tests", False),
+        ("LW-373 [FEAT] Add thing", False),
+        ("fix: weaken tests", True),
+        ("UN-3653 Fix without type", True),
+    ],
+)
+def test_title_check_with_unstract_pattern(title: str, failed: bool) -> None:
+    std = RepoStandards(source=Path("Zipstack.md"), body="", title_pattern=_UNSTRACT_TITLE)
+    assert title_check_failed(std, title) is failed
+
+
+def test_title_check_off_without_pattern() -> None:
+    assert not title_check_failed(None, "anything")
+    assert not title_check_failed(RepoStandards(Path("a.md"), "b"), "anything")
+
+
+def test_format_repo_standards_variants() -> None:
+    src = Path("Zipstack.md")
+    assert format_repo_standards(None, "t") == ""
+    # Passing title + empty body: nothing to say, no acknowledgement.
+    assert format_repo_standards(RepoStandards(src, "", _UNSTRACT_TITLE), "UN-1 [FIX] x") == ""
+    body_only = format_repo_standards(RepoStandards(src, "- rule"), "t")
+    assert "`Zipstack.md`" in body_only and body_only.endswith("- rule")
+    failed = format_repo_standards(RepoStandards(src, "- rule", _UNSTRACT_TITLE), "fix: x")
+    assert "- rule" in failed
+    assert "'fix: x'" in failed
+    assert "review body" in failed and "not as an inline" in failed
+
+
+def test_describe_repo_standards() -> None:
+    src = Path("Zipstack.md")
+    assert describe_repo_standards(None, "t") == ""
+    assert describe_repo_standards(RepoStandards(src, "b"), "t") == "standards: Zipstack.md"
+    assert describe_repo_standards(RepoStandards(src, "b", _UNSTRACT_TITLE), "fix: x") == (
+        "standards: Zipstack.md, title check failed"
+    )
+
+
+@pytest.mark.parametrize("cli", ["claude", "codex", "gemini"])
+def test_repo_standards_follow_review_standards_before_extras(cli: str) -> None:
+    """Conventions are more rules: right after the review standards, and
+    before the per-launch extras so those can still override them."""
+    section = format_repo_standards(RepoStandards(Path("Zipstack.md"), "- rule"), "t")
+    built = build_review_prompt(
+        post_inline=False,
+        extra_prompt="extra",
+        existing=[],
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+        cli=cli,
+        repo_standards=section,
+    )
+    base = REVIEW_PROMPT_CLAUDE if cli == "claude" else REVIEW_PROMPT_SKILL_BASED
+    assert built.text == PROMPT_SECTION_SEP.join(
+        [
+            base,
+            REVIEW_STANDARDS_SUFFIX,
+            section,
+            *_dispatch(cli),
+            "Additional instructions from reviewer:\nextra",
+        ]
+    )

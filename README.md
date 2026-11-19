@@ -123,6 +123,35 @@ Clones are organised as `$GH_PR_WORKSPACE/<owner>/<repo>`, so a second
 review of the same repo reuses the existing clone and just `git fetch`es
 before checking out the PR.
 
+### Per-org review standards
+
+To add your team's review rules to every review of an org's (or one
+repo's) PRs, drop a markdown file in `$GH_PR_WORKSPACE/.review-standards/`:
+
+```
+$GH_PR_WORKSPACE/.review-standards/
+├── <owner>.md            # every repo of <owner>
+└── <owner>/
+    └── <repo>.md         # one repo; replaces <owner>.md for that repo
+```
+
+Names match case-insensitively. The file's body is added to the review
+prompt (the first 6,000 characters). Optional frontmatter enables a PR-title
+check. Values are read literally (this is not YAML, so don't double the
+backslashes). Quote the regex if its leading or trailing whitespace matters:
+
+```markdown
+---
+title_pattern: "^[A-Z]+-\d+ \[[A-Z]+\] "
+---
+- Follow the PR types in CONTRIBUTION_GUIDE.md.
+- Never weaken an existing test just to make a change pass.
+```
+
+If the title doesn't match, the agent is told to raise it in the review
+body, not as an inline comment. If no file exists for a repo, nothing is
+added. The launch line shows `standards: <file>` when one is in use.
+
 ## Keybindings
 
 | Key           | Action                                                       |
@@ -213,9 +242,12 @@ If the modal's **post-inline** toggle (`Ctrl+T`) is on, the prompt is
 extended to ask the CLI to publish each finding as an inline review
 comment via a single `POST /repos/{owner}/{repo}/pulls/{n}/reviews` call
 through `gh api`, so they land grouped under one review. On a re-review
-of someone else's PR where only NIT-level findings remain, the CLI is
+of someone else's PR where only P3 (nit) findings remain, the CLI is
 also asked to resolve any of its own previously-posted threads that the
-new code has addressed before submitting the APPROVE.
+new code has addressed before submitting the APPROVE. Set **Approval on
+others' PRs** in Settings (`,`) to *Never approve (comment only)* to turn
+off every approve/resolve step: reviews are then always submitted as
+`event: COMMENT`, and approving stays a separate manual action.
 
 When you exit the CLI, press Enter and the TUI returns.
 
