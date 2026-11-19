@@ -4224,18 +4224,18 @@ def test_is_test_path_leaf_named_tests_is_not_a_dir_match() -> None:
 
 
 def test_parse_name_status_counts_all_and_lists_existing_tests() -> None:
-    out = "\n".join(
+    out = "\0".join(
         [
-            "M\tsrc/api.py",
-            "M\ttests/test_api.py",
-            "A\ttests/test_new.py",
-            "D\ttests/test_old.py",
-            "R095\ttests/test_a.py\ttests/test_b.py",
-            "R100\ttests/test_moved.py\tsrc/moved.py",
-            "C080\ttests/test_x.py\ttests/test_y.py",
+            "M", "src/api.py",
+            "M", "tests/test_api.py",
+            "A", "tests/test_new.py",
+            "D", "tests/test_old.py",
+            "R095", "tests/test_a.py", "tests/test_b.py",
+            "R100", "tests/test_moved.py", "src/moved.py",
+            "C080", "tests/test_x.py", "tests/test_y.py",
             "",
         ]
-    )
+    )  # fmt: skip
     count, tests = _parse_name_status(out)
     assert count == 7
     assert tests == (
@@ -4244,6 +4244,15 @@ def test_parse_name_status_counts_all_and_lists_existing_tests() -> None:
         ("renamed", "tests/test_b.py"),
         ("deleted", "tests/test_old.py"),
     )
+
+
+def test_parse_name_status_keeps_non_ascii_and_tab_paths_raw() -> None:
+    """With `-z`, git doesn't C-quote paths; names with non-ASCII bytes or a
+    tab must still be matched as tests and counted once each."""
+    out = "M\0tests/test_café.py\0M\0src/a\tb.py\0R100\0tests/old é.py\0lib/new é.py\0"
+    count, tests = _parse_name_status(out)
+    assert count == 3
+    assert tests == (("renamed", "lib/new é.py"), ("modified", "tests/test_café.py"))
 
 
 def test_format_test_change_scrutiny_empty_skips_section() -> None:
@@ -4321,7 +4330,13 @@ def test_resolve_diff_scope_reports_changed_existing_tests(
     _git(tmp_path, "clone", "-q", str(origin), str(repo))
     _git(repo, "checkout", "-q", "-b", "main")
     (repo / "tests").mkdir()
-    for name in ("src.py", "tests/test_a.py", "tests/test_b.py", "tests/test_c.py"):
+    for name in (
+        "src.py",
+        "tests/test_a.py",
+        "tests/test_b.py",
+        "tests/test_c.py",
+        "tests/test_café.py",
+    ):
         (repo / name).write_text(f"{name}\n" * 20)
     _git(repo, "add", ".")
     _git(repo, "commit", "-q", "-m", "base")
@@ -4334,15 +4349,17 @@ def test_resolve_diff_scope_reports_changed_existing_tests(
     _git(repo, "rm", "-q", "tests/test_b.py")
     _git(repo, "mv", "tests/test_c.py", "tests/test_c2.py")
     (repo / "tests/test_new.py").write_text("new\n")
+    (repo / "tests/test_café.py").write_text("weakened\n")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "pr")
 
-    _patch_gh(monkeypatch, stdout=_gh_meta(base_sha, files=5))
+    _patch_gh(monkeypatch, stdout=_gh_meta(base_sha, files=6))
     scope = _resolve_diff_scope("o/r", 1, repo)
     assert scope is not None
-    assert (scope.local_files, scope.github_files) == (5, 5)
+    assert (scope.local_files, scope.github_files) == (6, 6)
     assert scope.changed_tests == (
         ("modified", "tests/test_a.py"),
         ("deleted", "tests/test_b.py"),
         ("renamed", "tests/test_c2.py"),
+        ("modified", "tests/test_café.py"),
     )

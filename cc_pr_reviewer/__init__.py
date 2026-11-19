@@ -2049,8 +2049,10 @@ def _resolve_diff_scope(repo: str, number: int, worktree_path: Path) -> DiffScop
         return None
     # `--name-status` (not `--name-only`) so one call yields both the file
     # count (one line per file, renames included, same as `--name-only`) and
-    # which existing tests were modified/renamed/deleted.
-    diff_out = _git("diff", "--name-status", merge_base, "HEAD")
+    # which existing tests were modified/renamed/deleted. `-z` so paths come
+    # through raw — without it git C-quotes non-ASCII/tab/quote paths
+    # (`"tests/caf\303\251.py"`), which the test-path heuristic can't match.
+    diff_out = _git("diff", "--name-status", "-z", merge_base, "HEAD")
     if diff_out is None:
         return None
     local_files, changed_tests = _parse_name_status(diff_out)
@@ -2090,24 +2092,30 @@ _NAME_STATUS_LABELS = {"M": "modified", "D": "deleted", "R": "renamed"}
 
 
 def _parse_name_status(out: str) -> tuple[int, tuple[tuple[str, str], ...]]:
-    """Parse `git diff --name-status` into (file count, changed existing tests). Pure.
+    """Parse `git diff --name-status -z` into (file count, changed existing tests). Pure.
 
-    Lines are `<status>\t<path>` or, for renames/copies, `R<score>\t<old>\t<new>`.
-    A renamed test is listed under its new path (where the reviewer will find
-    it) but matched on either path, so moving a test out of `tests/` doesn't
-    hide it. Added (`A`) and copied (`C`) files are never "existing tests".
+    Records are NUL-separated: `<status>\0<path>\0`, or for renames/copies
+    `R<score>\0<old>\0<new>\0`. A renamed test is listed under its new path
+    (where the reviewer will find it) but matched on either path, so moving a
+    test out of `tests/` doesn't hide it. Added (`A`) and copied (`C`) files
+    are never "existing tests".
     """
     count = 0
     tests: list[tuple[str, str]] = []
-    for line in out.splitlines():
-        if not line.strip():
+    fields = out.split("\0")
+    i = 0
+    while i < len(fields):
+        status = fields[i].strip()
+        if not status:
+            i += 1
             continue
+        n_paths = 2 if status[:1] in ("R", "C") else 1
+        paths = [p for p in fields[i + 1 : i + 1 + n_paths] if p]
+        i += 1 + n_paths
         count += 1
-        fields = line.split("\t")
-        label = _NAME_STATUS_LABELS.get(fields[0][:1])
-        if label is None or len(fields) < 2:
+        label = _NAME_STATUS_LABELS.get(status[:1])
+        if label is None or not paths:
             continue
-        paths = fields[1:]
         if any(_is_test_path(p) for p in paths):
             tests.append((label, paths[-1]))
     return count, tuple(sorted(tests, key=lambda t: t[1]))
