@@ -110,6 +110,7 @@ from cc_pr_reviewer import (
     describe_diff_scope,
     describe_repo_standards,
     fetch_my_latest_review,
+    fetch_pr_title,
     format_codegraph_affected_tests,
     format_diff_scope,
     format_existing_comments,
@@ -4413,6 +4414,60 @@ def test_load_repo_standards_unreadable_warns_and_skips(tmp_path: Path, capsys) 
     (tmp_path / "Zipstack.md").write_bytes(b"\xff\xfe not utf-8 \x80")
     assert load_repo_standards("Zipstack", "unstract", tmp_path) is None
     assert "couldn't read review standards" in capsys.readouterr().out
+
+
+def test_load_repo_standards_missing_dir_is_silent(tmp_path: Path, capsys) -> None:
+    assert load_repo_standards("Zipstack", "unstract", tmp_path / "missing") is None
+    (tmp_path / "file").write_text("x")
+    assert load_repo_standards("Zipstack", "unstract", tmp_path / "file") is None
+    assert capsys.readouterr().out == ""
+
+
+def test_load_repo_standards_unlistable_owner_dir_warns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """An unlistable owner dir must not silently fall back to the org file."""
+    _write(tmp_path / "Zipstack.md", "- org rule\n")
+    _write(tmp_path / "Zipstack" / "unstract.md", "- repo rule\n")
+    real_iterdir = Path.iterdir
+
+    def fake_iterdir(self: Path):
+        if self.name == "Zipstack":
+            raise PermissionError(13, "Permission denied")
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+    assert load_repo_standards("Zipstack", "unstract", tmp_path).body == "- org rule"
+    out = capsys.readouterr().out
+    assert "couldn't list review standards dir" in out
+    assert "Permission denied" in out
+
+
+@pytest.mark.parametrize(
+    ("result", "expected", "warns"),
+    [
+        (("0", '{"title": "ABC-1 [FIX] new"}'), "ABC-1 [FIX] new", False),
+        (("1", ""), None, True),
+        (("0", "not json"), None, True),
+        (OSError("no gh"), None, True),
+    ],
+    ids=["ok", "gh-fails", "bad-json", "oserror"],
+)
+def test_fetch_pr_title(
+    monkeypatch: pytest.MonkeyPatch, capsys, result: Any, expected: str | None, warns: bool
+) -> None:
+    import subprocess
+
+    def fake(cmd: list[str], **kw: Any) -> subprocess.CompletedProcess:
+        assert cmd[:3] == ["gh", "pr", "view"] and "--repo" in cmd
+        if isinstance(result, Exception):
+            raise result
+        rc, out = result
+        return subprocess.CompletedProcess(cmd, int(rc), stdout=out, stderr="boom")
+
+    monkeypatch.setattr(_mod, "run", fake)
+    assert fetch_pr_title("o/r", 1) == expected
+    assert ("using the cached one" in capsys.readouterr().out) is warns
 
 
 def test_frontmatter_title_pattern_and_body(tmp_path: Path) -> None:

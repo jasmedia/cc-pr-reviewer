@@ -2187,10 +2187,18 @@ class RepoStandards:
 
 def _find_case_insensitive(directory: Path, name: str) -> Path | None:
     """`directory/name`, matched case-insensitively (GitHub owner/repo names
-    are case-insensitive, but Linux filesystems aren't)."""
+    are case-insensitive, but Linux filesystems aren't).
+
+    A missing directory is silent (the feature is simply off); any other
+    listing error (permissions, I/O) warns, so configured standards are never
+    skipped — or swapped for the org fallback — without a signal.
+    """
     try:
         entries = list(directory.iterdir())
-    except OSError:
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as e:
+        print(f"warning: couldn't list review standards dir {directory} ({e}); skipping it.")
         return None
     exact = directory / name
     if exact in entries:
@@ -2272,6 +2280,31 @@ def load_repo_standards(owner: str, repo: str, root: Path = STANDARDS_DIR) -> Re
             print(f"warning: couldn't read review standards {path} ({e}); skipping them.")
             return None
         return _parse_standards_file(text, path)
+    return None
+
+
+def fetch_pr_title(repo: str, number: int) -> str | None:
+    """The PR's current title from GitHub, or None (after a warning) on failure.
+
+    The queue's cached title can be stale by launch time; the title check
+    must judge what the PR is titled now, not at the last refresh.
+    """
+    try:
+        r = run(
+            ["gh", "pr", "view", str(number), "--repo", repo, "--json", "title"],
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as e:
+        err = str(e)
+    else:
+        if r.returncode == 0:
+            try:
+                return str(json.loads(r.stdout)["title"])
+            except (ValueError, KeyError, TypeError) as e:
+                err = f"unexpected output: {e}"
+        else:
+            err = (r.stderr or r.stdout).strip() or f"exit {r.returncode}"
+    print(f"warning: couldn't fetch the current PR title ({err}); using the cached one.")
     return None
 
 
@@ -5700,6 +5733,12 @@ class PRReviewer(App):
                 # (absent file = feature off for this repo, silently).
                 repo_standards = load_repo_standards(owner, name)
                 pr_title = pr.get("title") or ""
+                if repo_standards is not None and repo_standards.title_pattern:
+                    # Check the title as it is now, not as of the last
+                    # queue refresh (the author may have renamed it since).
+                    current_title = fetch_pr_title(repo_full, number)
+                    if current_title is not None:
+                        pr_title = current_title
                 if repo_standards is not None:
                     print(f"Using review standards from {repo_standards.source}")
 
