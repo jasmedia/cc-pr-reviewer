@@ -1913,6 +1913,184 @@ def _prepare_pr_worktree(
     return True, worktree_created, head_sha
 
 
+@dataclass(frozen=True)
+class DiffScope:
+    """The PR's review scope, resolved locally and reconciled with GitHub.
+
+    `merge_base` is computed against the PR's *actual* base commit (GitHub's
+    `baseRefOid` for `baseRefName`, never assumed to be the default branch),
+    so a stale remote-tracking ref can't drag already-merged commits from
+    other people into the diff. `local_files` is the
+    `git diff --name-only <merge_base> HEAD` count; `github_files` is GitHub's
+    own `changedFiles`. They disagree when the local base is wrong — local
+    showing *more* files is the classic stale-base signature.
+    """
+
+    base_ref: str
+    merge_base: str
+    head_sha: str
+    local_files: int
+    github_files: int
+
+    @property
+    def mismatch(self) -> bool:
+        return self.local_files != self.github_files
+
+
+def _resolve_diff_scope(repo: str, number: int, worktree_path: Path) -> DiffScope | None:
+    """Resolve and reconcile the PR's diff scope inside its worktree.
+
+    Returns None (after printing why) when the scope can't be determined —
+    `gh pr view` failing, an unparseable response, or `git merge-base`
+    failing. That is non-fatal: the launch proceeds without a Scope section,
+    exactly as before this check existed.
+
+    The merge-base is computed against GitHub's own base commit
+    (`baseRefOid`), not the local `origin/<base>` ref, so a stale ref can't
+    silently widen the diff — file-count reconciliation alone misses a stale
+    base whose extra commits only touch files the PR also touches. A failed
+    `git fetch` of the base is only a warning when that commit is already
+    present locally (e.g. via the PR's own history after a rebase); when it
+    isn't, the scope is unverifiable and we return None rather than certify
+    a diff against the wrong base.
+
+    Runs `git` in the worktree: worktrees share refs with the primary clone,
+    so fetching here updates the same `origin/<base>` ref the primary uses.
+    `gh pr view --repo` is explicit for the same cross-fork reason as
+    `_codegraph_affected_paths`.
+    """
+    try:
+        view = run(
+            [
+                "gh",
+                "pr",
+                "view",
+                str(number),
+                "--repo",
+                repo,
+                "--json",
+                "baseRefName,baseRefOid,changedFiles",
+            ],
+            cwd=worktree_path,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as e:
+        print(f"warning: `gh pr view` failed ({e}); skipping diff-scope check.")
+        return None
+    if view.returncode != 0:
+        err = (view.stderr or view.stdout).strip() or f"exit {view.returncode}"
+        print(f"warning: `gh pr view` failed ({err}); skipping diff-scope check.")
+        return None
+    try:
+        meta = json.loads(view.stdout)
+        base = str(meta["baseRefName"]).strip()
+        base_oid = str(meta["baseRefOid"]).strip()
+        github_files = int(meta["changedFiles"])
+    except (ValueError, KeyError, TypeError) as e:
+        print(f"warning: unexpected `gh pr view` output ({e}); skipping diff-scope check.")
+        return None
+    if not base or not base_oid:
+        print("warning: PR has an empty baseRefName/baseRefOid; skipping diff-scope check.")
+        return None
+
+    print(f"Fetching base branch origin/{base}…")
+    try:
+        fetch = run(["git", "fetch", "origin", base], cwd=worktree_path, timeout=120)
+        if fetch.returncode != 0:
+            err = (fetch.stderr or fetch.stdout).strip() or f"exit {fetch.returncode}"
+            print(f"warning: `git fetch origin {base}` failed ({err}); using last-fetched ref.")
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as e:
+        print(f"warning: `git fetch origin {base}` failed ({e}); using last-fetched ref.")
+
+    def _git(*args: str) -> str | None:
+        """Run one git step; on failure print why and return None."""
+        try:
+            r = run(["git", *args], cwd=worktree_path, timeout=30)
+        except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as e:
+            err = str(e)
+        else:
+            if r.returncode == 0:
+                return r.stdout
+            err = (r.stderr or r.stdout).strip() or f"exit {r.returncode}"
+        print(f"warning: `git {' '.join(args)}` failed ({err}); skipping diff-scope check.")
+        return None
+
+    # GitHub's base commit must be present locally; if the fetch failed and
+    # it isn't, our `origin/<base>` is behind GitHub's and any merge-base
+    # computed from it could include other people's already-merged work.
+    try:
+        has_base = run(
+            ["git", "cat-file", "-e", f"{base_oid}^{{commit}}"], cwd=worktree_path, timeout=30
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as e:
+        print(
+            f"warning: couldn't look up base commit {base_oid[:8]} ({e}); "
+            "skipping diff-scope check."
+        )
+        return None
+    if has_base.returncode != 0:
+        print(
+            f"warning: GitHub's base commit {base_oid[:8]} for origin/{base} isn't "
+            "available locally (base fetch failed?); skipping diff-scope check."
+        )
+        return None
+
+    mb_out = _git("merge-base", base_oid, "HEAD")
+    if mb_out is None:
+        return None
+    merge_base = mb_out.strip()
+    head_out = _git("rev-parse", "HEAD")
+    if head_out is None:
+        return None
+    diff_out = _git("diff", "--name-only", merge_base, "HEAD")
+    if diff_out is None:
+        return None
+    local_files = sum(1 for line in diff_out.splitlines() if line.strip())
+    return DiffScope(
+        base_ref=base,
+        merge_base=merge_base,
+        head_sha=head_out.strip(),
+        local_files=local_files,
+        github_files=github_files,
+    )
+
+
+def format_diff_scope(scope: DiffScope, number: int) -> str:
+    """Render the prompt's Scope section (pure).
+
+    Hands the agent one fixed scope so it — and every sub-agent it
+    dispatches — reads the same diff instead of re-deriving the base from
+    whatever ref happens to be local. On a mismatch the user chose to
+    continue anyway, so the section names GitHub's file list as
+    authoritative rather than silently trusting the local diff.
+    """
+    mb = scope.merge_base
+    lines = [
+        "Review scope (resolved before launch — use it instead of re-deriving the base):",
+        f"- Base branch: `{scope.base_ref}`; merge-base: `{mb}`; PR head: `{scope.head_sha}`.",
+        f"- Changed files: `git diff --name-only {mb} HEAD`. Full diff: `git diff {mb} HEAD`.",
+        "- Only changes in that diff are in scope. Give the merge-base SHA and these "
+        "commands to any sub-agent you dispatch.",
+    ]
+    if scope.mismatch:
+        lines.append(
+            f"- WARNING: the local diff has {scope.local_files} files but GitHub reports "
+            f"{scope.github_files}. Treat `gh pr diff {number} --name-only` as the "
+            "authoritative file list and ignore files outside it."
+        )
+    return "\n".join(lines)
+
+
+def describe_diff_scope(scope: DiffScope | None) -> str:
+    """Launch-banner fragment for the scope check (pure)."""
+    if scope is None:
+        return "scope: unavailable"
+    desc = f"scope: {scope.base_ref}@{scope.merge_base[:8]}, {scope.local_files} files"
+    if scope.mismatch:
+        desc += f" (GitHub: {scope.github_files})"
+    return desc
+
+
 def _setup_codegraph_index(
     primary_path: Path,
     worktree_path: Path,
@@ -2098,6 +2276,7 @@ def _format_launch_banner_parts(
     selected_agents: tuple[str, ...],
     extra_prompt: str,
     allow_approve: bool = True,
+    scope_desc: str = "",
 ) -> list[str]:
     """Assemble the human-readable launch-banner fragments (pure).
 
@@ -2124,6 +2303,8 @@ def _format_launch_banner_parts(
     if post_inline and not allow_approve:
         post_inline_desc += ", never-approve"
     parts = [f"post-inline: {post_inline_desc}", existing_desc]
+    if scope_desc:
+        parts.append(scope_desc)
     # Only call out the agent subset when it diverges from the default — the
     # banner is already crowded, and "agents: all" would be noise on every
     # default-shape launch. Compare as SETS rather than tuples:
@@ -2255,6 +2436,7 @@ def build_review_prompt(
     codegraph_affected_tests: str = "",
     selected_agents: tuple[str, ...] | None = None,
     allow_approve: bool = True,
+    diff_scope: str = "",
 ) -> BuiltPrompt:
     """Assemble the user message for the selected coding-agent CLI. Pure — no I/O.
 
@@ -2313,6 +2495,13 @@ def build_review_prompt(
     re-review raised bar (`POST_INLINE_REREVIEW_SUFFIX`) is unaffected — it's
     about which findings to post, not the verdict. Defaults to True so callers
     that predate the setting keep the historical prompt verbatim.
+
+    `diff_scope` is the pre-rendered Scope section from `format_diff_scope`
+    (base branch, merge-base SHA, head SHA, the exact diff commands, and a
+    GitHub-is-authoritative warning on a file-count mismatch). It lands after
+    the reviewer extras and before the CodeGraph sections — it's "what to
+    review" context. Empty string (the default, and the runtime value when
+    the scope couldn't be resolved) skips the section.
 
     Contract: `fetch_existing_review_comments` guarantees that
     `fetch_ok=False` always returns `existing=[]`. Passing a non-empty
@@ -2378,6 +2567,8 @@ def build_review_prompt(
     stripped_extra = extra_prompt.strip()
     if stripped_extra:
         sections.append(f"Additional instructions from reviewer:\n{stripped_extra}")
+    if diff_scope:
+        sections.append(diff_scope)
     # Placed AFTER the reviewer extras so a per-launch override stays close
     # to the base prompt (highest visibility), but BEFORE existing-comments
     # and the post-inline output instructions — CodeGraph is workflow guidance
@@ -5202,6 +5393,26 @@ class PRReviewer(App):
                 if not ok:
                     return
 
+                # Resolve the PR's diff scope against its actual base branch
+                # and reconcile the file count with GitHub. A mismatch means
+                # the local base is wrong (classically: stale), so the agent
+                # would review other people's already-merged commits — ask
+                # before launching, defaulting to abort. An unresolvable scope
+                # is non-fatal: the launch proceeds without a Scope section.
+                print("Resolving diff scope…")
+                diff_scope = _resolve_diff_scope(repo_full, number, worktree_path)
+                if diff_scope is not None and diff_scope.mismatch:
+                    print(
+                        f"\nwarning: local diff vs origin/{diff_scope.base_ref} has "
+                        f"{diff_scope.local_files} files, but GitHub reports "
+                        f"{diff_scope.github_files}. The local base is likely wrong, "
+                        "so the review may include changes that aren't in this PR."
+                    )
+                    answer = input("Launch the review anyway? [y/N] ").strip().lower()
+                    if answer not in ("y", "yes"):
+                        print("Review cancelled.")
+                        return
+
                 # Hoist the `codegraph` PATH probe once: the Tier 2/3/4
                 # blocks below all share this gate, and three separate
                 # `shutil.which` calls would also create a TOCTOU surface
@@ -5290,6 +5501,9 @@ class PRReviewer(App):
                     codegraph_affected_tests=codegraph_affected_block,
                     selected_agents=selected_agents,
                     allow_approve=allow_approve,
+                    diff_scope=(
+                        format_diff_scope(diff_scope, number) if diff_scope is not None else ""
+                    ),
                 )
 
                 cmd = _build_cli_command(cli, built.text)
@@ -5301,6 +5515,7 @@ class PRReviewer(App):
                     selected_agents,
                     extra_prompt,
                     allow_approve=allow_approve,
+                    scope_desc=describe_diff_scope(diff_scope),
                 )
                 print(
                     f"\nLaunching {_CLI_DISPLAY[cli]} ({', '.join(parts)})"

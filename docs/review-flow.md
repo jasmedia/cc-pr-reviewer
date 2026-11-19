@@ -36,7 +36,9 @@ flowchart TD
     RES -- reserved --> TRY["set _suspended_for_review = True<br/>(pause auto-refresh)"]
     TRY --> WT{"_prepare_pr_worktree:<br/>clone/fetch primary →<br/>worktree add → gh pr checkout →<br/>rev-parse HEAD"}
     WT -- not ok --> FIN
-    WT -- ok --> CG["_setup_codegraph_index<br/>(gated on x toggle):<br/>seed index from primary + sync diff +<br/>collect affected tests"]
+    WT -- ok --> SC{"_resolve_diff_scope:<br/>fetch PR's base → merge-base →<br/>local vs GitHub file count"}
+    SC -- "mismatch + user says N" --> FIN
+    SC -- "match / unresolvable / user says y" --> CG["_setup_codegraph_index<br/>(gated on x toggle):<br/>seed index from primary + sync diff +<br/>collect affected tests"]
     CG --> SK{"cli is skill-based<br/>(codex/gemini)?"}
     SK -- yes --> SKM["_materialise_skills →<br/>.agents/skills/ (snapshot for restore)"]
     SK -- no --> EX
@@ -44,7 +46,7 @@ flowchart TD
     EX --> SLB{"slack webhook<br/>configured?"}
     SLB -- yes --> SLP["fetch_my_latest_review →<br/>pre-session baseline"]
     SLB -- no --> PB
-    SLP --> PB["_resolve_codegraph_tools →<br/>build_review_prompt →<br/>_build_cli_command"]
+    SLP --> PB["_resolve_codegraph_tools →<br/>build_review_prompt (+ Scope section) →<br/>_build_cli_command"]
 
     PB --> RUN["print banner<br/>rc = subprocess.call(cmd, cwd=worktree)"]
     RUN --> AGENT[["Coding-agent CLI session<br/>(claude / codex / gemini)<br/>user reviews the PR"]]
@@ -102,17 +104,17 @@ All symbols live in `cc_pr_reviewer/__init__.py`:
 
 | Node | Symbol | Line |
 | --- | --- | --- |
-| Keypress entry, in-progress gate, modal push | `action_review` | 4521 |
-| Per-launch choices payload | `ConfirmResult` | 3176 |
-| Confirm modal | `ConfirmScreen` | 3237 |
-| In-progress warn modal | `InProgressWarnScreen` | 3400 |
-| Launch orchestration + `finally` teardown | `_launch_review_cli` | 5035 |
-| Prompt assembly (pure) | `build_review_prompt` | 2200 |
-| Slack notification decision | `_notify_review_to_slack` | 4921 |
-| Worktree index seed | `_seed_worktree_codegraph` | 1590 |
+| Keypress entry, in-progress gate, modal push | `action_review` | 4768 |
+| Per-launch choices payload | `ConfirmResult` | 3400 |
+| Confirm modal | `ConfirmScreen` | 3461 |
+| In-progress warn modal | `InProgressWarnScreen` | 3624 |
+| Launch orchestration + `finally` teardown | `_launch_review_cli` | 5285 |
+| Prompt assembly (pure) | `build_review_prompt` | 2398 |
+| Slack notification decision | `_notify_review_to_slack` | 5171 |
+| Worktree index seed | `_seed_worktree_codegraph` | 1630 |
 
 Other called helpers: `_preflight_cli_checks`, `_reserve_in_progress`,
-`_prepare_pr_worktree`, `_setup_codegraph_index`, `_materialise_skills`,
+`_prepare_pr_worktree`, `_resolve_diff_scope`, `_setup_codegraph_index`, `_materialise_skills`,
 `fetch_existing_review_comments`, `_resolve_codegraph_tools`,
 `_build_cli_command`, `_record_launch_telemetry`, `_record_review`,
 `_cleanup_skills`, `_release_in_progress`.
