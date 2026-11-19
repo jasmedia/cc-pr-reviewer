@@ -1911,6 +1911,64 @@ def test_materialise_raises_clear_error_when_copy_fails(
         _materialise_skills(tmp_path)
 
 
+# --- symlink containment (PR-controlled paths must not escape the worktree) --
+
+
+@pytest.mark.parametrize("layout", ["agents-skills", "claude-agents"])
+def test_materialise_skips_symlinked_outer_dir(tmp_path: Any, capsys, layout: str) -> None:
+    """A PR committing `.agents` / `.claude` as a symlink to an outside dir
+    (e.g. `~/.claude`) must not get our files written through it."""
+    ws, outside = tmp_path / "ws", tmp_path / "outside"
+    ws.mkdir()
+    outside.mkdir()
+    outer = ".claude" if layout == "claude-agents" else ".agents"
+    (ws / outer).symlink_to(outside, target_is_directory=True)
+    names = tuple(sorted(LOCAL_SKILLS)) if layout == "claude-agents" else REVIEW_SKILLS[:2]
+
+    manifest = _materialise_skills(ws, selected=names, layout=layout)
+    assert manifest.skills == {}
+    assert list(outside.rglob("*")) == []
+    assert "not materialising skill" in capsys.readouterr().out
+    _cleanup_skills(manifest)
+    assert (ws / outer).is_symlink()
+
+
+def test_materialise_skips_symlinked_target_file(tmp_path: Any, capsys) -> None:
+    """A target file symlinked to an outside file (e.g. `~/.bashrc`) must
+    not be overwritten — copy2 would follow the link."""
+    ws = tmp_path / "ws"
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"precious")
+    name = next(iter(LOCAL_SKILLS))
+    target = ws / ".claude" / "agents" / f"{name}.md"
+    target.parent.mkdir(parents=True)
+    target.symlink_to(victim)
+
+    manifest = _materialise_skills(ws, selected=(name,), layout="claude-agents")
+    assert name not in manifest.skills
+    assert victim.read_bytes() == b"precious"
+    assert "not materialising skill" in capsys.readouterr().out
+
+
+def test_cleanup_skips_path_swapped_for_symlink_mid_session(tmp_path: Any, capsys) -> None:
+    """If `.claude/agents` becomes a symlink after materialise (the agent has
+    write access), cleanup must not unlink/restore through it."""
+    ws, outside = tmp_path / "ws", tmp_path / "outside"
+    ws.mkdir()
+    outside.mkdir()
+    name = next(iter(LOCAL_SKILLS))
+    manifest = _materialise_skills(ws, selected=(name,), layout="claude-agents")
+    agents = ws / ".claude" / "agents"
+    (agents / f"{name}.md").unlink()
+    agents.rmdir()
+    agents.symlink_to(outside, target_is_directory=True)
+    (outside / f"{name}.md").write_bytes(b"outside file")
+
+    _cleanup_skills(manifest)
+    assert (outside / f"{name}.md").read_bytes() == b"outside file"
+    assert "not cleaning up skill" in capsys.readouterr().out
+
+
 # --- claude-agents layout (LOCAL_SKILLS delivery for claude) ---------------
 
 

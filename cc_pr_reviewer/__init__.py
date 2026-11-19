@@ -323,6 +323,30 @@ def _skill_target_path(skills_root: Path, layout: SkillLayout, name: str) -> Pat
     return skills_root / name / SKILL_FILE_NAME
 
 
+def _unsafe_skill_path(workspace: Path, layout: SkillLayout, name: str) -> Path | None:
+    """First path on the way to a skill's target that could escape the worktree.
+
+    The worktree is checked-out PR content, so `.claude`, `.agents`, their
+    subdirs, or the target file itself may be symlinks committed by the PR
+    author. Writing (or later restoring/unlinking) through one would touch a
+    file outside the worktree — e.g. `.claude -> ~/.claude`, or a target file
+    linked to `~/.bashrc`. Returns the first component that is a symlink or
+    resolves outside `workspace`, else None.
+    """
+    outer_dir, skills_root = _skill_layout_dirs(workspace, layout)
+    target = _skill_target_path(skills_root, layout, name)
+    chain = [outer_dir, skills_root, target]
+    if layout == "agents-skills":
+        chain.insert(2, skills_root / name)
+    ws_real = workspace.resolve()
+    for path in chain:
+        if path.is_symlink():
+            return path
+        if path.exists() and not path.resolve().is_relative_to(ws_real):
+            return path
+    return None
+
+
 @dataclass(frozen=True)
 class _SkillSnapshot:
     """Pre-materialise state of one skill's target path.
@@ -416,6 +440,17 @@ def _materialise_skills(
     for name in selected:
         target = _skill_target_path(skills_root, layout, name)
 
+        unsafe = _unsafe_skill_path(workspace, layout, name)
+        if unsafe is not None:
+            # Skip rather than raise: an exception here would abort (and,
+            # from the Textual callback, crash) the whole launch over a
+            # hostile PR. Not recorded in the manifest, so cleanup leaves it.
+            print(
+                f"warning: not materialising skill {name!r}: {unsafe} is a symlink "
+                "or points outside the worktree."
+            )
+            continue
+
         # The flat claude-agents layout has no per-skill dir — pin the
         # flag True so cleanup's `rmdir` branch is a no-op for it.
         skill_dir_existed = (skills_root / name).is_dir() if layout == "agents-skills" else True
@@ -479,6 +514,15 @@ def _cleanup_skills(manifest: _MaterialisedSkills) -> None:
     outer_dir, skills_root = _skill_layout_dirs(manifest.workspace, manifest.layout)
     for name, snap in manifest.skills.items():
         target = _skill_target_path(skills_root, manifest.layout, name)
+        # Re-check: the agent ran with write access to the worktree and could
+        # have swapped a path component for a symlink since materialise.
+        unsafe = _unsafe_skill_path(manifest.workspace, manifest.layout, name)
+        if unsafe is not None:
+            print(
+                f"warning: not cleaning up skill {name!r}: {unsafe} is now a symlink "
+                "or points outside the worktree."
+            )
+            continue
         if snap.original_skill_md is not None:
             target.write_bytes(snap.original_skill_md)
         else:
