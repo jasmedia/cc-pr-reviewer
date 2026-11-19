@@ -1931,6 +1931,11 @@ class DiffScope:
     head_sha: str
     local_files: int
     github_files: int
+    # Existing test files this PR modified, renamed or deleted, as
+    # `(status, path)` with status one of "modified"/"renamed"/"deleted".
+    # Added tests are excluded on purpose — new tests for new behavior are
+    # welcome; it's edits to existing expectations that need scrutiny.
+    changed_tests: tuple[tuple[str, str], ...] = ()
 
     @property
     def mismatch(self) -> bool:
@@ -2042,17 +2047,117 @@ def _resolve_diff_scope(repo: str, number: int, worktree_path: Path) -> DiffScop
     head_out = _git("rev-parse", "HEAD")
     if head_out is None:
         return None
-    diff_out = _git("diff", "--name-only", merge_base, "HEAD")
+    # `--name-status` (not `--name-only`) so one call yields both the file
+    # count (one line per file, renames included, same as `--name-only`) and
+    # which existing tests were modified/renamed/deleted. `-z` so paths come
+    # through raw — without it git C-quotes non-ASCII/tab/quote paths
+    # (`"tests/caf\303\251.py"`), which the test-path heuristic can't match.
+    diff_out = _git("diff", "--name-status", "-z", merge_base, "HEAD")
     if diff_out is None:
         return None
-    local_files = sum(1 for line in diff_out.splitlines() if line.strip())
+    local_files, changed_tests = _parse_name_status(diff_out)
     return DiffScope(
         base_ref=base,
         merge_base=merge_base,
         head_sha=head_out.strip(),
         local_files=local_files,
         github_files=github_files,
+        changed_tests=changed_tests,
     )
+
+
+# Directory names that mark everything under them as test code. Includes
+# `__snapshots__` because editing a snapshot IS editing expected values — the
+# "update the expectation to match new output" red flag in its purest form.
+_TEST_DIR_NAMES = frozenset({"test", "tests", "__tests__", "spec", "specs", "__snapshots__"})
+# Filename conventions across the common ecosystems: pytest (`test_*.py`,
+# `*_test.py`, `conftest.py` fixtures), Go (`*_test.go`), JS/TS
+# (`*.test.*`, `*.spec.*`), JVM/.NET (`*Test(s).java|kt|cs`), RSpec (`*_spec.rb`).
+_TEST_FILE_RE = re.compile(
+    r"(^test_.*\.py$)|(_test\.(py|go)$)|(^conftest\.py$)"
+    r"|(\.(test|spec)\.[cm]?[jt]sx?$)"
+    r"|(Tests?\.(java|kt|cs)$)|(_spec\.rb$)"
+)
+
+
+def _is_test_path(path: str) -> bool:
+    """Heuristic: does this repo-relative path look like test code? (pure)"""
+    parts = path.split("/")
+    if any(part in _TEST_DIR_NAMES for part in parts[:-1]):
+        return True
+    return bool(_TEST_FILE_RE.search(parts[-1]))
+
+
+_NAME_STATUS_LABELS = {"M": "modified", "D": "deleted", "R": "renamed"}
+
+
+def _parse_name_status(out: str) -> tuple[int, tuple[tuple[str, str], ...]]:
+    """Parse `git diff --name-status -z` into (file count, changed existing tests). Pure.
+
+    Records are NUL-separated: `<status>\0<path>\0`, or for renames/copies
+    `R<score>\0<old>\0<new>\0`. A renamed test is listed under its new path
+    (where the reviewer will find it) but matched on either path, so moving a
+    test out of `tests/` doesn't hide it. Added (`A`) and copied (`C`) files
+    are never "existing tests".
+    """
+    count = 0
+    tests: list[tuple[str, str]] = []
+    fields = out.split("\0")
+    i = 0
+    while i < len(fields):
+        status = fields[i].strip()
+        if not status:
+            i += 1
+            continue
+        n_paths = 2 if status[:1] in ("R", "C") else 1
+        paths = [p for p in fields[i + 1 : i + 1 + n_paths] if p]
+        i += 1 + n_paths
+        count += 1
+        label = _NAME_STATUS_LABELS.get(status[:1])
+        if label is None or not paths:
+            continue
+        if any(_is_test_path(p) for p in paths):
+            tests.append((label, paths[-1]))
+    return count, tuple(sorted(tests, key=lambda t: t[1]))
+
+
+TEST_CHANGE_SCRUTINY_CAP = 30
+
+TEST_CHANGE_SCRUTINY_SUFFIX = (
+    "Changing an existing test is the exception, not the norm: a refactor or "
+    "bug fix that doesn't change intended behavior shouldn't need to touch "
+    "existing expectations. For each file above, decide whether the change is "
+    "legitimate (a real requirement changed, and the PR says so) or weakens "
+    "the test to get the suite green. Red flags: an assertion removed, "
+    "loosened, or made less specific; expected values edited to match new "
+    "output with no stated reason; a test deleted, skipped, xfail'd, or "
+    "commented out; a test-only change with no product-code change to justify "
+    "it; reduced coverage (cases dropped, fixtures stubbed out). For each, find "
+    "the product-code change that necessitates it, confirm the new expectation "
+    "is the intended behavior rather than a regression the edited test now "
+    "accepts, and check the PR explains why. Flag unjustified changes as P1 if "
+    "they could hide a regression, P2 if merely unexplained, naming the "
+    "specific assertion. Newly added tests are fine and not in scope here."
+)
+
+
+def format_test_change_scrutiny(changed_tests: tuple[tuple[str, str], ...]) -> str:
+    """Render the edited-existing-tests prompt section (pure).
+
+    Returns "" (skip the section) when the PR touches no existing test, so
+    the ~200-token instruction only rides on launches where it applies.
+    Capped at `TEST_CHANGE_SCRUTINY_CAP` with an explicit overflow note.
+    """
+    if not changed_tests:
+        return ""
+    shown = changed_tests[:TEST_CHANGE_SCRUTINY_CAP]
+    lines = ["This PR modifies, renames, or deletes existing test files:"]
+    lines += [f"- `{path}` ({label})" for label, path in shown]
+    hidden = len(changed_tests) - len(shown)
+    if hidden:
+        lines.append(f"- … and {hidden} more (run the scope diff to see all).")
+    lines.append(TEST_CHANGE_SCRUTINY_SUFFIX)
+    return "\n".join(lines)
 
 
 def format_diff_scope(scope: DiffScope, number: int) -> str:
@@ -2088,6 +2193,10 @@ def describe_diff_scope(scope: DiffScope | None) -> str:
     desc = f"scope: {scope.base_ref}@{scope.merge_base[:8]}, {scope.local_files} files"
     if scope.mismatch:
         desc += f" (GitHub: {scope.github_files})"
+    elif scope.changed_tests:
+        # Mirrors the launch gate: the test-change section is only sent when
+        # the counts reconcile, so only advertise it then.
+        desc += f", {len(scope.changed_tests)} existing tests edited"
     return desc
 
 
@@ -2437,6 +2546,7 @@ def build_review_prompt(
     selected_agents: tuple[str, ...] | None = None,
     allow_approve: bool = True,
     diff_scope: str = "",
+    test_changes: str = "",
 ) -> BuiltPrompt:
     """Assemble the user message for the selected coding-agent CLI. Pure — no I/O.
 
@@ -2502,6 +2612,10 @@ def build_review_prompt(
     the reviewer extras and before the CodeGraph sections — it's "what to
     review" context. Empty string (the default, and the runtime value when
     the scope couldn't be resolved) skips the section.
+
+    `test_changes` is the pre-rendered `format_test_change_scrutiny` section
+    (existing tests this PR modified/renamed/deleted, plus the weakened-test
+    red flags). It follows the Scope section; empty skips it.
 
     Contract: `fetch_existing_review_comments` guarantees that
     `fetch_ok=False` always returns `existing=[]`. Passing a non-empty
@@ -2569,6 +2683,8 @@ def build_review_prompt(
         sections.append(f"Additional instructions from reviewer:\n{stripped_extra}")
     if diff_scope:
         sections.append(diff_scope)
+    if test_changes:
+        sections.append(test_changes)
     # Placed AFTER the reviewer extras so a per-launch override stays close
     # to the base prompt (highest visibility), but BEFORE existing-comments
     # and the post-inline output instructions — CodeGraph is workflow guidance
@@ -5503,6 +5619,14 @@ class PRReviewer(App):
                     allow_approve=allow_approve,
                     diff_scope=(
                         format_diff_scope(diff_scope, number) if diff_scope is not None else ""
+                    ),
+                    # Skipped on a (user-overridden) mismatch: the local diff
+                    # then includes files outside the PR, so its test list
+                    # could point the agent at other people's test edits.
+                    test_changes=(
+                        format_test_change_scrutiny(diff_scope.changed_tests)
+                        if diff_scope is not None and not diff_scope.mismatch
+                        else ""
                     ),
                 )
 

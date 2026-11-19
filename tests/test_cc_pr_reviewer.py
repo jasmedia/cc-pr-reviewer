@@ -51,6 +51,8 @@ from cc_pr_reviewer import (
     REVIEW_SKILLS,
     REVIEW_STANDARDS_SUFFIX,
     SKILL_FILE_NAME,
+    TEST_CHANGE_SCRUTINY_CAP,
+    TEST_CHANGE_SCRUTINY_SUFFIX,
     WORKSPACE,
     BuiltPrompt,
     DiffScope,
@@ -71,11 +73,13 @@ from cc_pr_reviewer import (
     _get_setting,
     _in_progress_age_str,
     _is_newer,
+    _is_test_path,
     _join_agents,
     _load_in_progress,
     _load_review_state,
     _materialise_skills,
     _open_review_db,
+    _parse_name_status,
     _parse_semver,
     _pid_alive,
     _pr_key,
@@ -106,6 +110,7 @@ from cc_pr_reviewer import (
     format_codegraph_affected_tests,
     format_diff_scope,
     format_existing_comments,
+    format_test_change_scrutiny,
     humanise,
     new_review_pr_keys,
     parse_refresh_interval,
@@ -4001,6 +4006,22 @@ def _commit(repo: Path, name: str, content: str | None = None) -> str:
     return _git(repo, "rev-parse", "HEAD")
 
 
+def _isolate_git(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run git with an empty global config and a fixed identity, so the
+    user's hooks, signing, or default-branch settings can't affect tests."""
+    gitcfg = tmp_path / "gitconfig"
+    gitcfg.write_text("")
+    for k, v in {
+        "GIT_CONFIG_GLOBAL": str(gitcfg),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@example.com",
+    }.items():
+        monkeypatch.setenv(k, v)
+
+
 def _build_stale_base(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, same_file: bool = False
 ) -> dict[str, Any]:
@@ -4015,18 +4036,7 @@ def _build_stale_base(
     After the PR is pushed, main advances once more (`later`), a commit the
     review checkout only gets if its base fetch succeeds.
     """
-    gitcfg = tmp_path / "gitconfig"
-    gitcfg.write_text("")
-    for k, v in {
-        "GIT_CONFIG_GLOBAL": str(gitcfg),
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_AUTHOR_NAME": "t",
-        "GIT_AUTHOR_EMAIL": "t@example.com",
-        "GIT_COMMITTER_NAME": "t",
-        "GIT_COMMITTER_EMAIL": "t@example.com",
-    }.items():
-        monkeypatch.setenv(k, v)
-
+    _isolate_git(tmp_path, monkeypatch)
     origin = tmp_path / "origin.git"
     _git(tmp_path, "init", "-q", "--bare", "-b", "main", str(origin))
     author = tmp_path / "author"
@@ -4162,3 +4172,194 @@ def test_resolve_diff_scope_returns_none_when_base_ref_missing(
     out = capsys.readouterr().out
     assert "git fetch origin nope" in out
     assert "isn't available locally" in out
+
+
+# --- test-change scrutiny (_is_test_path / _parse_name_status) -------------
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "tests/test_api.py",
+        "pkg/tests/helpers.py",
+        "src/__tests__/Button.jsx",
+        "src/__snapshots__/Button.test.tsx.snap",
+        "spec/models/user_spec.rb",
+        "test_utils.py",
+        "pkg/utils_test.py",
+        "conftest.py",
+        "internal/store/store_test.go",
+        "web/src/Button.test.tsx",
+        "web/src/api.spec.ts",
+        "web/src/util.test.mjs",
+        "src/main/java/FooTest.java",
+        "src/FooTests.cs",
+        "app/src/BarTest.kt",
+    ],
+)
+def test_is_test_path_positive(path: str) -> None:
+    assert _is_test_path(path)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "src/api.py",
+        "contest.py",
+        "src/testing_utils.py",
+        "latest/main.go",
+        "src/attest.ts",
+        "README.md",
+    ],
+)
+def test_is_test_path_negative(path: str) -> None:
+    """Substrings like `test` inside other words, or a file merely *named*
+    `tests…` at the leaf, must not match."""
+    assert not _is_test_path(path)
+
+
+def test_is_test_path_leaf_named_tests_is_not_a_dir_match() -> None:
+    assert not _is_test_path("docs/tests")
+    assert _is_test_path("docs/tests/x.md")
+
+
+def test_parse_name_status_counts_all_and_lists_existing_tests() -> None:
+    out = "\0".join(
+        [
+            "M", "src/api.py",
+            "M", "tests/test_api.py",
+            "A", "tests/test_new.py",
+            "D", "tests/test_old.py",
+            "R095", "tests/test_a.py", "tests/test_b.py",
+            "R100", "tests/test_moved.py", "src/moved.py",
+            "C080", "tests/test_x.py", "tests/test_y.py",
+            "",
+        ]
+    )  # fmt: skip
+    count, tests = _parse_name_status(out)
+    assert count == 7
+    assert tests == (
+        ("renamed", "src/moved.py"),
+        ("modified", "tests/test_api.py"),
+        ("renamed", "tests/test_b.py"),
+        ("deleted", "tests/test_old.py"),
+    )
+
+
+def test_parse_name_status_keeps_non_ascii_and_tab_paths_raw() -> None:
+    """With `-z`, git doesn't C-quote paths; names with non-ASCII bytes or a
+    tab must still be matched as tests and counted once each."""
+    out = "M\0tests/test_café.py\0M\0src/a\tb.py\0R100\0tests/old é.py\0lib/new é.py\0"
+    count, tests = _parse_name_status(out)
+    assert count == 3
+    assert tests == (("renamed", "lib/new é.py"), ("modified", "tests/test_café.py"))
+
+
+def test_format_test_change_scrutiny_empty_skips_section() -> None:
+    assert format_test_change_scrutiny(()) == ""
+
+
+def test_format_test_change_scrutiny_lists_files_then_rules() -> None:
+    text = format_test_change_scrutiny(
+        (("modified", "tests/test_a.py"), ("deleted", "tests/test_b.py"))
+    )
+    assert text.splitlines()[1:3] == [
+        "- `tests/test_a.py` (modified)",
+        "- `tests/test_b.py` (deleted)",
+    ]
+    assert text.endswith(TEST_CHANGE_SCRUTINY_SUFFIX)
+    for token in ("P1", "P2", "skipped", "loosened", "product-code change"):
+        assert token in TEST_CHANGE_SCRUTINY_SUFFIX
+
+
+def test_format_test_change_scrutiny_caps_with_overflow_note() -> None:
+    many = tuple(("modified", f"tests/test_{i:03}.py") for i in range(TEST_CHANGE_SCRUTINY_CAP + 5))
+    text = format_test_change_scrutiny(many)
+    assert sum(1 for line in text.splitlines() if line.startswith("- `")) == (
+        TEST_CHANGE_SCRUTINY_CAP
+    )
+    assert "and 5 more" in text
+
+
+@pytest.mark.parametrize("cli", ["claude", "codex", "gemini"])
+def test_test_change_section_follows_scope_before_codegraph(cli: str) -> None:
+    scope_text = format_diff_scope(_scope(), 7)
+    tests_text = format_test_change_scrutiny((("modified", "tests/test_a.py"),))
+    built = build_review_prompt(
+        post_inline=False,
+        extra_prompt="",
+        existing=[],
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+        cli=cli,
+        codegraph_present=True,
+        diff_scope=scope_text,
+        test_changes=tests_text,
+    )
+    base = REVIEW_PROMPT_CLAUDE if cli == "claude" else REVIEW_PROMPT_SKILL_BASED
+    assert built.text == PROMPT_SECTION_SEP.join(
+        [
+            base,
+            REVIEW_STANDARDS_SUFFIX,
+            scope_text,
+            tests_text,
+            f"{CODEGRAPH_HINT_SUFFIX} {CODEGRAPH_IMPACT_NUDGE}",
+        ]
+    )
+
+
+def test_describe_diff_scope_counts_edited_tests_only_when_reconciled() -> None:
+    edited = (("modified", "tests/test_a.py"),)
+    ok = DiffScope("main", _MB, _HEAD, 3, 3, edited)
+    bad = DiffScope("main", _MB, _HEAD, 4, 3, edited)
+    assert describe_diff_scope(ok).endswith("3 files, 1 existing tests edited")
+    assert "edited" not in describe_diff_scope(bad)
+
+
+def test_resolve_diff_scope_reports_changed_existing_tests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end on a real repo: modified, deleted and renamed existing
+    tests are reported; an added test and product code are not; the file
+    count still matches GitHub's."""
+    _isolate_git(tmp_path, monkeypatch)
+    origin = tmp_path / "origin.git"
+    _git(tmp_path, "init", "-q", "--bare", "-b", "main", str(origin))
+    repo = tmp_path / "repo"
+    _git(tmp_path, "clone", "-q", str(origin), str(repo))
+    _git(repo, "checkout", "-q", "-b", "main")
+    (repo / "tests").mkdir()
+    for name in (
+        "src.py",
+        "tests/test_a.py",
+        "tests/test_b.py",
+        "tests/test_c.py",
+        "tests/test_café.py",
+    ):
+        (repo / name).write_text(f"{name}\n" * 20)
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "base")
+    base_sha = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "push", "-q", "origin", "main")
+
+    _git(repo, "checkout", "-q", "-b", "pr")
+    (repo / "src.py").write_text("changed\n")
+    (repo / "tests/test_a.py").write_text("weakened\n")
+    _git(repo, "rm", "-q", "tests/test_b.py")
+    _git(repo, "mv", "tests/test_c.py", "tests/test_c2.py")
+    (repo / "tests/test_new.py").write_text("new\n")
+    (repo / "tests/test_café.py").write_text("weakened\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "pr")
+
+    _patch_gh(monkeypatch, stdout=_gh_meta(base_sha, files=6))
+    scope = _resolve_diff_scope("o/r", 1, repo)
+    assert scope is not None
+    assert (scope.local_files, scope.github_files) == (6, 6)
+    assert scope.changed_tests == (
+        ("modified", "tests/test_a.py"),
+        ("deleted", "tests/test_b.py"),
+        ("renamed", "tests/test_c2.py"),
+        ("modified", "tests/test_café.py"),
+    )
