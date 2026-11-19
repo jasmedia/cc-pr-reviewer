@@ -2160,6 +2160,195 @@ def format_test_change_scrutiny(changed_tests: tuple[tuple[str, str], ...]) -> s
     return "\n".join(lines)
 
 
+# Per-org / per-repo review conventions, by file convention (no Settings UI):
+#   $GH_PR_WORKSPACE/.review-standards/<owner>.md          — every repo of <owner>
+#   $GH_PR_WORKSPACE/.review-standards/<owner>/<repo>.md   — one repo; REPLACES
+#                                                            the org file
+# The markdown body is added to the prompt; an optional frontmatter
+# `title_pattern:` regex enables a Python-side PR-title check. Lives outside any
+# clone/worktree so it never leaks into a reviewed repo, and is scoped per org
+# because the TUI lists review requests from every org the user belongs to.
+STANDARDS_DIR = WORKSPACE / ".review-standards"
+# Keep a runaway file from swamping the prompt; truncation is announced both
+# in the terminal and inside the section itself.
+REPO_STANDARDS_CHAR_CAP = 6000
+_KNOWN_STANDARDS_KEYS = frozenset({"title_pattern"})
+
+
+@dataclass(frozen=True)
+class RepoStandards:
+    """A loaded `.review-standards` file. `title_pattern` is pre-validated:
+    it's None when absent or when the regex didn't compile (warned)."""
+
+    source: Path
+    body: str
+    title_pattern: str | None = None
+
+
+def _find_case_insensitive(directory: Path, name: str) -> Path | None:
+    """`directory/name`, matched case-insensitively (GitHub owner/repo names
+    are case-insensitive, but Linux filesystems aren't).
+
+    A missing directory is silent (the feature is simply off); any other
+    listing error (permissions, I/O) warns, so configured standards are never
+    skipped — or swapped for the org fallback — without a signal.
+    """
+    try:
+        entries = list(directory.iterdir())
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as e:
+        print(f"warning: couldn't list review standards dir {directory} ({e}); skipping it.")
+        return None
+    exact = directory / name
+    if exact in entries:
+        return exact
+    lowered = name.lower()
+    return next((e for e in entries if e.name.lower() == lowered), None)
+
+
+def _parse_standards_file(text: str, source: Path) -> RepoStandards:
+    """Split optional `---` frontmatter from the body (pure apart from warnings).
+
+    Frontmatter is deliberately minimal — `key: value` lines, not YAML — so no
+    new dependency. Values are taken verbatim after the first `: ` and
+    stripped; wrap a value in matching single or double quotes to keep
+    leading/trailing whitespace (e.g. a regex ending in a space).
+    """
+    body = text
+    meta: dict[str, str] = {}
+    lines = text.splitlines()
+    if lines and lines[0].strip() == "---":
+        end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), None)
+        if end is None:
+            print(f"warning: {source}: unterminated `---` frontmatter; treating it as body.")
+        else:
+            for raw in lines[1:end]:
+                if not raw.strip() or raw.lstrip().startswith("#"):
+                    continue
+                key, sep, value = raw.partition(":")
+                key = key.strip()
+                if not sep or key not in _KNOWN_STANDARDS_KEYS:
+                    print(f"warning: {source}: ignoring unknown frontmatter line {raw.strip()!r}.")
+                    continue
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+                    value = value[1:-1]
+                meta[key] = value
+            body = "\n".join(lines[end + 1 :])
+
+    pattern = meta.get("title_pattern") or None
+    if pattern is not None:
+        try:
+            re.compile(pattern)
+        except re.error as e:
+            print(f"warning: {source}: invalid title_pattern {pattern!r} ({e}); title check off.")
+            pattern = None
+
+    body = body.strip()
+    if len(body) > REPO_STANDARDS_CHAR_CAP:
+        print(
+            f"warning: {source} is {len(body)} chars; only the first "
+            f"{REPO_STANDARDS_CHAR_CAP} go into the prompt."
+        )
+        body = body[:REPO_STANDARDS_CHAR_CAP] + "\n[… truncated — the rest of the file was omitted]"
+    return RepoStandards(source=source, body=body, title_pattern=pattern)
+
+
+def load_repo_standards(owner: str, repo: str, root: Path = STANDARDS_DIR) -> RepoStandards | None:
+    """Load the conventions file for `owner/repo`, repo file first, else org file.
+
+    Returns None when neither exists (the feature is simply off for this repo
+    — silent by design) and, after a warning, when the file exists but can't
+    be read (a configured-but-broken file must not be silently ignored).
+    """
+    candidates: list[Path] = []
+    owner_dir = _find_case_insensitive(root, owner)
+    if owner_dir is not None and owner_dir.is_dir():
+        repo_file = _find_case_insensitive(owner_dir, f"{repo}.md")
+        if repo_file is not None:
+            candidates.append(repo_file)
+    org_file = _find_case_insensitive(root, f"{owner}.md")
+    if org_file is not None:
+        candidates.append(org_file)
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as e:
+            print(f"warning: couldn't read review standards {path} ({e}); skipping them.")
+            return None
+        return _parse_standards_file(text, path)
+    return None
+
+
+def fetch_pr_title(repo: str, number: int) -> str | None:
+    """The PR's current title from GitHub, or None (after a warning) on failure.
+
+    The queue's cached title can be stale by launch time; the title check
+    must judge what the PR is titled now, not at the last refresh.
+    """
+    try:
+        r = run(
+            ["gh", "pr", "view", str(number), "--repo", repo, "--json", "title"],
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as e:
+        err = str(e)
+    else:
+        if r.returncode == 0:
+            try:
+                return str(json.loads(r.stdout)["title"])
+            except (ValueError, KeyError, TypeError) as e:
+                err = f"unexpected output: {e}"
+        else:
+            err = (r.stderr or r.stdout).strip() or f"exit {r.returncode}"
+    print(f"warning: couldn't fetch the current PR title ({err}); using the cached one.")
+    return None
+
+
+def title_check_failed(standards: RepoStandards | None, title: str) -> bool:
+    """True when a title pattern is configured and the PR title doesn't match. Pure."""
+    return bool(
+        standards and standards.title_pattern and not re.search(standards.title_pattern, title)
+    )
+
+
+def describe_repo_standards(standards: RepoStandards | None, title: str) -> str:
+    """Launch-banner fragment for the conventions file (pure; "" when none)."""
+    if standards is None:
+        return ""
+    desc = f"standards: {standards.source.name}"
+    if title_check_failed(standards, title):
+        desc += ", title check failed"
+    return desc
+
+
+def format_repo_standards(standards: RepoStandards | None, title: str) -> str:
+    """Render the repository-conventions prompt section (pure).
+
+    A passing title check adds nothing (no acknowledgement to post); a failing
+    one is stated as a fact for the review *body* — a process issue, not a
+    `file:line` finding. Returns "" when there's nothing to say.
+    """
+    if standards is None:
+        return ""
+    parts: list[str] = []
+    if standards.body:
+        parts.append(
+            f"Repository review conventions (from `{standards.source.name}`) — apply "
+            f"these on top of the review standards above:\n{standards.body}"
+        )
+    if title_check_failed(standards, title):
+        parts.append(
+            f"PR title check: the title {title!r} does not match this repository's "
+            f"required format (regex `{standards.title_pattern}`). Raise this in the "
+            "review body or summary, not as an inline `file:line` finding."
+        )
+    return "\n\n".join(parts)
+
+
 def format_diff_scope(scope: DiffScope, number: int) -> str:
     """Render the prompt's Scope section (pure).
 
@@ -2386,6 +2575,7 @@ def _format_launch_banner_parts(
     extra_prompt: str,
     allow_approve: bool = True,
     scope_desc: str = "",
+    standards_desc: str = "",
 ) -> list[str]:
     """Assemble the human-readable launch-banner fragments (pure).
 
@@ -2414,6 +2604,8 @@ def _format_launch_banner_parts(
     parts = [f"post-inline: {post_inline_desc}", existing_desc]
     if scope_desc:
         parts.append(scope_desc)
+    if standards_desc:
+        parts.append(standards_desc)
     # Only call out the agent subset when it diverges from the default — the
     # banner is already crowded, and "agents: all" would be noise on every
     # default-shape launch. Compare as SETS rather than tuples:
@@ -2547,6 +2739,7 @@ def build_review_prompt(
     allow_approve: bool = True,
     diff_scope: str = "",
     test_changes: str = "",
+    repo_standards: str = "",
 ) -> BuiltPrompt:
     """Assemble the user message for the selected coding-agent CLI. Pure — no I/O.
 
@@ -2617,6 +2810,11 @@ def build_review_prompt(
     (existing tests this PR modified/renamed/deleted, plus the weakened-test
     red flags). It follows the Scope section; empty skips it.
 
+    `repo_standards` is the pre-rendered `format_repo_standards` section (the
+    org/repo `.review-standards` file body and any failed PR-title check). It
+    sits right after `REVIEW_STANDARDS_SUFFIX` — it's more rules — and before
+    the reviewer extras, so a per-launch instruction can still override it.
+
     Contract: `fetch_existing_review_comments` guarantees that
     `fetch_ok=False` always returns `existing=[]`. Passing a non-empty
     `existing` with `fetch_ok=False` is a contradictory state — caught
@@ -2673,6 +2871,8 @@ def build_review_prompt(
     # post-inline modes — they define the P1/P2/P3 taxonomy the post-inline
     # verdict suffixes rely on, so they must always be present.
     sections = [base, REVIEW_STANDARDS_SUFFIX]
+    if repo_standards:
+        sections.append(repo_standards)
     # Strip defensively — the current ConfirmResult dataclass already strips,
     # but `build_review_prompt` is now an API boundary and a future caller
     # (or test) passing whitespace-only `extra_prompt` would otherwise render
@@ -5529,6 +5729,19 @@ class PRReviewer(App):
                         print("Review cancelled.")
                         return
 
+                # Per-org/per-repo conventions from `.review-standards/`
+                # (absent file = feature off for this repo, silently).
+                repo_standards = load_repo_standards(owner, name)
+                pr_title = pr.get("title") or ""
+                if repo_standards is not None and repo_standards.title_pattern:
+                    # Check the title as it is now, not as of the last
+                    # queue refresh (the author may have renamed it since).
+                    current_title = fetch_pr_title(repo_full, number)
+                    if current_title is not None:
+                        pr_title = current_title
+                if repo_standards is not None:
+                    print(f"Using review standards from {repo_standards.source}")
+
                 # Hoist the `codegraph` PATH probe once: the Tier 2/3/4
                 # blocks below all share this gate, and three separate
                 # `shutil.which` calls would also create a TOCTOU surface
@@ -5623,6 +5836,7 @@ class PRReviewer(App):
                     # Skipped on a (user-overridden) mismatch: the local diff
                     # then includes files outside the PR, so its test list
                     # could point the agent at other people's test edits.
+                    repo_standards=format_repo_standards(repo_standards, pr_title),
                     test_changes=(
                         format_test_change_scrutiny(diff_scope.changed_tests)
                         if diff_scope is not None and not diff_scope.mismatch
@@ -5640,6 +5854,7 @@ class PRReviewer(App):
                     extra_prompt,
                     allow_approve=allow_approve,
                     scope_desc=describe_diff_scope(diff_scope),
+                    standards_desc=describe_repo_standards(repo_standards, pr_title),
                 )
                 print(
                     f"\nLaunching {_CLI_DISPLAY[cli]} ({', '.join(parts)})"

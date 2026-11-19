@@ -45,6 +45,7 @@ from cc_pr_reviewer import (
     POST_INLINE_REREVIEW_RESOLVE_SUFFIX,
     POST_INLINE_REREVIEW_SUFFIX,
     PROMPT_SECTION_SEP,
+    REPO_STANDARDS_CHAR_CAP,
     REVIEW_PROMPT_CLAUDE,
     REVIEW_PROMPT_SKILL_BASED,
     REVIEW_SKILL_LABELS,
@@ -57,6 +58,7 @@ from cc_pr_reviewer import (
     BuiltPrompt,
     DiffScope,
     InProgressHolder,
+    RepoStandards,
     ReviewInProgressError,
     SettingsScreen,
     _approx_tokens,
@@ -106,14 +108,19 @@ from cc_pr_reviewer import (
     build_slack_payload,
     check_prereqs,
     describe_diff_scope,
+    describe_repo_standards,
     fetch_my_latest_review,
+    fetch_pr_title,
     format_codegraph_affected_tests,
     format_diff_scope,
     format_existing_comments,
+    format_repo_standards,
     format_test_change_scrutiny,
     humanise,
+    load_repo_standards,
     new_review_pr_keys,
     parse_refresh_interval,
+    title_check_failed,
 )
 
 # --- build_review_prompt ---------------------------------------------------
@@ -4362,4 +4369,214 @@ def test_resolve_diff_scope_reports_changed_existing_tests(
         ("deleted", "tests/test_b.py"),
         ("renamed", "tests/test_c2.py"),
         ("modified", "tests/test_café.py"),
+    )
+
+
+# --- per-org/per-repo review standards (.review-standards/) ----------------
+
+_UNSTRACT_TITLE = r"^[A-Z]+-\d+ \[[A-Z]+\] "
+
+
+def _write(path: Path, text: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_load_repo_standards_absent_is_none(tmp_path: Path) -> None:
+    assert load_repo_standards("Zipstack", "unstract", tmp_path / "missing") is None
+    assert load_repo_standards("Zipstack", "unstract", tmp_path) is None
+
+
+def test_load_repo_standards_org_file(tmp_path: Path) -> None:
+    src = _write(tmp_path / "Zipstack.md", "- org rule\n")
+    loaded = load_repo_standards("Zipstack", "unstract", tmp_path)
+    assert loaded == RepoStandards(source=src, body="- org rule", title_pattern=None)
+
+
+def test_load_repo_standards_repo_file_replaces_org_file(tmp_path: Path) -> None:
+    _write(tmp_path / "Zipstack.md", "- org rule\n")
+    _write(tmp_path / "Zipstack" / "unstract.md", "- repo rule\n")
+    assert load_repo_standards("Zipstack", "unstract", tmp_path).body == "- repo rule"
+    # Another repo of the same org still gets the org file.
+    assert load_repo_standards("Zipstack", "other", tmp_path).body == "- org rule"
+
+
+def test_load_repo_standards_matches_case_insensitively(tmp_path: Path) -> None:
+    """GitHub owner/repo names are case-insensitive; Linux filesystems aren't."""
+    _write(tmp_path / "zipstack" / "Unstract.md", "- repo rule\n")
+    _write(tmp_path / "ZIPSTACK.md", "- org rule\n")
+    assert load_repo_standards("Zipstack", "unstract", tmp_path).body == "- repo rule"
+    assert load_repo_standards("Zipstack", "x", tmp_path).body == "- org rule"
+
+
+def test_load_repo_standards_unreadable_warns_and_skips(tmp_path: Path, capsys) -> None:
+    (tmp_path / "Zipstack.md").write_bytes(b"\xff\xfe not utf-8 \x80")
+    assert load_repo_standards("Zipstack", "unstract", tmp_path) is None
+    assert "couldn't read review standards" in capsys.readouterr().out
+
+
+def test_load_repo_standards_missing_dir_is_silent(tmp_path: Path, capsys) -> None:
+    assert load_repo_standards("Zipstack", "unstract", tmp_path / "missing") is None
+    (tmp_path / "file").write_text("x")
+    assert load_repo_standards("Zipstack", "unstract", tmp_path / "file") is None
+    assert capsys.readouterr().out == ""
+
+
+def test_load_repo_standards_unlistable_owner_dir_warns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """An unlistable owner dir must not silently fall back to the org file."""
+    _write(tmp_path / "Zipstack.md", "- org rule\n")
+    _write(tmp_path / "Zipstack" / "unstract.md", "- repo rule\n")
+    real_iterdir = Path.iterdir
+
+    def fake_iterdir(self: Path):
+        if self.name == "Zipstack":
+            raise PermissionError(13, "Permission denied")
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+    assert load_repo_standards("Zipstack", "unstract", tmp_path).body == "- org rule"
+    out = capsys.readouterr().out
+    assert "couldn't list review standards dir" in out
+    assert "Permission denied" in out
+
+
+@pytest.mark.parametrize(
+    ("result", "expected", "warns"),
+    [
+        (("0", '{"title": "ABC-1 [FIX] new"}'), "ABC-1 [FIX] new", False),
+        (("1", ""), None, True),
+        (("0", "not json"), None, True),
+        (OSError("no gh"), None, True),
+    ],
+    ids=["ok", "gh-fails", "bad-json", "oserror"],
+)
+def test_fetch_pr_title(
+    monkeypatch: pytest.MonkeyPatch, capsys, result: Any, expected: str | None, warns: bool
+) -> None:
+    import subprocess
+
+    def fake(cmd: list[str], **kw: Any) -> subprocess.CompletedProcess:
+        assert cmd[:3] == ["gh", "pr", "view"] and "--repo" in cmd
+        if isinstance(result, Exception):
+            raise result
+        rc, out = result
+        return subprocess.CompletedProcess(cmd, int(rc), stdout=out, stderr="boom")
+
+    monkeypatch.setattr(_mod, "run", fake)
+    assert fetch_pr_title("o/r", 1) == expected
+    assert ("using the cached one" in capsys.readouterr().out) is warns
+
+
+def test_frontmatter_title_pattern_and_body(tmp_path: Path) -> None:
+    _write(tmp_path / "Zipstack.md", f"---\ntitle_pattern: {_UNSTRACT_TITLE}\n---\n\n- rule\n")
+    loaded = load_repo_standards("Zipstack", "unstract", tmp_path)
+    # Unquoted values are stripped, so the regex's trailing space is lost.
+    assert loaded.title_pattern == _UNSTRACT_TITLE.rstrip()
+    assert loaded.body == "- rule"
+
+
+@pytest.mark.parametrize("quote", ['"', "'"])
+def test_frontmatter_quoted_value_keeps_whitespace(tmp_path: Path, quote: str) -> None:
+    _write(
+        tmp_path / "Zipstack.md",
+        f"---\ntitle_pattern: {quote}{_UNSTRACT_TITLE}{quote}\n---\nbody\n",
+    )
+    assert load_repo_standards("Zipstack", "u", tmp_path).title_pattern == _UNSTRACT_TITLE
+
+
+def test_frontmatter_unknown_key_warns(tmp_path: Path, capsys) -> None:
+    _write(tmp_path / "Zipstack.md", "---\ntitel_pattern: x\n# comment\n---\nbody\n")
+    loaded = load_repo_standards("Zipstack", "u", tmp_path)
+    assert loaded.title_pattern is None
+    assert loaded.body == "body"
+    out = capsys.readouterr().out
+    assert "titel_pattern" in out and "comment" not in out
+
+
+def test_frontmatter_unterminated_is_body(tmp_path: Path, capsys) -> None:
+    _write(tmp_path / "Zipstack.md", "---\ntitle_pattern: x\nbody\n")
+    loaded = load_repo_standards("Zipstack", "u", tmp_path)
+    assert loaded.title_pattern is None
+    assert loaded.body.startswith("---")
+    assert "unterminated" in capsys.readouterr().out
+
+
+def test_frontmatter_invalid_regex_disables_title_check(tmp_path: Path, capsys) -> None:
+    _write(tmp_path / "Zipstack.md", "---\ntitle_pattern: ([unclosed\n---\nbody\n")
+    loaded = load_repo_standards("Zipstack", "u", tmp_path)
+    assert loaded.title_pattern is None
+    assert loaded.body == "body"
+    assert "invalid title_pattern" in capsys.readouterr().out
+
+
+def test_standards_body_truncated_at_cap(tmp_path: Path, capsys) -> None:
+    _write(tmp_path / "Zipstack.md", "x" * (REPO_STANDARDS_CHAR_CAP + 50))
+    loaded = load_repo_standards("Zipstack", "u", tmp_path)
+    assert loaded.body.startswith("x" * REPO_STANDARDS_CHAR_CAP)
+    assert loaded.body.endswith("truncated — the rest of the file was omitted]")
+    assert f"only the first {REPO_STANDARDS_CHAR_CAP}" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("title", "failed"),
+    [
+        ("UN-3653 [FIX] Never weaken tests", False),
+        ("LW-373 [FEAT] Add thing", False),
+        ("fix: weaken tests", True),
+        ("UN-3653 Fix without type", True),
+    ],
+)
+def test_title_check_with_unstract_pattern(title: str, failed: bool) -> None:
+    std = RepoStandards(source=Path("Zipstack.md"), body="", title_pattern=_UNSTRACT_TITLE)
+    assert title_check_failed(std, title) is failed
+
+
+def test_title_check_off_without_pattern() -> None:
+    assert not title_check_failed(None, "anything")
+    assert not title_check_failed(RepoStandards(Path("a.md"), "b"), "anything")
+
+
+def test_format_repo_standards_variants() -> None:
+    src = Path("Zipstack.md")
+    assert format_repo_standards(None, "t") == ""
+    # Passing title + empty body: nothing to say, no acknowledgement.
+    assert format_repo_standards(RepoStandards(src, "", _UNSTRACT_TITLE), "UN-1 [FIX] x") == ""
+    body_only = format_repo_standards(RepoStandards(src, "- rule"), "t")
+    assert "`Zipstack.md`" in body_only and body_only.endswith("- rule")
+    failed = format_repo_standards(RepoStandards(src, "- rule", _UNSTRACT_TITLE), "fix: x")
+    assert "- rule" in failed
+    assert "'fix: x'" in failed
+    assert "review body" in failed and "not as an inline" in failed
+
+
+def test_describe_repo_standards() -> None:
+    src = Path("Zipstack.md")
+    assert describe_repo_standards(None, "t") == ""
+    assert describe_repo_standards(RepoStandards(src, "b"), "t") == "standards: Zipstack.md"
+    assert describe_repo_standards(RepoStandards(src, "b", _UNSTRACT_TITLE), "fix: x") == (
+        "standards: Zipstack.md, title check failed"
+    )
+
+
+@pytest.mark.parametrize("cli", ["claude", "codex", "gemini"])
+def test_repo_standards_follow_review_standards_before_extras(cli: str) -> None:
+    """Conventions are more rules: right after the review standards, and
+    before the per-launch extras so those can still override them."""
+    section = format_repo_standards(RepoStandards(Path("Zipstack.md"), "- rule"), "t")
+    built = build_review_prompt(
+        post_inline=False,
+        extra_prompt="extra",
+        existing=[],
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+        cli=cli,
+        repo_standards=section,
+    )
+    base = REVIEW_PROMPT_CLAUDE if cli == "claude" else REVIEW_PROMPT_SKILL_BASED
+    assert built.text == PROMPT_SECTION_SEP.join(
+        [base, REVIEW_STANDARDS_SUFFIX, section, "Additional instructions from reviewer:\nextra"]
     )
