@@ -244,7 +244,10 @@ comment via a single `POST /repos/{owner}/{repo}/pulls/{n}/reviews` call
 through `gh api`, so they land grouped under one review. On a re-review
 of someone else's PR where only P3 (nit) findings remain, the CLI is
 also asked to resolve any of its own previously-posted threads that the
-new code has addressed before submitting the APPROVE. Set **Approval on
+new code has addressed before submitting the APPROVE. Before any
+APPROVE, the CLI must re-check every P3 against the P1/P2 definitions
+and promote any that's really a bug, which blocks the approval, so a
+mis-tagged nit can't slip through as an automatic approval. Set **Approval on
 others' PRs** in Settings (`,`) to *Never approve (comment only)* to turn
 off every approve/resolve step: reviews are then always submitted as
 `event: COMMENT`, and approving stays a separate manual action.

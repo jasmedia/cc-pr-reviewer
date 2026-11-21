@@ -37,6 +37,7 @@ from cc_pr_reviewer import (
     DEFAULT_THEME,
     EXISTING_COMMENT_BODY_CAP,
     EXISTING_COMMENT_LIST_CAP,
+    POST_INLINE_APPROVE_RECHECK_SUFFIX,
     POST_INLINE_APPROVE_SUFFIX,
     POST_INLINE_DEDUP_SUFFIX,
     POST_INLINE_FETCH_FAILED_SUFFIX,
@@ -297,6 +298,7 @@ def test_full_chain_assembles_in_canonical_order(cli: str, expected_base: str) -
             POST_INLINE_PROMPT
             + POST_INLINE_DEDUP_SUFFIX
             + POST_INLINE_REREVIEW_SUFFIX
+            + POST_INLINE_APPROVE_RECHECK_SUFFIX
             + POST_INLINE_REREVIEW_APPROVE_SUFFIX
             + POST_INLINE_REREVIEW_RESOLVE_SUFFIX,
         ]
@@ -463,7 +465,10 @@ def test_first_review_approve_assembles_in_canonical_order(cli: str, expected_ba
             *_standards(cli),
             "Additional instructions from reviewer:\nx",
             format_existing_comments(existing)[0],
-            POST_INLINE_PROMPT + POST_INLINE_DEDUP_SUFFIX + POST_INLINE_APPROVE_SUFFIX,
+            POST_INLINE_PROMPT
+            + POST_INLINE_DEDUP_SUFFIX
+            + POST_INLINE_APPROVE_RECHECK_SUFFIX
+            + POST_INLINE_APPROVE_SUFFIX,
         ]
     )
     assert built.text == expected
@@ -599,10 +604,95 @@ def test_dispatch_rules_sit_between_repo_standards_and_extras() -> None:
     )
 
 
+# --- P3 re-check before any APPROVE (POST_INLINE_APPROVE_RECHECK_SUFFIX) ----
+
+
+_RECHECK_CASES = [
+    # (existing, fetch_ok, my_login, author_login, allow_approve, approve_clause)
+    ([], True, "alice", "bob", True, POST_INLINE_APPROVE_SUFFIX),
+    ([_comment("alice")], True, "alice", "bob", True, POST_INLINE_REREVIEW_APPROVE_SUFFIX),
+    ([], True, "alice", "alice", True, None),  # own PR: GitHub 422s on self-approval
+    ([_comment("alice")], True, "alice", "alice", True, None),  # own PR, re-review
+    ([], True, None, "bob", True, None),  # unknown login
+    ([], False, "alice", "bob", True, None),  # existing-comments fetch failed
+    ([], True, "alice", "bob", False, None),  # approve_policy comment-only
+]
+
+
+@pytest.mark.parametrize("cli", ["claude", "codex", "gemini"])
+@pytest.mark.parametrize(
+    ("existing", "fetch_ok", "my_login", "author_login", "allow_approve", "approve_clause"),
+    _RECHECK_CASES,
+    ids=[
+        "first-review",
+        "rereview",
+        "self-first",
+        "self-rereview",
+        "unknown-login",
+        "fetch-failed",
+        "comment-only",
+    ],
+)
+def test_p3_recheck_rides_with_every_approve_clause(
+    cli: str,
+    existing: list[dict[str, Any]],
+    fetch_ok: bool,
+    my_login: str | None,
+    author_login: str,
+    allow_approve: bool,
+    approve_clause: str | None,
+) -> None:
+    """Both approve clauses approve when only P3s remain, so a bug mis-tagged
+    as a nit would become an automatic approval. The re-check must sit
+    directly before whichever approve clause fires, exactly once, and be
+    absent whenever no approve clause is sent."""
+    built = build_review_prompt(
+        post_inline=True,
+        extra_prompt="",
+        existing=existing,
+        fetch_ok=fetch_ok,
+        my_login=my_login,
+        author_login=author_login,
+        cli=cli,
+        allow_approve=allow_approve,
+    )
+    if approve_clause is None:
+        assert POST_INLINE_APPROVE_RECHECK_SUFFIX not in built.text
+    else:
+        assert built.text.count(POST_INLINE_APPROVE_RECHECK_SUFFIX) == 1
+        assert POST_INLINE_APPROVE_RECHECK_SUFFIX + approve_clause in built.text
+
+
+def test_p3_recheck_absent_without_post_inline() -> None:
+    built = build_review_prompt(
+        post_inline=False,
+        extra_prompt="",
+        existing=[],
+        fetch_ok=True,
+        my_login="alice",
+        author_login="bob",
+    )
+    assert POST_INLINE_APPROVE_RECHECK_SUFFIX not in built.text
+
+
+def test_p3_recheck_wording_pins_load_bearing_rules() -> None:
+    """Re-review skips P3s, so the re-check must cover skipped ones too;
+    promotion must block approval and be reported."""
+    for token in (
+        "every P3",
+        "including any you are about to skip",
+        "P1 or P2 definitions in the review standards",
+        "must not approve",
+        "final summary",
+    ):
+        assert token in POST_INLINE_APPROVE_RECHECK_SUFFIX
+
+
 # --- approve_policy (Settings → build_review_prompt(allow_approve=...)) -----
 
 
 _APPROVE_CLAUSES = (
+    POST_INLINE_APPROVE_RECHECK_SUFFIX,
     POST_INLINE_APPROVE_SUFFIX,
     POST_INLINE_REREVIEW_APPROVE_SUFFIX,
     POST_INLINE_REREVIEW_RESOLVE_SUFFIX,
@@ -1030,7 +1120,10 @@ def test_codegraph_suffix_placed_after_extra_prompt_before_existing() -> None:
             # nudge rides along with the hint as one section.
             f"{CODEGRAPH_HINT_SUFFIX} {CODEGRAPH_IMPACT_NUDGE}",
             format_existing_comments(existing)[0],
-            POST_INLINE_PROMPT + POST_INLINE_DEDUP_SUFFIX + POST_INLINE_APPROVE_SUFFIX,
+            POST_INLINE_PROMPT
+            + POST_INLINE_DEDUP_SUFFIX
+            + POST_INLINE_APPROVE_RECHECK_SUFFIX
+            + POST_INLINE_APPROVE_SUFFIX,
         ]
     )
     assert built.text == expected
@@ -1227,7 +1320,10 @@ def test_affected_tests_block_lands_after_hint_before_existing(cli: str) -> None
             CODEGRAPH_HINT_SUFFIX,
             affected_block,
             format_existing_comments(existing)[0],
-            POST_INLINE_PROMPT + POST_INLINE_DEDUP_SUFFIX + POST_INLINE_APPROVE_SUFFIX,
+            POST_INLINE_PROMPT
+            + POST_INLINE_DEDUP_SUFFIX
+            + POST_INLINE_APPROVE_RECHECK_SUFFIX
+            + POST_INLINE_APPROVE_SUFFIX,
         ]
     )
     assert built.text == expected
