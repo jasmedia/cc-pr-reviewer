@@ -608,6 +608,25 @@ POST_INLINE_REREVIEW_RESOLVE_SUFFIX = (
     "and any that failed to resolve (with the GraphQL error)."
 )
 
+# Prepended to BOTH approve clauses (first-review `POST_INLINE_APPROVE_SUFFIX`
+# and re-review `POST_INLINE_REREVIEW_APPROVE_SUFFIX`), so it rides on exactly
+# the same gates (not self-authored, approve_policy "auto", fetch_ok on the
+# first-review path). Both clauses approve when only P3s remain, so a real bug
+# mis-tagged as a nit would otherwise turn into an automatic approval; on the
+# re-review path P3s are skipped entirely, hence "including any you are about
+# to skip". Points at the P1/P2 definitions in REVIEW_STANDARDS_SUFFIX instead
+# of restating them, so the taxonomy keeps a single source.
+POST_INLINE_APPROVE_RECHECK_SUFFIX = (
+    " Before any APPROVE, re-check every P3 finding, including any you are "
+    "about to skip: re-read the changed code it points at and ask whether it "
+    "fits the P1 or P2 definitions in the review standards (could it break "
+    "behavior, lose data, open a security hole, or break a contract?). "
+    "Promote any that does, and verify it like any other P1/P2; a promoted "
+    "finding means you must not approve. In your final summary, say how many "
+    "P3s you re-checked and which, if any, you promoted."
+)
+
+
 # Appended to POST_INLINE_PROMPT on a *first* review (not a re-review) of a PR
 # the `gh` user did NOT author. It turns the post-inline pass into a verdict:
 # using the P1/P2/P3 tags from REVIEW_STANDARDS_SUFFIX, APPROVE when no P1/P2
@@ -2952,6 +2971,7 @@ def build_review_prompt(
         if rereview:
             post += POST_INLINE_REREVIEW_SUFFIX
             if rereview_can_approve:
+                post += POST_INLINE_APPROVE_RECHECK_SUFFIX
                 post += POST_INLINE_REREVIEW_APPROVE_SUFFIX
                 post += POST_INLINE_REREVIEW_RESOLVE_SUFFIX
         elif may_approve and fetch_ok:
@@ -2962,6 +2982,7 @@ def build_review_prompt(
             # (a re-review whose prior comments were unreachable looks
             # identical). When the prior-comment state is unknown, stay
             # conservative and fall through to plain `event: COMMENT`.
+            post += POST_INLINE_APPROVE_RECHECK_SUFFIX
             post += POST_INLINE_APPROVE_SUFFIX
         sections.append(post)
 
