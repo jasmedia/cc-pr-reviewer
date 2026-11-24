@@ -904,6 +904,36 @@ def run(cmd: list[str], **kw: Any) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
 
 
+def _cli_exec_error(cli: str, timeout: float = 10) -> str | None:
+    """Return why `cli` can't be launched, or None if it looks runnable.
+
+    `shutil.which` only proves an executable *file* is on PATH, not that it
+    runs. The npm-distributed CLIs ship a thin wrapper whose real native
+    binary arrives via an optional dependency + postinstall; when either step
+    is skipped the wrapper is on PATH but exec fails (`OSError: [Errno 8]
+    Exec format error`) or exits non-zero complaining about the missing
+    binary. Probing `<cli> --version` before suspending the TUI turns that
+    into an actionable toast instead of a crash mid-launch.
+
+    A timeout returns None: slow isn't broken, and blocking the launch on a
+    sluggish cold start would be a worse failure than letting it proceed.
+    """
+    path = shutil.which(cli) or cli
+    try:
+        r = run([cli, "--version"], timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None
+    except OSError as e:
+        return f"`{cli}` at {path} can't be executed ({e.strerror or e}) — reinstall it"
+    if r.returncode != 0:
+        detail = next(
+            (ln.strip() for ln in (r.stderr or r.stdout or "").splitlines() if ln.strip()),
+            f"exit code {r.returncode}",
+        )
+        return f"`{cli} --version` failed ({detail}) — reinstall it"
+    return None
+
+
 PR_REVIEW_TOOLKIT_PLUGIN = "pr-review-toolkit"
 PR_REVIEW_TOOLKIT_URL = "https://claude.com/plugins/pr-review-toolkit"
 
@@ -925,7 +955,10 @@ def _pr_review_toolkit_enabled() -> bool | None:
     """
     try:
         r = run(["claude", "plugin", "list", "--json"], timeout=5)
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+    # `OSError`, not just `FileNotFoundError`: a binary that's on PATH but
+    # can't be exec'd (ENOEXEC from a half-installed npm wrapper, EACCES)
+    # raises a different OSError subclass and would otherwise crash the TUI.
+    except (OSError, subprocess.TimeoutExpired):
         return None
     if r.returncode != 0:
         return None
@@ -5630,6 +5663,15 @@ class PRReviewer(App):
                 severity="error",
                 timeout=8,
             )
+            return False
+
+        # On PATH isn't the same as runnable: a half-installed npm wrapper
+        # (native binary never downloaded) passes `which` but fails at exec.
+        # Catch it here, while the TUI is alive, rather than after suspending
+        # and cloning — the launch `subprocess.call` has no OSError guard.
+        exec_error = _cli_exec_error(cli)
+        if exec_error is not None:
+            self.notify(exec_error, severity="error", timeout=12)
             return False
 
         # Claude additionally needs the PR Review Toolkit plugin (the base

@@ -4668,3 +4668,57 @@ def test_repo_standards_follow_review_standards_before_extras(cli: str) -> None:
             "Additional instructions from reviewer:\nextra",
         ]
     )
+
+
+# --- _cli_exec_error / broken-binary handling ---------------------------------
+
+
+def _install_fake_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: bytes) -> str:
+    """Put an executable `fakecli` with `body` first on PATH; return its name."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    exe = bindir / "fakecli"
+    exe.write_bytes(body)
+    exe.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
+    return "fakecli"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX exec semantics")
+def test_cli_exec_error_reports_exec_format_error(tmp_path, monkeypatch):
+    # No shebang, not a native binary -> ENOEXEC, the half-installed npm case.
+    cli = _install_fake_cli(tmp_path, monkeypatch, b"\x00\x01garbage")
+    msg = _mod._cli_exec_error(cli)
+    assert msg is not None
+    assert "can't be executed" in msg and "reinstall" in msg
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell script")
+def test_cli_exec_error_reports_nonzero_version_with_stderr(tmp_path, monkeypatch):
+    cli = _install_fake_cli(
+        tmp_path, monkeypatch, b"#!/bin/sh\necho 'native binary not found' >&2\nexit 1\n"
+    )
+    msg = _mod._cli_exec_error(cli)
+    assert msg is not None and "native binary not found" in msg
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell script")
+def test_cli_exec_error_none_for_working_cli(tmp_path, monkeypatch):
+    cli = _install_fake_cli(tmp_path, monkeypatch, b"#!/bin/sh\necho 1.2.3\n")
+    assert _mod._cli_exec_error(cli) is None
+
+
+def test_cli_exec_error_timeout_is_not_broken(monkeypatch):
+    def _hang(cmd, **kw):
+        raise _mod.subprocess.TimeoutExpired(cmd, kw.get("timeout", 0))
+
+    monkeypatch.setattr(_mod, "run", _hang)
+    assert _mod._cli_exec_error("claude") is None
+
+
+def test_toolkit_check_returns_none_on_exec_format_error(monkeypatch):
+    def _enoexec(cmd, **kw):
+        raise OSError(8, "Exec format error", "claude")
+
+    monkeypatch.setattr(_mod, "run", _enoexec)
+    assert _mod._pr_review_toolkit_enabled() is None
